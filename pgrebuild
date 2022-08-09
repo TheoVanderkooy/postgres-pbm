@@ -15,4 +15,5 @@ if [ $ret -ne 0 ]; then
 fi
 
 # restart the server
+truncate --size=0 ~/postgresql/logfile
 pg_ctl start -l ~/postgresql/logfile

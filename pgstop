@@ -1,2 +1,3 @@
 #!/bin/sh
-pg_ctl stop -D /usr/local/pgsql/data
+export PGDATA=/usr/local/pgsql/data
+pg_ctl stop
