@@ -37,6 +37,7 @@
 #include "storage/bufmgr.h"
 #include "storage/dsm.h"
 #include "storage/ipc.h"
+#include "storage/pbm.h"
 #include "storage/pg_shmem.h"
 #include "storage/pmsignal.h"
 #include "storage/predicate.h"
@@ -122,6 +123,7 @@ CreateSharedMemoryAndSemaphores(void)
 												 sizeof(ShmemIndexEnt)));
 		size = add_size(size, dsm_estimate_size());
 		size = add_size(size, BufferShmemSize());
+		size = add_size(size, PbmShmemSize());
 		size = add_size(size, LockShmemSize());
 		size = add_size(size, PredicateLockShmemSize());
 		size = add_size(size, ProcGlobalShmemSize());
@@ -222,6 +224,7 @@ CreateSharedMemoryAndSemaphores(void)
 	SUBTRANSShmemInit();
 	MultiXactShmemInit();
 	InitBufferPool();
+	InitPBM();
 
 	/*
 	 * Set up lock manager

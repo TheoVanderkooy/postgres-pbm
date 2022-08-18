@@ -26,6 +26,7 @@
 #include "storage/dsm.h"
 #include "storage/lockdefs.h"
 #include "storage/shm_toc.h"
+#include "storage/pbm.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
 
@@ -75,6 +76,10 @@ typedef struct HeapScanDescData
 	int			rs_cindex;		/* current tuple's index in vistuples */
 	int			rs_ntuples;		/* number of visible tuples on page */
 	OffsetNumber rs_vistuples[MaxHeapTuplesPerPage];	/* their offsets */
+
+	// TODO theo: maybe put this in TableScanDescData instead
+	// Scan ID for PBM
+	ScanId scanId;
 }			HeapScanDescData;
 typedef struct HeapScanDescData *HeapScanDesc;
 

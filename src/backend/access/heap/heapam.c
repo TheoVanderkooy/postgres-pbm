@@ -57,6 +57,7 @@
 #include "port/atomics.h"
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
+#include "storage/pbm.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
@@ -231,6 +232,9 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 	ParallelBlockTableScanDesc bpscan = NULL;
 	bool		allow_strat;
 	bool		allow_sync;
+
+	// Register the scan with the PBM
+	RegisterSeqScan(scan);
 
 	/*
 	 * Determine the number of blocks we have to scan.
@@ -1317,6 +1321,9 @@ heap_endscan(TableScanDesc sscan)
 	 */
 	if (BufferIsValid(scan->rs_cbuf))
 		ReleaseBuffer(scan->rs_cbuf);
+
+	// PBM: unregister scan
+	UnregisterScan(scan->scanId);
 
 	/*
 	 * decrement relation reference count and free scan descriptor storage
