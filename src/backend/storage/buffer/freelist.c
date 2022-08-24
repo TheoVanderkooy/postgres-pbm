@@ -312,6 +312,11 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 		}
 	}
 
+// TODO theo --- this is where we need to get new buffer from PBM if nothing in the free list
+#ifdef USE_PBM
+
+#endif
+
 	/* Nothing on the freelist, so run the "clock sweep" algorithm */
 	trycounter = NBuffers;
 	for (;;)

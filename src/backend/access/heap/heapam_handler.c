@@ -2319,6 +2319,10 @@ heapam_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate)
 				blockno = InvalidBlockNumber;
 			}
 		}
+
+		// TODO theo --- maybe report progress here, not sure if we care about sample scans
+		// TODO put this outside the if block?
+		ReportSeqScanPosition(hscan->scanId, blockno);
 	}
 
 	if (!BlockNumberIsValid(blockno))

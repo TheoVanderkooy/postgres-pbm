@@ -233,9 +233,6 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 	bool		allow_strat;
 	bool		allow_sync;
 
-	// Register the scan with the PBM
-	RegisterSeqScan(scan);
-
 	/*
 	 * Determine the number of blocks we have to scan.
 	 *
@@ -342,6 +339,9 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 	 */
 	if (scan->rs_base.rs_flags & SO_TYPE_SEQSCAN)
 		pgstat_count_heap_scan(scan->rs_base.rs_rd);
+
+	// Register the scan with the PBM
+	RegisterSeqScan(scan);
 }
 
 /*
@@ -798,6 +798,10 @@ heapgettup(HeapScanDesc scan,
 				ss_report_location(scan->rs_base.rs_rd, page);
 		}
 
+
+		// TODO theo is this the right place for it? Only report on new page?
+		ReportSeqScanPosition(scan->scanId, page);
+
 		/*
 		 * return NULL if we've exhausted all the pages
 		 */
@@ -1107,6 +1111,10 @@ heapgettup_pagemode(HeapScanDesc scan,
 				ss_report_location(scan->rs_base.rs_rd, page);
 		}
 
+
+		// TODO put this outside the if block?
+		ReportSeqScanPosition(scan->scanId, page);
+
 		/*
 		 * return NULL if we've exhausted all the pages
 		 */
@@ -1323,7 +1331,7 @@ heap_endscan(TableScanDesc sscan)
 		ReleaseBuffer(scan->rs_cbuf);
 
 	// PBM: unregister scan
-	UnregisterScan(scan->scanId);
+	UnregisterSeqScan(scan);
 
 	/*
 	 * decrement relation reference count and free scan descriptor storage

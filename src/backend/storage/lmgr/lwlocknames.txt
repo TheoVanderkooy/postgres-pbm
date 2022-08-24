@@ -53,4 +53,5 @@ XactTruncationLock					44
 # 45 was XactTruncationLock until removal of BackendRandomLock
 WrapLimitsVacuumLock				46
 NotifyQueueTailLock					47
-PbmLock                             48
+PbmScansLock                        48
+PbmBlocksLock                       49
