@@ -5,6 +5,8 @@
 #ifndef POSTGRESQL_PBM_H
 #define POSTGRESQL_PBM_H
 
+#include "storage/block.h"
+
 /// Forward declarations
 struct HeapScanDescData;
 struct BufferDesc;
