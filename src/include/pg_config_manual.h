@@ -402,3 +402,8 @@
  * Enable tracing of syncscan operations (see also the trace_syncscan GUC var).
  */
 /* #define TRACE_SYNCSCAN */
+
+/*
+ * Enable predictive buffer manager
+ */
+#define USE_PBM

@@ -39,6 +39,7 @@
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/lmgr.h"
+#include "storage/pbm.h"
 #include "storage/predicate.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
@@ -2319,10 +2320,11 @@ heapam_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate)
 				blockno = InvalidBlockNumber;
 			}
 		}
-
+#ifdef USE_PBM
 		// TODO theo --- maybe report progress here, not sure if we care about sample scans
 		// TODO put this outside the if block?
 		ReportSeqScanPosition(hscan->scanId, blockno);
+#endif // USE_PBM
 	}
 
 	if (!BlockNumberIsValid(blockno))

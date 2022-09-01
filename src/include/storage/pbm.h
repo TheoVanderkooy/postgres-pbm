@@ -7,6 +7,7 @@
 
 #include "storage/block.h"
 
+
 /// Forward declarations
 struct HeapScanDescData;
 struct BufferDesc;
@@ -26,9 +27,11 @@ extern void UnregisterSeqScan(struct HeapScanDescData *scan);
 extern void ReportSeqScanPosition(ScanId id, BlockNumber pos);
 
 /// Forward certain operations from the normal buffer manager to PBM.
+extern void PbmNewBuffer(struct BufferDesc* buf);
+extern void PbmBufferNotPinned(struct BufferDesc* buf);
+extern void PbmOnEvictBuffer(struct BufferDesc* buf);
+
 extern struct BufferDesc* EvictPages(void /*TODO args --- may need to pass something for returning pages to the free list*/);
-// TODO register a page when we load it...
-// TODO register when a page get un-pinned to put it into the queue.
 
 /*
  * TODO: Register*Scan for:

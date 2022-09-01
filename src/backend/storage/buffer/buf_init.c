@@ -128,6 +128,12 @@ InitBufferPool(void)
 			 */
 			buf->freeNext = i + 1;
 
+			/*
+			 * PBM: initially buffers are empty so don't contain a block from any group
+			 */
+			buf->pbm_bgroup_next = FREENEXT_NOT_IN_LIST;
+			buf->pbm_bgroup_prev = FREENEXT_NOT_IN_LIST;
+
 			LWLockInitialize(BufferDescriptorGetContentLock(buf),
 							 LWTRANCHE_BUFFER_CONTENT);
 

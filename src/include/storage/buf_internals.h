@@ -184,6 +184,11 @@ typedef struct BufferDesc
 	BufferTag	tag;			/* ID of page contained in buffer */
 	int			buf_id;			/* buffer's index number (from 0) */
 
+	int pbm_bgroup_next;				/* PBM next buffer which is loaded in a block */
+	int pbm_bgroup_prev;				/* PBM previous buffer in the chain for a given block */
+// TODO theo does this need to be doubly linked? (re-pinning the block could remove it here?)
+// TODO theo: we need to be able to lock the group when we remove. Can either make singly-linked with group ptr (to stay under 64 bytes) or do lookup based on tag.
+
 	/* state of the tag, containing flags, refcount and usagecount */
 	pg_atomic_uint32 state;
 

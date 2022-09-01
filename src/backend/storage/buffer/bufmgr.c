@@ -46,6 +46,7 @@
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
+#include "storage/pbm.h"
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"
@@ -1073,6 +1074,13 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	if (VacuumCostActive)
 		VacuumCostBalance += VacuumCostPageMiss;
 
+// TODO theo --- if we have a new shared buffer, need to notify the PBM
+#ifdef USE_PBM
+	if (!found && !isLocalBuf) {
+		PbmNewBuffer(bufHdr);
+	}
+#endif // USE_PBM
+
 	TRACE_POSTGRESQL_BUFFER_READ_DONE(forkNum, blockNum,
 									  smgr->smgr_rnode.node.spcNode,
 									  smgr->smgr_rnode.node.dbNode,
@@ -1197,6 +1205,12 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 		/* Pin the buffer and then release the buffer spinlock */
 		PinBuffer_Locked(buf);
+
+#ifdef USE_PBM
+		// Report eviction to the PBM
+		// TODO theo --- should this be before we release the spinlock?
+		PbmOnEvictBuffer(buf);
+#endif
 
 		/*
 		 * If the buffer was dirty, try to write it out.  There is a race
@@ -1888,6 +1902,14 @@ UnpinBuffer(BufferDesc *buf, bool fixOwner)
 											   buf_state))
 				break;
 		}
+
+// TODO theo: consider noyifying PBM when we *unpin* a buffer rather than load it.
+// TODO theo --- to know if the buffer isn't pinned, would need to:
+//  1. lock buffer header
+//  2. check refcount and usage count (? what are those) are 0 (?)
+//  3. ???
+// (is it enough to check if the buf_state refcount is 0? is it possible for it to reach 0 anywhere else?)
+// TODO theo --- BufferIsPinned macro!
 
 		/* Support LockBufferForCleanup() */
 		if (buf_state & BM_PIN_COUNT_WAITER)
@@ -3430,7 +3452,7 @@ void
 DropDatabaseBuffers(Oid dbid)
 {
 	int			i;
-
+// TODO theo --- can ignore this for now but proper implementation would care. Same with DropRelFileNodeBuffers/etc.
 	/*
 	 * We needn't consider local buffers, since by assumption the target
 	 * database isn't our own.

@@ -278,7 +278,7 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 		/* During a rescan, keep the previous strategy object. */
 		if (scan->rs_strategy == NULL)
 			scan->rs_strategy = GetAccessStrategy(BAS_BULKREAD);
-	}
+	} // TODO theo may need a new strategy here...
 	else
 	{
 		if (scan->rs_strategy != NULL)
@@ -339,9 +339,10 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 	 */
 	if (scan->rs_base.rs_flags & SO_TYPE_SEQSCAN)
 		pgstat_count_heap_scan(scan->rs_base.rs_rd);
-
+#ifdef USE_PBM
 	// Register the scan with the PBM
 	RegisterSeqScan(scan);
+#endif // USE_PBM
 }
 
 /*
@@ -798,10 +799,10 @@ heapgettup(HeapScanDesc scan,
 				ss_report_location(scan->rs_base.rs_rd, page);
 		}
 
-
+#ifdef USE_PBM
 		// TODO theo is this the right place for it? Only report on new page?
 		ReportSeqScanPosition(scan->scanId, page);
-
+#endif // USE_PBM
 		/*
 		 * return NULL if we've exhausted all the pages
 		 */
@@ -1110,11 +1111,9 @@ heapgettup_pagemode(HeapScanDesc scan,
 			if (scan->rs_base.rs_flags & SO_ALLOW_SYNC)
 				ss_report_location(scan->rs_base.rs_rd, page);
 		}
-
-
-		// TODO put this outside the if block?
+#ifdef USE_PBM
 		ReportSeqScanPosition(scan->scanId, page);
-
+#endif // USE_PBM
 		/*
 		 * return NULL if we've exhausted all the pages
 		 */
@@ -1329,10 +1328,10 @@ heap_endscan(TableScanDesc sscan)
 	 */
 	if (BufferIsValid(scan->rs_cbuf))
 		ReleaseBuffer(scan->rs_cbuf);
-
+#ifdef USE_PBM
 	// PBM: unregister scan
 	UnregisterSeqScan(scan);
-
+#endif // USE_PBM
 	/*
 	 * decrement relation reference count and free scan descriptor storage
 	 */
