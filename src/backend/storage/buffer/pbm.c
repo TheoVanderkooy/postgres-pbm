@@ -29,6 +29,7 @@
 //#define TRACE_PBM_REPORT_PROGRESS
 #define TRACE_PBM_PRINT_SCANMAP
 #define TRACE_PBM_PRINT_BLOCKMAP
+//#define TRACE_PBM_BUFFERS
 
 // how much to shift the block # by to find its group
 #define BLOCK_GROUP_SHIFT 5 // 10
@@ -125,7 +126,7 @@ typedef struct BlockGroupDataVec {
 	uint32	capacity;
 
 	// Each is a *set* (array) of scan information
-	BlockGroupData*	buffers;
+	BlockGroupData*	blockGroups;
 } BlockGroupDataVec;
 
 // Entry (KVP) in the hash map
@@ -336,10 +337,10 @@ void RegisterSeqScan(HeapScanDesc scan) {
 			b_entry->val = (BlockGroupDataVec){
 				.len = len,
 				.capacity = cap,
-				.buffers = ShmemAlloc(cap * sizeof(BlockGroupScanList*)),
+				.blockGroups = ShmemAlloc(cap * sizeof(BlockGroupData)),
 			};
 			for (uint32 i = 0; i < cap; ++i) {
-				b_entry->val.buffers[i] = (BlockGroupData){
+				b_entry->val.blockGroups[i] = (BlockGroupData){
 					.scans_head = NULL,
 					.buffers_head = FREENEXT_END_OF_LIST,
 				};
@@ -353,7 +354,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 			// Entry already present but capacity isn't large enough, reallocate.
 // ### NOTE: this is not really supported...
 			if (new_len > b_entry->val.capacity) {
-				BlockGroupData* old = b_entry->val.buffers;
+				BlockGroupData* old = b_entry->val.blockGroups;
 				uint32 old_cap = b_entry->val.capacity;
 				uint32 new_cap = Max(old_cap * 2, new_len + (new_len >> 2));
 				uint32 i;
@@ -364,14 +365,14 @@ void RegisterSeqScan(HeapScanDesc scan) {
 				b_entry->val = (BlockGroupDataVec){
 					.len = new_len,
 					.capacity = new_cap,
-					.buffers = ShmemAlloc(new_cap * sizeof(BlockGroupData)),
+					.blockGroups = ShmemAlloc(new_cap * sizeof(BlockGroupData)),
 				};
 
 				for (i = 0; i < old_len; ++i) {
-					b_entry->val.buffers[i] = old[i];
+					b_entry->val.blockGroups[i] = old[i];
 				}
 				for (	  ; i < new_cap; ++i) {
-					b_entry->val.buffers[i] = (BlockGroupData){
+					b_entry->val.blockGroups[i] = (BlockGroupData){
 						.scans_head = NULL,
 						.buffers_head = FREENEXT_END_OF_LIST,
 					};
@@ -389,13 +390,13 @@ void RegisterSeqScan(HeapScanDesc scan) {
 		for (bgnum = 0; pbm->buffer_stats_free_list != NULL && bgnum < nblock_groups; ++bgnum) {
 			// Pop list element off the free-list
 			BlockGroupScanList* temp = pbm->buffer_stats_free_list;
-			pbm->buffer_stats_free_list = pbm->buffer_stats_free_list->next;
+			pbm->buffer_stats_free_list = temp->next;
 
 			// Initialize the list element
-			InitScanStatsEntry(temp, id, s_data, b_entry->val.buffers[bgnum].scans_head, bgnum);
+			InitScanStatsEntry(temp, id, s_data, b_entry->val.blockGroups[bgnum].scans_head, bgnum);
 
 			// Link it in
-			b_entry->val.buffers[bgnum].scans_head = temp;
+			b_entry->val.blockGroups[bgnum].scans_head = temp;
 		}
 
 		// Once we run out: allocate more (as a single allocation - it won't get free'd anyway)
@@ -406,8 +407,8 @@ void RegisterSeqScan(HeapScanDesc scan) {
 
 			for ( ; bgnum < nblock_groups; ++bgnum) {
 				BlockGroupScanList* const temp = &new_stats[bgnum - offset];
-				InitScanStatsEntry(temp, id, s_data, b_entry->val.buffers[bgnum].scans_head, bgnum);
-				b_entry->val.buffers[bgnum].scans_head = temp;
+				InitScanStatsEntry(temp, id, s_data, b_entry->val.blockGroups[bgnum].scans_head, bgnum);
+				b_entry->val.blockGroups[bgnum].scans_head = temp;
 			}
 		}
 
@@ -482,7 +483,7 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 			// Iterate over the buffers to remove the scan metadata
 			const uint32 upper = Min(BLOCK_GROUP(data.nblocks), b_entry->val.len);
 			for (int64 i = (int64)(upper) - 1; i >= 0; --i) {
-				DeleteScanFromGroup(id, &b_entry->val.buffers[i]);
+				DeleteScanFromGroup(id, &b_entry->val.blockGroups[i]);
 // ### If accessing the buffers can remove the scan metadata when done, we should stop once we don't find it.
 			}
 		}
@@ -550,7 +551,7 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 			if (curGroupPos < prevGroupPos) {
 				// First delete the start part
 				for (BlockNumber i = 0; i < curGroupPos; ++i) {
-					DeleteScanFromGroup(id, &b_entry->val.buffers[i]);
+					DeleteScanFromGroup(id, &b_entry->val.blockGroups[i]);
 				}
 				// find last block
 				upper = BLOCK_GROUP(entry->nblocks);
@@ -558,7 +559,7 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 
 			// Remove the scan from the blocks
 			for (BlockNumber i = prevGroupPos; i < upper; ++i) {
-				DeleteScanFromGroup(id, &b_entry->val.buffers[i]);
+				DeleteScanFromGroup(id, &b_entry->val.blockGroups[i]);
 			}
 		}
 	}
@@ -583,13 +584,13 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 // Notify the PBM about a new buffer so it can be added to the priority queue
 void PbmNewBuffer(BufferDesc* buf) {
 	BlockGroupData* group;
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS)
 	if (FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_next) {
 		debug_buffer_access(buf, "new buffer NOT there yet!");
 	} else {
 		debug_buffer_access(buf, "new buffer already in block group, unlink first...");
 	}
-#endif // TRACE_PBM
+#endif // TRACE_PBM && TRACE_PBM_BUFFERS
 
 	BufRemoveFromBlock(buf);
 
@@ -619,7 +620,7 @@ void PbmBufferNotPinned(struct BufferDesc* buf){
 
 // ### eventually want to get rid of this
 inline void PbmOnEvictBuffer(struct BufferDesc* buf) {
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS)
 // ### debugging checks...
 	const RelFileNode	rnode = buf->tag.rnode;
 	const ForkNumber 	fork = buf->tag.forkNum;
@@ -660,7 +661,7 @@ inline void PbmOnEvictBuffer(struct BufferDesc* buf) {
 		if (FREENEXT_END_OF_LIST == it->pbm_bgroup_next) it = NULL;
 		else it = GetBufferDescriptor(it->pbm_bgroup_next);
 	}
-#endif // TRACE_PBM
+#endif // TRACE_PBM && TRACE_PBM_BUFFERS
 
 // ### need to lock the block group? (worry about it later, this needs to change anyways...)
 	BufRemoveFromBlock(buf);
@@ -733,7 +734,7 @@ BlockGroupData * search_block_group(BufferDesc* buf, bool* foundPtr) {
 		return NULL;
 	}
 
-	return &b_entry->val.buffers[bgroup];
+	return &b_entry->val.blockGroups[bgroup];
 }
 
 // Print debugging information for a single entry in the scans hash map.
@@ -774,11 +775,11 @@ void debug_log_scan_map(void) {
 
 // Print an entry in the buffers hash table for debugging. Note: the entry is for a *table* and includes an array of all buffers, so skip most of them.
 void debug_append_buffer_data(StringInfoData * str, BlockGroupHashEntry * entry) {
-	const int skip_amt = 1000;
+	const int skip_amt = 100;
 
 	appendStringInfo(str, "rel=%d [", entry->key.rnode.relNode);
 	for (int i = 0; i < entry->val.len; i += skip_amt) {
-		BlockGroupScanList * stat = entry->val.buffers[i].scans_head;
+		BlockGroupScanList * stat = entry->val.blockGroups[i].scans_head;
 
 		appendStringInfo(str, "%d={", i);
 		while (stat != NULL) {
