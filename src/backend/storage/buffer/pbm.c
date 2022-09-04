@@ -27,9 +27,11 @@
 // Output debugging messages
 #define TRACE_PBM
 //#define TRACE_PBM_REPORT_PROGRESS
-#define TRACE_PBM_PRINT_SCANMAP
-#define TRACE_PBM_PRINT_BLOCKMAP
-//#define TRACE_PBM_BUFFERS
+//#define TRACE_PBM_PRINT_SCANMAP
+//#define TRACE_PBM_PRINT_BLOCKMAP
+#define TRACE_PBM_BUFFERS
+#define TRACE_PBM_BUFFERS_NEW
+#define TRACE_PBM_BUFFERS_EVICT
 
 // how much to shift the block # by to find its group
 #define BLOCK_GROUP_SHIFT 5 // 10
@@ -184,7 +186,7 @@ PbmShared* pbm;
 
 // lookup in applicable hash maps
 static ScanData* search_scan(ScanId id, HASHACTION action, bool* foundPtr);
-static BlockGroupData * search_block_group(BufferDesc* buf, bool* foundPtr);
+static BlockGroupData * search_block_group(const BufferDesc *const buf, bool* foundPtr);
 
 // various helpers to improve code reuse and readability
 static void InitScanStatsEntry(BlockGroupScanList* temp, ScanId id, ScanData* sdata, BlockGroupScanList* next, BlockNumber bgnum);
@@ -197,16 +199,20 @@ static void debug_log_scan_map(void);
 static void debug_append_buffer_data(StringInfoData * str, BlockGroupHashEntry * entry);
 static void debug_log_buffers_map(void);
 static void debug_buffer_access(BufferDesc* buf, char* msg);
+static void list_all_buffers();
+
+// sanity checks
+static void sanity_check_verify_block_group_buffers(const BufferDesc * buf);
 
 // managing buffer priority
-static clock_t ScanTimeToNextConsumption(BlockGroupScanList* stats, bool* foundPtr);
-static clock_t PageNextConsumption(BlockGroupData *stats, bool *requestedPtr);
+static clock_t ScanTimeToNextConsumption(const BlockGroupScanList* stats, bool* foundPtr);
+static clock_t PageNextConsumption(const BlockGroupData* stats, bool *requestedPtr);
 
 
 /// Inline private helpers
 // ### revisit to see which other ones should be inline
 
-static inline void BufRemoveFromBlock(const BufferDesc *buf);
+static inline void RemoveBufFromBlock(BufferDesc *buf);
 
 
 ///-------------------------------------------------------------------------
@@ -331,8 +337,8 @@ void RegisterSeqScan(HeapScanDesc scan) {
 		// Insert into the buffer map as well
 		b_entry = hash_search(pbm->BufferMap, &tbl, HASH_ENTER, &found);
 		if (false == found) {
-			uint32 len = nblock_groups;
-			uint32 cap = len + (len >> 2); // ### Max(5, (len >> 2)); // allocate with 25% extra capacity
+			const uint32 len = nblock_groups;
+			const uint32 cap = len + (len >> 2); // ### Max(5, (len >> 2)); // allocate with 25% extra capacity
 
 			b_entry->val = (BlockGroupDataVec){
 				.len = len,
@@ -346,8 +352,8 @@ void RegisterSeqScan(HeapScanDesc scan) {
 				};
 			}
 		} else {
-			uint32 new_len = nblock_groups;
-			uint32 old_len = b_entry->val.len;
+			const uint32 new_len = nblock_groups;
+			const uint32 old_len = b_entry->val.len;
 
 			b_entry->val.len = Max(b_entry->val.len, new_len);
 
@@ -355,8 +361,8 @@ void RegisterSeqScan(HeapScanDesc scan) {
 // ### NOTE: this is not really supported...
 			if (new_len > b_entry->val.capacity) {
 				BlockGroupData* old = b_entry->val.blockGroups;
-				uint32 old_cap = b_entry->val.capacity;
-				uint32 new_cap = Max(old_cap * 2, new_len + (new_len >> 2));
+				const uint32 old_cap = b_entry->val.capacity;
+				const uint32 new_cap = Max(old_cap * 2, new_len + (new_len >> 2));
 				uint32 i;
 
 				// ### this is not really supported...
@@ -389,7 +395,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 		// First, use as many freed buffer-stats structs as we can
 		for (bgnum = 0; pbm->buffer_stats_free_list != NULL && bgnum < nblock_groups; ++bgnum) {
 			// Pop list element off the free-list
-			BlockGroupScanList* temp = pbm->buffer_stats_free_list;
+			BlockGroupScanList *const temp = pbm->buffer_stats_free_list;
 			pbm->buffer_stats_free_list = temp->next;
 
 			// Initialize the list element
@@ -403,10 +409,10 @@ void RegisterSeqScan(HeapScanDesc scan) {
 		if (bgnum < nblock_groups) {
 			// remember how many have been assigned already since temp and buffers array need to be indexed at different locations.
 			const uint32 offset = bgnum;
-			BlockGroupScanList* const new_stats = ShmemAlloc((nblock_groups - bgnum) * sizeof(BlockGroupScanList));
+			BlockGroupScanList *const new_stats = ShmemAlloc((nblock_groups - bgnum) * sizeof(BlockGroupScanList));
 
 			for ( ; bgnum < nblock_groups; ++bgnum) {
-				BlockGroupScanList* const temp = &new_stats[bgnum - offset];
+				BlockGroupScanList *const temp = &new_stats[bgnum - offset];
 				InitScanStatsEntry(temp, id, s_data, b_entry->val.blockGroups[bgnum].scans_head, bgnum);
 				b_entry->val.blockGroups[bgnum].scans_head = temp;
 			}
@@ -436,10 +442,10 @@ void RegisterSeqScan(HeapScanDesc scan) {
 
 
 void UnregisterSeqScan(struct HeapScanDescData *scan) {
-	ScanId id = scan->scanId;
+	const ScanId id = scan->scanId;
 	bool found;
 	ScanData data;
-	TableData tbl = (TableData){
+	const TableData tbl = (TableData){
 			.rnode = scan->rs_base.rs_rd->rd_node,
 			.forkNum = MAIN_FORKNUM, // Sequential scans only use main fork
 	};
@@ -457,7 +463,7 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 
 	// Remove the scan metadata from the map (grab a copy first)
 	LOCK_GUARD_V2(PbmScansLock, LW_EXCLUSIVE) {
-		const float alpha = 0.85f;
+		const float alpha = 0.85f; // ### pick something else? move to configuration?
 		float new_est;
 		data = *search_scan(id, HASH_FIND, &found);
 		Assert(found);
@@ -474,7 +480,7 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 
 	// For each block in the scan: remove it from the list of scans
 	LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
-		BlockGroupHashEntry * b_entry = hash_search(pbm->BufferMap, &tbl, HASH_FIND, &found);
+		BlockGroupHashEntry *const b_entry = hash_search(pbm->BufferMap, &tbl, HASH_FIND, &found);
 		if (false == found || NULL == b_entry) {
 			elog(WARNING, "UnregisterSeqScan(%lu): could not find table in BufferMap", id);
 		} else {
@@ -543,7 +549,7 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 	if (curGroupPos != prevGroupPos) {
 		tbl = (TableData){ .rnode = entry->rnode, .forkNum = entry->forkNum, };
 		LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
-			BlockGroupHashEntry * b_entry = hash_search(pbm->BufferMap, &tbl, HASH_FIND, &found);
+			const BlockGroupHashEntry * const b_entry = hash_search(pbm->BufferMap, &tbl, HASH_FIND, &found);
 			BlockNumber upper = curGroupPos;
 			Assert(found && b_entry != NULL);
 
@@ -582,19 +588,78 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 
 // ### revisit whether to register buffers when loaded or when unpinned
 // Notify the PBM about a new buffer so it can be added to the priority queue
-void PbmNewBuffer(BufferDesc* buf) {
-	BlockGroupData* group;
-#if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS)
+void PbmNewBuffer(BufferDesc * const buf) {
+	const BlockGroupData* group;
+#if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS) && defined(TRACE_PBM_BUFFERS_NEW)
 	if (FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_next) {
-		debug_buffer_access(buf, "new buffer NOT there yet!");
+		debug_buffer_access(buf, "new buffer");
 	} else {
-		debug_buffer_access(buf, "new buffer already in block group, unlink first...");
+		debug_buffer_access(buf, "(WARNING!) new buffer already in block group, unlink first...");
 	}
-#endif // TRACE_PBM && TRACE_PBM_BUFFERS
+#endif // TRACE_PBM && TRACE_PBM_BUFFERS && TRACE_PBM_BUFFERS_NEW
 
-	BufRemoveFromBlock(buf);
+	RemoveBufFromBlock(buf);
+
+	elog(WARNING, "PbmNewBuffer added new buffer:" //"\n"
+			   "\tnew={id=%d, tbl={spc=%u, db=%u, rel=%u} block=%u (%u) %d/%d}",
+		 buf->buf_id,
+		 buf->tag.rnode.spcNode,
+		 buf->tag.rnode.dbNode,
+		 buf->tag.rnode.relNode,
+		 buf->tag.blockNum,
+		 BLOCK_GROUP(buf->tag.blockNum),
+		 buf->pbm_bgroup_next, buf->pbm_bgroup_prev
+	);
+
 
 	group = AddBufToBlock(buf);
+
+	// TODO stop here if there is no group
+	if (group == NULL) return;
+
+	Assert(group->buffers_head == buf->buf_id);
+
+	sanity_check_verify_block_group_buffers(buf);
+
+//return;
+	BufferDesc* temp = GetBufferDescriptor(group->buffers_head);
+	BufferDesc* temp2 = temp->pbm_bgroup_next < 0 ? NULL : GetBufferDescriptor(temp->pbm_bgroup_next);
+
+	if (temp2 != NULL) {
+		elog(INFO, "PbmNewBuffer added new buffer:"
+				   "\n\t new={id=%d, tbl={spc=%u, db=%u, rel=%u} block=%u group=%u prev=%d next=%d}"
+				   "\n\t old={id=%d, tbl={spc=%u, db=%u, rel=%u} block=%u group=%u prev=%d next=%d}",
+			 temp->buf_id,
+			 temp->tag.rnode.spcNode,
+			 temp->tag.rnode.dbNode,
+			 temp->tag.rnode.relNode,
+			 temp->tag.blockNum,
+			 BLOCK_GROUP(temp->tag.blockNum),
+			 temp->pbm_bgroup_prev, temp->pbm_bgroup_next
+			 ,
+			 temp2->buf_id,
+			 temp2->tag.rnode.spcNode,
+			 temp2->tag.rnode.dbNode,
+			 temp2->tag.rnode.relNode,
+			 temp2->tag.blockNum,
+			 BLOCK_GROUP(temp2->tag.blockNum),
+			 temp2->pbm_bgroup_prev, temp2->pbm_bgroup_next
+		);
+	} else {
+		elog(INFO, "PbmNewBuffer added new buffer:"
+				   "\n\t new={id=%d, tbl={spc=%u, db=%u, rel=%u} block=%u group=%u prev=%d next=%d}"
+			 	   "\n\t old={n/a}",
+			 temp->buf_id,
+			 temp->tag.rnode.spcNode,
+			 temp->tag.rnode.dbNode,
+			 temp->tag.rnode.relNode,
+			 temp->tag.blockNum,
+			 BLOCK_GROUP(temp->tag.blockNum),
+			 temp->pbm_bgroup_next, temp->pbm_bgroup_prev
+		);
+	}
+
+	// TODO if group wasn't in the PQ already, add it?
 }
 
 
@@ -619,58 +684,138 @@ void PbmBufferNotPinned(struct BufferDesc* buf){
 
 
 // ### eventually want to get rid of this
-inline void PbmOnEvictBuffer(struct BufferDesc* buf) {
-#if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS)
+inline void PbmOnEvictBuffer(struct BufferDesc *const buf) {
+#if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS) && defined(TRACE_PBM_BUFFERS_EVICT)
 // ### debugging checks...
-	const RelFileNode	rnode = buf->tag.rnode;
-	const ForkNumber 	fork = buf->tag.forkNum;
-	const BlockNumber	bgroup = BLOCK_GROUP(buf->tag.blockNum);
-	BufferDesc* it;
-
-	elog(INFO, "evicting buffer %d tbl={spc=%u, db=%u, rel=%u, fork=%d} block#=%u",
+	static int num_evicted = 0;
+	elog(WARNING, "evicting buffer %d tbl={spc=%u, db=%u, rel=%u, fork=%d} block#=%u, #evictions=%d",
 		 buf->buf_id,
 		 buf->tag.rnode.spcNode,
 		 buf->tag.rnode.dbNode,
 		 buf->tag.rnode.relNode,
 		 buf->tag.forkNum,
-		 buf->tag.blockNum
+		 buf->tag.blockNum,
+		 num_evicted++
 	);
 
-	// get first buffer in the list
-	it = buf;
-	while (it->pbm_bgroup_prev != FREENEXT_END_OF_LIST) {
-		it = GetBufferDescriptor(it->pbm_bgroup_prev);
+	if (buf->tag.blockNum == InvalidBlockNumber) {
+		// not really evicting anything!
+		// TODO move call to PbmOnEvictBuffer to only be when we evict...
+		return;
 	}
 
-	// make sure everything in the list has the same group
-	while (it != NULL) {
-		if (it->tag.rnode.spcNode != rnode.spcNode
-				|| it->tag.rnode.dbNode != rnode.dbNode
-				|| it->tag.rnode.relNode != rnode.dbNode
-				|| it->tag.forkNum != fork
-				|| BLOCK_GROUP(it->tag.blockNum) != bgroup)
-		{
-			const BufferTag tag = it->tag;
-			elog(ERROR, "BLOCK GROUP has buffer from the wrong group!"
-						"\n\texpected: \ttbl={spc=%u, db=%u, rel=%u, fork=%d} block_group=%u"
-						"\n\tgot:\ttbl={spc=%u, db=%u, rel=%u, fork=%d} block#=%u (group=%u)",
-				rnode.spcNode, rnode.dbNode, rnode.relNode, fork, bgroup,
-				tag.rnode.spcNode, tag.rnode.dbNode, tag.rnode.relNode, tag.forkNum, tag.blockNum, BLOCK_GROUP(tag.blockNum)
-			);
-		}
-		if (FREENEXT_END_OF_LIST == it->pbm_bgroup_next) it = NULL;
-		else it = GetBufferDescriptor(it->pbm_bgroup_next);
-	}
-#endif // TRACE_PBM && TRACE_PBM_BUFFERS
+	// Check everything in the block group actually belongs to the same group
+	sanity_check_verify_block_group_buffers(buf);
+
+#endif // TRACE_PBM && TRACE_PBM_BUFFERS && TRACE_PBM_BUFFERS_EVICT
 
 // ### need to lock the block group? (worry about it later, this needs to change anyways...)
-	BufRemoveFromBlock(buf);
+	RemoveBufFromBlock(buf);
 }
 
 
 ///-------------------------------------------------------------------------
 /// Private helpers:
 ///-------------------------------------------------------------------------
+
+void sanity_check_verify_block_group_buffers(const BufferDesc * const buf) {
+	const RelFileNode rnode = buf->tag.rnode;
+	const ForkNumber  fork = buf->tag.forkNum;
+	const BlockNumber bgroup = BLOCK_GROUP(buf->tag.blockNum);
+
+	int num_traversed = 0;
+
+	// get first buffer in the list
+	const BufferDesc * it = buf;
+
+	// Buffer is not in any list (special thing here...
+	if (-3 == it->pbm_bgroup_prev) {
+		// ### this should eventually be disallowed
+		Assert(-3 == it->pbm_bgroup_next);
+		return;
+	}
+
+	Assert(it->pbm_bgroup_prev != FREENEXT_NOT_IN_LIST && it->pbm_bgroup_next != FREENEXT_NOT_IN_LIST);
+
+	while (it->pbm_bgroup_prev != FREENEXT_END_OF_LIST) {
+		it = GetBufferDescriptor(it->pbm_bgroup_prev);
+		++num_traversed;
+		if (num_traversed % 100 == 0) {
+			elog(WARNING, "sanity_check traversed 100 blocks!");
+
+			it = buf;
+			for (int i = 0; i < 10; ++i) {
+				const BufferTag tag = it->tag;
+				elog(WARNING, " tbl={spc=%u, db=%u, rel=%u, fork=%d} block#=%u (group=%u) prev=%d next=%d",
+					 tag.rnode.spcNode, tag.rnode.dbNode, tag.rnode.relNode, tag.forkNum, tag.blockNum, BLOCK_GROUP(tag.blockNum),
+					 it->pbm_bgroup_prev, it->pbm_bgroup_next
+				);
+//				it = GetBufferDescriptor(it->pbm_bgroup_next);
+				it = GetBufferDescriptor(it->pbm_bgroup_prev);
+			}
+
+
+			elog(ERROR, "sanity_check traversed 100 blocks!");
+			return;
+		}
+	}
+
+	// make sure everything in the list has the same group
+	while (it != NULL) {
+		if (it->tag.rnode.spcNode != rnode.spcNode
+			|| it->tag.rnode.dbNode != rnode.dbNode
+			|| it->tag.rnode.relNode != rnode.relNode
+			|| it->tag.forkNum != fork
+			|| BLOCK_GROUP(it->tag.blockNum) != bgroup)
+		{
+			const BufferTag tag = it->tag;
+
+			bool found;
+			BlockGroupData* data = search_block_group(buf, &found);
+
+			list_all_buffers();
+
+			elog(ERROR, "BLOCK GROUP has buffer from the wrong group!"
+						"\n\texpected: \ttbl={spc=%u, db=%u, rel=%u, fork=%d} block_group=%u"
+						"\n\tgot:      \ttbl={spc=%u, db=%u, rel=%u, fork=%d} block#=%u (group=%u)",
+//						"\n\tgroup:    \t",
+				 rnode.spcNode, rnode.dbNode, rnode.relNode, fork, bgroup,
+				 tag.rnode.spcNode, tag.rnode.dbNode, tag.rnode.relNode, tag.forkNum, tag.blockNum, BLOCK_GROUP(tag.blockNum)
+			);
+		}
+		if (FREENEXT_END_OF_LIST == it->pbm_bgroup_next) it = NULL;
+		else it = GetBufferDescriptor(it->pbm_bgroup_next);
+	}
+}
+
+void list_all_buffers() {
+	for (int i = 0; i < NBuffers; ++i) {
+		BufferDesc* buf = GetBufferDescriptor(i);
+		BufferTag tag = buf->tag;
+		elog(WARNING, "BLOCK %d: \tspc=%u, db=%u, rel=%u, fork=%d, block=%u (group=%u) \tprev=%d  next=%d",
+			 i, tag.rnode.spcNode, tag.rnode.dbNode, tag.rnode.relNode, tag.forkNum, tag.blockNum, BLOCK_GROUP(tag.blockNum)
+			, buf->pbm_bgroup_prev, buf->pbm_bgroup_next
+		);
+
+		bool found;
+		BlockGroupData* data = search_block_group(buf, &found);
+
+		if (!found || data == NULL) {
+			elog(WARNING, "\tGROUP NOT FOUND!  prev=%d  next=%d", buf->pbm_bgroup_prev, buf->pbm_bgroup_next);
+			continue;
+		}
+
+		Buffer bid;
+		for (bid = data->buffers_head; bid >= 0 && bid <= NBuffers; bid = GetBufferDescriptor(bid)->pbm_bgroup_next) {
+			BufferDesc* buf2 = GetBufferDescriptor(bid);
+			tag = buf2->tag;
+			elog(WARNING, "\tbid=%d:  \tspc=%u, db=%u, rel=%u, fork=%d, block=%u (group=%u) \tPREV=%d, NEXT=%d",
+				 bid,
+				 tag.rnode.spcNode, tag.rnode.dbNode, tag.rnode.relNode, tag.forkNum, tag.blockNum, BLOCK_GROUP(tag.blockNum)
+				 , buf2->pbm_bgroup_prev, buf2->pbm_bgroup_next
+			);
+		}
+}
 
 void debug_buffer_access(BufferDesc* buf, char* msg) {
 	bool found, requested;
@@ -683,7 +828,7 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 	clock_t next_access_time = NotRequested;
 	clock_t now = clock();
 
-	BlockGroupData* block_scans = search_block_group(buf, &found);
+	const BlockGroupData *const block_scans = search_block_group(buf, &found);
 	if (true == found) {
 		next_access_time = PageNextConsumption(block_scans, &requested);
 	}
@@ -715,16 +860,16 @@ ScanData* search_scan(const ScanId id, HASHACTION action, bool* foundPtr) {
 }
 
 // Search block group map for a particular buffer returning the location in the array
-BlockGroupData * search_block_group(BufferDesc* buf, bool* foundPtr) {
-	BlockNumber blockNum = buf->tag.blockNum;
-	BlockNumber bgroup = BLOCK_GROUP(blockNum);
-	TableData tbl = (TableData){
+BlockGroupData * search_block_group(const BufferDesc *const buf, bool* foundPtr) {
+	const BlockNumber blockNum = buf->tag.blockNum;
+	const BlockNumber bgroup = BLOCK_GROUP(blockNum);
+	const TableData tbl = (TableData){
 			.rnode = buf->tag.rnode,
 			.forkNum = buf->tag.forkNum,
 	};
 
 	// Look up by the table
-	BlockGroupHashEntry * b_entry = hash_search(pbm->BufferMap, &tbl, HASH_FIND, foundPtr);
+	const BlockGroupHashEntry *const b_entry = hash_search(pbm->BufferMap, &tbl, HASH_FIND, foundPtr);
 
 	if (false == *foundPtr) return NULL;
 
@@ -821,7 +966,7 @@ void debug_log_buffers_map(void) {
 }
 
 // Estimate the next access time of a block group based on the scan progress
-clock_t ScanTimeToNextConsumption(BlockGroupScanList* stats, bool* foundPtr) {
+clock_t ScanTimeToNextConsumption(const BlockGroupScanList *const stats, bool* foundPtr) {
 	const ScanId id = stats->scan_id;
 	ScanData s_data;
 	const BlockNumber blocks_behind = GROUP_TO_FIRST_BLOCK(stats->blocks_behind);
@@ -849,10 +994,10 @@ clock_t ScanTimeToNextConsumption(BlockGroupScanList* stats, bool* foundPtr) {
 	return (clock_t)((float)blocks_remaining / s_data.est_speed);
 }
 
-clock_t PageNextConsumption(BlockGroupData *stats, bool *requestedPtr) {
+clock_t PageNextConsumption(const BlockGroupData *const stats, bool *requestedPtr) {
 	clock_t min_next_access = -1;
 	bool found = false;
-	BlockGroupScanList * it;
+	const BlockGroupScanList * it;
 
 // ### lock the entry in some way?
 
@@ -883,12 +1028,12 @@ clock_t PageNextConsumption(BlockGroupData *stats, bool *requestedPtr) {
 }
 
 // Initialize an entry in the list of scans for a block group
-void InitScanStatsEntry(BlockGroupScanList* temp, ScanId id, ScanData* sdata, BlockGroupScanList* next, BlockNumber bgnum) {
-	BlockNumber startblock = sdata->startBlock;
-	BlockNumber nblocks = sdata->nblocks;
-	BlockNumber blocks_behind;
+void InitScanStatsEntry(BlockGroupScanList *const temp, ScanId id, ScanData* sdata, BlockGroupScanList *const next, const BlockNumber bgnum) {
+	const BlockNumber startblock = sdata->startBlock;
+	const BlockNumber nblocks = sdata->nblocks;
 	// convert group # -> block #
-	BlockNumber block_num = GROUP_TO_FIRST_BLOCK(bgnum);
+	const BlockNumber block_num = GROUP_TO_FIRST_BLOCK(bgnum);
+	BlockNumber blocks_behind;
 
 	// calculate where the block group is in the scan relative to start block
 	if (block_num >= startblock) {
@@ -906,7 +1051,7 @@ void InitScanStatsEntry(BlockGroupScanList* temp, ScanId id, ScanData* sdata, Bl
 }
 
 // Delete a specific scan from the list of the given block group
-bool DeleteScanFromGroup(ScanId id, BlockGroupData* groupData) {
+bool DeleteScanFromGroup(const ScanId id, BlockGroupData *const groupData) {
 	BlockGroupScanList *it = groupData->scans_head;
 	BlockGroupScanList **prev = &groupData->scans_head;
 
@@ -929,14 +1074,16 @@ bool DeleteScanFromGroup(ScanId id, BlockGroupData* groupData) {
 	}
 }
 
-BlockGroupData * AddBufToBlock(struct BufferDesc *buf) {
+BlockGroupData * AddBufToBlock(BufferDesc *const buf) {
 	bool found;
-	BlockGroupData* group;
+	BlockGroupData * group;
 	Buffer group_head;
 
+	Assert(buf->pbm_bgroup_next == FREENEXT_NOT_IN_LIST && buf->pbm_broup_prev == FREENEXT_NOT_IN_LIST);
 	if (buf->pbm_bgroup_next != FREENEXT_NOT_IN_LIST) {
-		Assert(FREENEXT_NOT_IN_LIST = buf->pbm_group_prev);
+		Assert(buf->pbm_bgroup_prev != FREENEXT_NOT_IN_LIST);
 		return NULL; // nothing to do
+		// TODO should this be possible at all?
 	}
 
 	// Find the block group for this buffer
@@ -945,15 +1092,20 @@ BlockGroupData * AddBufToBlock(struct BufferDesc *buf) {
 
 	if (false == found) {
 		// TODO ... how to handle buffers not associated with any scans? (let normal buffer manager handle it I guess)
+		// ### sanity check: use -3 as a signal
+		buf->pbm_bgroup_prev = -3;
+		buf->pbm_bgroup_next = -3;
+
 		return NULL;
 	}
 
 	// Link the buffer into the block group chain of buffers
 	group_head = group->buffers_head;
+	group->buffers_head = buf->buf_id;
 	buf->pbm_bgroup_next = group_head;
 	buf->pbm_bgroup_prev = FREENEXT_END_OF_LIST;
 	if (group_head != FREENEXT_END_OF_LIST) {
-		GetBufferDescriptor(group_head)->pbm_bgroup_prev = BufferDescriptorGetBuffer(buf);
+		GetBufferDescriptor(group_head)->pbm_bgroup_prev = buf->buf_id;
 	}
 
 	return group;
@@ -961,12 +1113,15 @@ BlockGroupData * AddBufToBlock(struct BufferDesc *buf) {
 
 
 static inline
-void BufRemoveFromBlock(const BufferDesc *buf) {
-	Buffer next, prev;
+void RemoveBufFromBlock(BufferDesc *const buf) {
+	int next, prev;
 // ### locking needed? (lock first when calling?)
 
 	// Nothing to do if it isn't in the list
-	if (FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_next) return;
+	if (FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_next) {
+		Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_prev);
+		return;
+	}
 
 	next = buf->pbm_bgroup_next;
 	prev = buf->pbm_bgroup_prev;
@@ -977,7 +1132,17 @@ void BufRemoveFromBlock(const BufferDesc *buf) {
 	}
 	if (prev != FREENEXT_END_OF_LIST) {
 		GetBufferDescriptor(prev)->pbm_bgroup_next = next;
+	} else {
+		// This is the first one in the list, remove from the group!
+// ### some way to optimize this?? maybe using pointers instead of indexes?
+		bool found;
+		BlockGroupData * group = search_block_group(buf, &found);
+		Assert(found);
+		group->buffers_head = next;
 	}
+
+	buf->pbm_bgroup_prev = FREENEXT_NOT_IN_LIST;
+	buf->pbm_bgroup_next = FREENEXT_NOT_IN_LIST;
 }
 
 #if 0
