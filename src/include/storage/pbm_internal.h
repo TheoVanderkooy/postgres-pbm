@@ -35,7 +35,7 @@ typedef struct PbmPQ {
 	PbmPQBucket ** buckets;
 	// ### keep track of "not requested" and "very far future" separately?
 
-	long last_refreshed;
+	long last_shifted;
 	long first_bucket_time;
 
 
