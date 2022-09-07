@@ -18,6 +18,7 @@ OBJS = \
 	bufmgr.o \
 	freelist.o \
 	localbuf.o \
-	pbm.o
+	pbm.o \
+	pbm_internal.o
 
 include $(top_srcdir)/src/backend/common.mk

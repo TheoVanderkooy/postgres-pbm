@@ -4,6 +4,7 @@
 #include "postgres.h"
 
 #include "storage/pbm.h"
+#include "storage/pbm_internal.h"
 
 #include "miscadmin.h"
 #include "lib/stringinfo.h"
@@ -37,11 +38,16 @@
 // how much to shift the block # by to find its group
 #define BLOCK_GROUP_SHIFT 5 // 10
 
-static const clock_t NotRequested = 0;
+static const long NotRequested = 0;
 
 // not hard limits
 #define SCAN_MAP_MAX_SIZE 1024
 #define BLOCK_MAP_MAX_SIZE 1024
+
+// 10^9 ns per second
+#define NS_PER_SEC 1000000000
+#define PBM_CLOCK CLOCK_MONOTONIC
+//#define PBM_CLOCK CLOCK_MONOTONIC_COARSE
 
 ///-------------------------------------------------------------------------
 /// Helper macros
@@ -80,7 +86,7 @@ typedef struct ScanData {
 
 	// Statistics
 // ### Consider concurrency control for these. Only *written* from one thread, but could be read concurrently from others
-	clock_t		last_report_time;
+	long		last_report_time;
 	BlockNumber	last_pos;
 	BlockNumber	blocks_scanned;
 	float		est_speed;
@@ -119,7 +125,13 @@ typedef struct BlockGroupData {
 	BlockGroupScanList* scans_head;
 
 	// Set of (### unpinned?) buffers holding data in this block group
-	Buffer buffers_head;
+	int buffers_head;
+
+	// Linked-list in PQ buckets
+	struct PbmPQBucket* pq_bucket;
+	struct BlockGroupData* bucket_next;
+	struct BlockGroupData* bucket_prev;
+	// TODO initialize these fields!
 } BlockGroupData;
 
 // Hash value: array of info for all block groups in the relation fork
@@ -144,6 +156,9 @@ typedef struct PbmShared {
 	// TODO more granular locking if it could improve performance.
 	// ### where to use `volatile`?
 
+	/// Time-related stuff
+	time_t start_time_sec;
+
 	/// Atomic counter for ID generation
 	/// Note: protected by PbmScansLock: could make it atomic but it is only accessed when we lock the hash table anyways.
 	volatile ScanId next_id;
@@ -155,10 +170,10 @@ typedef struct PbmShared {
 // ### Map[ range (table -> block indexes) -> scan ] --- for looking up what scans reference a particular block, maybe useful later
 	//	HTAB * ScansByRange;
 
-	/// Map[ table -> buffer -> set of scans ] + free-list of the list-nodes for tracking statistics on each buffer
+	/// Map[ table -> BlockGroup -> set of scans ] + free-list of the list-nodes for tracking statistics on each buffer
 	/// Protected by PbmBlocksLock
-	HTAB * BufferMap;
-	BlockGroupScanList* buffer_stats_free_list;
+	HTAB * BlockGroupMap;
+	BlockGroupScanList* block_group_stats_free_list;
 // ### if possible, free list could be protected by its own spinlock instead of using this lock
 // TODO modify the map to be: (i.e. linked hash-map of block groups, stored in fixed-size buffers to ammortize allocations and reduce the size of hash map needed)
 //   Map[ (table, block group >> N) -> entry ]
@@ -167,6 +182,9 @@ typedef struct PbmShared {
 //   	Array [ 1 << N ] of BlockGroupData
 //		entry* next ptr
 //	 }
+
+	/// Priority queue of block groups that could be evicted
+	PbmPQ * BlockQueue;
 
 	/// Global estimate of speed used for *new* scans
 	/// Currently NOT protected, as long as write is atomic we don't really care about lost updates...
@@ -200,14 +218,14 @@ static void debug_log_scan_map(void);
 static void debug_append_buffer_data(StringInfoData * str, BlockGroupHashEntry * entry);
 static void debug_log_buffers_map(void);
 static void debug_buffer_access(BufferDesc* buf, char* msg);
-static void list_all_buffers();
+static void list_all_buffers(void);
 
 // sanity checks
 static void sanity_check_verify_block_group_buffers(const BufferDesc * buf);
 
 // managing buffer priority
-static clock_t ScanTimeToNextConsumption(const BlockGroupScanList* stats, bool* foundPtr);
-static clock_t PageNextConsumption(const BlockGroupData* stats, bool *requestedPtr);
+static long ScanTimeToNextConsumption(const BlockGroupScanList* stats, bool* foundPtr);
+static long PageNextConsumption(const BlockGroupData* stats, bool *requestedPtr);
 
 
 /// Inline private helpers
@@ -226,6 +244,7 @@ void InitPBM(void) {
 	bool found;
 	int hash_flags;
 	HASHCTL hash_info;
+	struct timespec ts;
 
 	// Initialize the PBM
 	pbm = (PbmShared*) ShmemInitStruct("Predictive buffer manager", sizeof(PbmShared), &found);
@@ -240,9 +259,16 @@ void InitPBM(void) {
 	Assert(!IsUnderPostmaster);
 
 	pbm->next_id = 0;
-	pbm->buffer_stats_free_list = NULL;
-	pbm->initial_est_speed = 0.1f;
+	pbm->block_group_stats_free_list = NULL;
+	pbm->initial_est_speed = 0.0001f;
 // ### what should be initial-initial speed estimate lol
+// ### need to adjust it for units...
+
+	// record starting time
+	clock_gettime(PBM_CLOCK, &ts);
+	pbm->start_time_sec = ts.tv_sec;
+
+
 
 // ### should either of these be partitioned? (HASH_PARTITION)
 
@@ -260,7 +286,10 @@ void InitPBM(void) {
 		.entrysize = sizeof(BlockGroupHashEntry),
 	};
 	hash_flags = HASH_ELEM | HASH_BLOBS;
-	pbm->BufferMap = ShmemInitHash("PBM buffer stats", 32, 1024, &hash_info, hash_flags);
+	pbm->BlockGroupMap = ShmemInitHash("PBM buffer stats", 32, 1024, &hash_info, hash_flags);
+
+	// Priority queue
+	pbm->BlockQueue = InitPbmPQ();
 
 // ### other fields to be added...
 
@@ -328,7 +357,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 				.nblocks = nblocks,
 				.est_speed = init_est_speed,
 				.blocks_scanned = 0,
-				.last_report_time = clock(),
+				.last_report_time = get_time_ns(),
 		};
 	}
 
@@ -336,7 +365,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 	LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
 
 		// Insert into the buffer map as well
-		b_entry = hash_search(pbm->BufferMap, &tbl, HASH_ENTER, &found);
+		b_entry = hash_search(pbm->BlockGroupMap, &tbl, HASH_ENTER, &found);
 		if (false == found) {
 			const uint32 len = nblock_groups;
 			const uint32 cap = len + (len >> 2); // ### Max(5, (len >> 2)); // allocate with 25% extra capacity
@@ -394,10 +423,10 @@ void RegisterSeqScan(HeapScanDesc scan) {
 
 		// Add the scan for each block group
 		// First, use as many freed buffer-stats structs as we can
-		for (bgnum = 0; pbm->buffer_stats_free_list != NULL && bgnum < nblock_groups; ++bgnum) {
+		for (bgnum = 0; pbm->block_group_stats_free_list != NULL && bgnum < nblock_groups; ++bgnum) {
 			// Pop list element off the free-list
-			BlockGroupScanList *const temp = pbm->buffer_stats_free_list;
-			pbm->buffer_stats_free_list = temp->next;
+			BlockGroupScanList *const temp = pbm->block_group_stats_free_list;
+			pbm->block_group_stats_free_list = temp->next;
 
 			// Initialize the list element
 			InitScanStatsEntry(temp, id, s_data, b_entry->val.blockGroups[bgnum].scans_head, bgnum);
@@ -481,9 +510,9 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 
 	// For each block in the scan: remove it from the list of scans
 	LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
-		BlockGroupHashEntry *const b_entry = hash_search(pbm->BufferMap, &tbl, HASH_FIND, &found);
+		BlockGroupHashEntry *const b_entry = hash_search(pbm->BlockGroupMap, &tbl, HASH_FIND, &found);
 		if (false == found || NULL == b_entry) {
-			elog(WARNING, "UnregisterSeqScan(%lu): could not find table in BufferMap", id);
+			elog(WARNING, "UnregisterSeqScan(%lu): could not find table in BlockGroupMap", id);
 		} else {
 
 // ### vvv this could be done outside the lock (with only shared access) if we have locks for each buffer.
@@ -500,7 +529,7 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 
 void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 	bool found;
-	clock_t curTime, elapsed;
+	long curTime, elapsed;
 	ScanData *entry;
 	BlockNumber blocks;
 	BlockNumber prevGroupPos, curGroupPos;
@@ -529,7 +558,7 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 
 	// Note: the entry is only *written* in one process.
 	// If readers aren't atomic: how bad is this? Could mis-predict next access time...
-	curTime = clock();
+	curTime = get_time_ns();
 	elapsed = curTime - entry->last_report_time;
 	if (pos > entry->last_pos) {
 		blocks = pos - entry->last_pos;
@@ -550,7 +579,7 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 	if (curGroupPos != prevGroupPos) {
 		tbl = (TableData){ .rnode = entry->rnode, .forkNum = entry->forkNum, };
 		LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
-			const BlockGroupHashEntry * const b_entry = hash_search(pbm->BufferMap, &tbl, HASH_FIND, &found);
+			const BlockGroupHashEntry * const b_entry = hash_search(pbm->BlockGroupMap, &tbl, HASH_FIND, &found);
 			BlockNumber upper = curGroupPos;
 			Assert(found && b_entry != NULL);
 
@@ -787,7 +816,7 @@ void sanity_check_verify_block_group_buffers(const BufferDesc * const buf) {
 	}
 }
 
-void list_all_buffers() {
+void list_all_buffers(void) {
 	for (int i = 0; i < NBuffers; ++i) {
 		BufferDesc *buf = GetBufferDescriptor(i);
 		BufferTag tag = buf->tag;
@@ -825,8 +854,8 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 			.rnode = buf->tag.rnode,
 			.forkNum = buf->tag.forkNum,
 	};
-	clock_t next_access_time = NotRequested;
-	clock_t now = clock();
+	long next_access_time = NotRequested;
+	long now = get_time_ns();
 
 	const BlockGroupData *const block_scans = search_block_group(buf, &found);
 	if (true == found) {
@@ -866,7 +895,7 @@ BlockGroupData * search_block_group(const BufferDesc *const buf, bool* foundPtr)
 	};
 
 	// Look up by the table
-	const BlockGroupHashEntry *const b_entry = hash_search(pbm->BufferMap, &tbl, HASH_FIND, foundPtr);
+	const BlockGroupHashEntry *const b_entry = hash_search(pbm->BlockGroupMap, &tbl, HASH_FIND, foundPtr);
 
 	if (false == *foundPtr) return NULL;
 
@@ -945,7 +974,7 @@ void debug_log_buffers_map(void) {
 		HASH_SEQ_STATUS status;
 		BlockGroupHashEntry * entry;
 
-		hash_seq_init(&status, pbm->BufferMap);
+		hash_seq_init(&status, pbm->BlockGroupMap);
 
 		for(;;) {
 			entry = hash_seq_search(&status);
@@ -963,7 +992,7 @@ void debug_log_buffers_map(void) {
 }
 
 // Estimate the next access time of a block group based on the scan progress
-clock_t ScanTimeToNextConsumption(const BlockGroupScanList *const stats, bool* foundPtr) {
+long ScanTimeToNextConsumption(const BlockGroupScanList *const stats, bool* foundPtr) {
 	const ScanId id = stats->scan_id;
 	ScanData s_data;
 	const BlockNumber blocks_behind = GROUP_TO_FIRST_BLOCK(stats->blocks_behind);
@@ -988,11 +1017,11 @@ clock_t ScanTimeToNextConsumption(const BlockGroupScanList *const stats, bool* f
 		blocks_remaining = blocks_behind - blocks_scanned;
 	}
 
-	return (clock_t)((float)blocks_remaining / s_data.est_speed);
+	return (long)((float)blocks_remaining / s_data.est_speed);
 }
 
-clock_t PageNextConsumption(const BlockGroupData *const stats, bool *requestedPtr) {
-	clock_t min_next_access = -1;
+long PageNextConsumption(const BlockGroupData *const stats, bool *requestedPtr) {
+	long min_next_access = -1;
 	bool found = false;
 	const BlockGroupScanList * it;
 
@@ -1008,7 +1037,7 @@ clock_t PageNextConsumption(const BlockGroupData *const stats, bool *requestedPt
 	// loop over the scans and check the next access time estimate from that scan
 	it = stats->scans_head;
 	while (it != NULL) {
-		const clock_t time_to_next_access = ScanTimeToNextConsumption(it, &found);
+		const long time_to_next_access = ScanTimeToNextConsumption(it, &found);
 		if (true == found && (false == *requestedPtr || time_to_next_access < min_next_access)) {
 			min_next_access = time_to_next_access;
 			*requestedPtr = true;
@@ -1020,7 +1049,7 @@ clock_t PageNextConsumption(const BlockGroupData *const stats, bool *requestedPt
 	if (false == *requestedPtr) {
 		return NotRequested;
 	} else {
-		return clock() + min_next_access;
+		return get_time_ns() + min_next_access;
 	}
 }
 
@@ -1065,8 +1094,8 @@ bool DeleteScanFromGroup(const ScanId id, BlockGroupData *const groupData) {
 		// unlink
 		*prev = it->next;
 		// add to free list
-		it->next = pbm->buffer_stats_free_list;
-		pbm->buffer_stats_free_list = it;
+		it->next = pbm->block_group_stats_free_list;
+		pbm->block_group_stats_free_list = it;
 		return true;
 	}
 }
@@ -1141,6 +1170,18 @@ void RemoveBufFromBlock(BufferDesc *const buf) {
 	buf->pbm_bgroup_prev = FREENEXT_NOT_IN_LIST;
 	buf->pbm_bgroup_next = FREENEXT_NOT_IN_LIST;
 }
+
+
+long get_time_ns(void) {
+	struct timespec now;
+	clock_gettime(PBM_CLOCK, &now);
+
+	return NS_PER_SEC * (now.tv_sec - pbm->start_time_sec) + now.tv_nsec;
+}
+
+
+
+
 
 #if 0
 void PagePush(/*TODO args --- page + header? */) {

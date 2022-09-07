@@ -55,3 +55,4 @@ WrapLimitsVacuumLock				46
 NotifyQueueTailLock					47
 PbmScansLock                        48
 PbmBlocksLock                       49
+PbmPqLock                           50
