@@ -21,47 +21,6 @@
 // TODO! look for ### comments --- low-priority/later TODOs
 
 
-///-------------------------------------------------------------------------
-/// Configuration
-///-------------------------------------------------------------------------
-
-// Output debugging messages
-#define TRACE_PBM
-//#define TRACE_PBM_REPORT_PROGRESS
-//#define TRACE_PBM_PRINT_SCANMAP
-//#define TRACE_PBM_PRINT_BLOCKMAP
-//#define TRACE_PBM_BUFFERS
-//#define TRACE_PBM_BUFFERS_NEW
-//#define TRACE_PBM_BUFFERS_EVICT
-#define SANITY_PBM_BUFFERS
-
-// how much to shift the block # by to find its group
-#define BLOCK_GROUP_SHIFT 5 // 10
-
-static const long NotRequested = 0;
-
-// not hard limits
-#define SCAN_MAP_MAX_SIZE 1024
-#define BLOCK_MAP_MAX_SIZE 1024
-
-// 10^9 ns per second
-#define NS_PER_SEC 1000000000
-#define PBM_CLOCK CLOCK_MONOTONIC
-//#define PBM_CLOCK CLOCK_MONOTONIC_COARSE
-
-///-------------------------------------------------------------------------
-/// Helper macros
-///-------------------------------------------------------------------------
-
-/// Helper to make sure locks get freed
-/// NOTE: do NOT return from inside the lock guard (or break/continue if it will leave the scope), the lock won't be released.
-//#define LOCK_GUARD_V1(lock, mode, code) LWLockAcquire((lock), (mode)); {code} LWLockRelease((lock));
-#define LOCK_GUARD_V2(lock, mode) \
-  for (bool _c_ = true, pg_attribute_unused() _unused = LWLockAcquire((lock), (mode)); _c_; LWLockRelease((lock)), _c_ = false)
-
-/// Block size is too small to store *every* block individually, shift the ID to reduce the # of blocks.
-#define BLOCK_GROUP(block) ((block) >> BLOCK_GROUP_SHIFT)
-#define GROUP_TO_FIRST_BLOCK(group) ((group) << BLOCK_GROUP_SHIFT)
 
 
 ///-------------------------------------------------------------------------
@@ -105,34 +64,6 @@ typedef struct TableData {
 	RelFileNode	rnode;
 	ForkNumber	forkNum;
 } TableData;
-
-// Info about a scan for the block group. (linked list)
-// ### make linked-list of short arrays to improve performance (less pointer chasing and less frequent allocations)
-typedef struct BlockGroupScanList {
-	// Info about the current scan
-	ScanId		scan_id;
-	BlockNumber	blocks_behind;
-
-	// Next item in the list
-	struct BlockGroupScanList* next;
-} BlockGroupScanList;
-
-// Record data for this block group.
-typedef struct BlockGroupData {
-// ### some kind of lock?
-
-	// Set of scans which care about this block group
-	BlockGroupScanList* scans_head;
-
-	// Set of (### unpinned?) buffers holding data in this block group
-	int buffers_head;
-
-	// Linked-list in PQ buckets
-	struct PbmPQBucket* pq_bucket;
-	struct BlockGroupData* bucket_next;
-	struct BlockGroupData* bucket_prev;
-	// TODO initialize these fields!
-} BlockGroupData;
 
 // Hash value: array of info for all block groups in the relation fork
 typedef struct BlockGroupDataVec {
@@ -232,6 +163,7 @@ static long PageNextConsumption(const BlockGroupData* stats, bool *requestedPtr)
 // ### revisit to see which other ones should be inline
 
 static inline void RemoveBufFromBlock(BufferDesc *buf);
+static inline BlockGroupData EmptyBlockGroupData();
 
 
 ///-------------------------------------------------------------------------
@@ -278,7 +210,7 @@ void InitPBM(void) {
 		.entrysize = sizeof(ScanHashEntry),
 	};
 	hash_flags = HASH_ELEM | HASH_BLOBS;
-	pbm->ScanMap = ShmemInitHash("PBM active scan stats", 128, 1024, &hash_info, hash_flags);
+	pbm->ScanMap = ShmemInitHash("PBM active scan stats", 128, ScanMapMaxSize, &hash_info, hash_flags);
 
 	// Initialize map of blocks
 	hash_info = (HASHCTL) {
@@ -286,7 +218,7 @@ void InitPBM(void) {
 		.entrysize = sizeof(BlockGroupHashEntry),
 	};
 	hash_flags = HASH_ELEM | HASH_BLOBS;
-	pbm->BlockGroupMap = ShmemInitHash("PBM buffer stats", 32, 1024, &hash_info, hash_flags);
+	pbm->BlockGroupMap = ShmemInitHash("PBM buffer stats", 32, BlockGroupMapMaxSize, &hash_info, hash_flags);
 
 	// Priority queue
 	pbm->BlockQueue = InitPbmPQ();
@@ -301,13 +233,13 @@ Size PbmShmemSize(void) {
 	Size size = 0;
 #ifdef USE_PBM
 	size = add_size(size, sizeof(PbmShared));
-	size = add_size(size, hash_estimate_size(SCAN_MAP_MAX_SIZE, sizeof(ScanHashEntry)));
-	size = add_size(size, hash_estimate_size(BLOCK_MAP_MAX_SIZE, sizeof(BlockGroupHashEntry)));
+	size = add_size(size, hash_estimate_size(ScanMapMaxSize, sizeof(ScanHashEntry)));
+	size = add_size(size, hash_estimate_size(BlockGroupMapMaxSize, sizeof(BlockGroupHashEntry)));
 // ### total size estimate for the lists of block groups
 //	size = add_size(size, sizeof(BlockGroupData) * ???)
 // ### total size estimate of list of scans on each block group
 //	size = add_size(size, sizeof(BlockGroupScanList) * ???)
-// ### set of buffers in each block group doesn't take additional space, embedded in the buffer header
+	size = add_size(size, PbmPqShmemSize());
 
 // ### ADD SIZE ESTIMATES
 
@@ -376,10 +308,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 				.blockGroups = ShmemAlloc(cap * sizeof(BlockGroupData)),
 			};
 			for (uint32 i = 0; i < cap; ++i) {
-				b_entry->val.blockGroups[i] = (BlockGroupData){
-					.scans_head = NULL,
-					.buffers_head = FREENEXT_END_OF_LIST,
-				};
+				b_entry->val.blockGroups[i] = EmptyBlockGroupData();
 			}
 		} else {
 			const uint32 new_len = nblock_groups;
@@ -408,10 +337,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 					b_entry->val.blockGroups[i] = old[i];
 				}
 				for (	  ; i < new_cap; ++i) {
-					b_entry->val.blockGroups[i] = (BlockGroupData){
-						.scans_head = NULL,
-						.buffers_head = FREENEXT_END_OF_LIST,
-					};
+					b_entry->val.blockGroups[i] = EmptyBlockGroupData();
 				}
 
 // ### leak old! since we can't free it...
@@ -628,6 +554,7 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	}
 #endif // TRACE_PBM && TRACE_PBM_BUFFERS && TRACE_PBM_BUFFERS_NEW
 
+// ### make sure the buffer is not already in a block!
 	RemoveBufFromBlock(buf);
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS) && defined(TRACE_PBM_BUFFERS_NEW)
@@ -643,17 +570,15 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	);
 #endif // TRACE_PBM && TRACE_PBM_BUFFERS && TRACE_PBM_BUFFERS_NEW
 
-
-#ifdef SANITY_PBM_BUFFERS
 	group = AddBufToBlock(buf);
 
-	// TODO stop here if there is no group
+	// stop here if there is no group
+// ### we should instead create the group!
 	if (group == NULL) return;
-
 	Assert(group->buffers_head == buf->buf_id);
 
+#ifdef SANITY_PBM_BUFFERS
 	sanity_check_verify_block_group_buffers(buf);
-
 #if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS) && defined(TRACE_PBM_BUFFERS_NEW)
 	BufferDesc* temp = GetBufferDescriptor(group->buffers_head);
 	BufferDesc* temp2 = temp->pbm_bgroup_next < 0 ? NULL : GetBufferDescriptor(temp->pbm_bgroup_next);
@@ -696,26 +621,6 @@ void PbmNewBuffer(BufferDesc * const buf) {
 
 	// TODO if group wasn't in the PQ already, add it
 }
-
-
-#if 0
-// Notify PBM about a buffer which could get added to the priority queue.
-void PbmBufferNotPinned(struct BufferDesc* buf){
-	BlockGroupData* group;
-#ifdef TRACE_PBM
-	if (FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_next) {
-		debug_buffer_access(buf, "unpin buffer NOT there yet!");
-	} else {
-		debug_buffer_access(buf, "unpin buffer already in block group");
-	}
-#endif // TRACE_PBM
-
-	group = AddBufToBlock(buf);
-
-// ### What if buffer isn't for this block? (evicting needs to remove it obviously)
-// ### recalculate priority of the group?
-}
-#endif
 
 
 // ### eventually want to get rid of this
@@ -854,7 +759,7 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 			.rnode = buf->tag.rnode,
 			.forkNum = buf->tag.forkNum,
 	};
-	long next_access_time = NotRequested;
+	long next_access_time = AccessTimeNotRequested;
 	long now = get_time_ns();
 
 	const BlockGroupData *const block_scans = search_block_group(buf, &found);
@@ -1004,7 +909,7 @@ long ScanTimeToNextConsumption(const BlockGroupScanList *const stats, bool* foun
 	}
 
 	// Might be possible the scan has just ended
-	if (false == *foundPtr) return NotRequested;
+	if (false == *foundPtr) return AccessTimeNotRequested;
 
 	// Estimate time to next access time
 	// First: estimate distance (# blocks) to the block based on # of blocks scanned and position
@@ -1031,7 +936,7 @@ long PageNextConsumption(const BlockGroupData *const stats, bool *requestedPtr) 
 
 	// not requested if there are no scans
 	if (NULL == stats || NULL == stats->scans_head) {
-		return NotRequested;
+		return AccessTimeNotRequested;
 	}
 
 	// loop over the scans and check the next access time estimate from that scan
@@ -1047,7 +952,7 @@ long PageNextConsumption(const BlockGroupData *const stats, bool *requestedPtr) 
 
 	// return the soonest next access time if applicable
 	if (false == *requestedPtr) {
-		return NotRequested;
+		return AccessTimeNotRequested;
 	} else {
 		return get_time_ns() + min_next_access;
 	}
@@ -1132,6 +1037,9 @@ BlockGroupData * AddBufToBlock(BufferDesc *const buf) {
 	buf->pbm_bgroup_prev = FREENEXT_END_OF_LIST;
 	if (group_head != FREENEXT_END_OF_LIST) {
 		GetBufferDescriptor(group_head)->pbm_bgroup_prev = buf->buf_id;
+	} else {
+		// If the block was previously empty, push into the PQ
+		// TODO push to the PQ!
 	}
 
 	return group;
@@ -1163,14 +1071,30 @@ void RemoveBufFromBlock(BufferDesc *const buf) {
 // ### some way to optimize this?? maybe using pointers instead of indexes?
 		bool found;
 		BlockGroupData * group = search_block_group(buf, &found);
+// ### lock the group!
 		Assert(found);
 		group->buffers_head = next;
+
+		// If the whole list is empty now, remove the block from the PQ bucket as well
+		if (next == FREENEXT_END_OF_LIST) {
+			// TODO remove from PQ bucket!
+		}
 	}
 
 	buf->pbm_bgroup_prev = FREENEXT_NOT_IN_LIST;
 	buf->pbm_bgroup_next = FREENEXT_NOT_IN_LIST;
 }
 
+static inline
+BlockGroupData EmptyBlockGroupData() {
+	return (BlockGroupData){
+		.scans_head = NULL,
+		.buffers_head = FREENEXT_END_OF_LIST,
+		.pq_bucket = NULL,
+		.bucket_prev = NULL,
+		.bucket_next = NULL,
+	};
+}
 
 long get_time_ns(void) {
 	struct timespec now;
@@ -1191,6 +1115,12 @@ void PagePush(/*TODO args --- page + header? */) {
 	 *  2. Estimate next consumption time
 	 *  3. Add to bucket
 	 */
+
+	/*
+	 * This should be called:
+	 *  - after being processed by a scan
+	 *  - ...
+	 */
 }
 
 void RefreshRequestedBuckets(/*TODO args?*/) {
@@ -1199,6 +1129,10 @@ void RefreshRequestedBuckets(/*TODO args?*/) {
 	 * 2. Create new buckets to fill gaps as needed
 	 * 3. Re-calculate priority of pages in bucket -1 and free that bucket
 	 */
+
+	// shift buckets as many times as needed to get back to where we should be
+	long t = get_time_ns();
+	while (shift_buckets(pbm->pq, t)) ;
 }
 
 void EvictPage(/*TODO argsg?*/) {
