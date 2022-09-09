@@ -63,12 +63,13 @@ static const int64_t PQ_TimeSlice = NS_PER_SEC / 10;
 ///-------------------------------------------------------------------------
 
 struct BlockGroupData;
+struct HTAB;
 
 ///-------------------------------------------------------------------------
 /// Type definitions
 ///-------------------------------------------------------------------------
 
-// Info about a scan for the block group. (linked list)
+/// Info about a scan for the block group. (linked list)
 typedef struct BlockGroupScanList {
 	// Info about the current scan
 	ScanId		scan_id;
@@ -78,7 +79,7 @@ typedef struct BlockGroupScanList {
 	struct BlockGroupScanList* next;
 } BlockGroupScanList;
 
-// Record data for this block group.
+/// Record data for this block group.
 typedef struct BlockGroupData {
 // ### some kind of lock?
 
@@ -92,16 +93,16 @@ typedef struct BlockGroupData {
 	struct PbmPQBucket* pq_bucket;
 	struct BlockGroupData* bucket_next;
 	struct BlockGroupData* bucket_prev;
-	// TODO initialize these fields!
 } BlockGroupData;
 
 typedef struct PbmPQBucket {
 	struct BlockGroupData* bucket_head;
-	// TODO could also include start & end time (delta) in the bucket?
+	// ### could also include start & end time (delta) in the bucket?
 	// TODO (spin) lock?
 } PbmPQBucket;
 
 
+/// The priority queue structure for tracking blocks to evict
 typedef struct PbmPQ {
 // protected by PbmPqLock
 
@@ -111,11 +112,69 @@ typedef struct PbmPQ {
 	volatile long last_shifted;
 } PbmPQ;
 
+
+/// Main PBM data structure
+typedef struct PbmShared {
+	// TODO more granular locking if it could improve performance.
+	// ### where to use `volatile`?
+
+	/// Time-related stuff
+	time_t start_time_sec;
+
+	/// Atomic counter for ID generation
+	/// Note: protected by PbmScansLock: could make it atomic but it is only accessed when we lock the hash table anyways.
+	volatile ScanId next_id;
+
+	/// Map[ scan ID -> scan stats ] to record progress & estimate speed
+	/// Protected by PbmScansLock
+	struct HTAB * ScanMap;
+
+// ### Map[ range (table -> block indexes) -> scan ] --- for looking up what scans reference a particular block, maybe useful later
+	//struct HTAB * ScansByRange;
+
+	/// Map[ table -> BlockGroup -> set of scans ] + free-list of the list-nodes for tracking statistics on each buffer
+	/// Protected by PbmBlocksLock
+	struct HTAB * BlockGroupMap;
+	BlockGroupScanList* block_group_stats_free_list;
+// ### if possible, free list could be protected by its own spinlock instead of using this lock
+// TODO modify the map to be: (i.e. linked hash-map of block groups, stored in fixed-size buffers to ammortize allocations and reduce the size of hash map needed)
+//   Map[ (table, block group >> N) -> entry ]
+//   where N is some chosen constant
+//   where entry =  {
+//   	Array [ 1 << N ] of BlockGroupData
+//		entry* next ptr
+//	 }
+
+	/// Priority queue of block groups that could be evicted
+	PbmPQ * BlockQueue;
+
+	/// Global estimate of speed used for *new* scans
+	/// Currently NOT protected, as long as write is atomic we don't really care about lost updates...
+	volatile float initial_est_speed;
+
+
+// ### Potential other fields:
+// ...
+} PbmShared;
+
+
+///-------------------------------------------------------------------------
+/// Global variables
+///-------------------------------------------------------------------------
+
+/// Global pointer to the single PBM
+extern PbmShared * pbm;
+
+
 ///-------------------------------------------------------------------------
 /// PBM PQ Initialization
 ///-------------------------------------------------------------------------
 extern PbmPQ* InitPbmPQ(void);
 extern Size PbmPqShmemSize(void);
+
+extern void PQ_InsertBlockGroup(PbmPQ * pq, BlockGroupData * block_group, long t);
+extern void PQ_RemoveBlockGroup(BlockGroupData *block_group);
+bool PQ_ShiftBucketsIfNeeded(PbmPQ * pq, long t);
 
 ///-------------------------------------------------------------------------
 /// Helpers

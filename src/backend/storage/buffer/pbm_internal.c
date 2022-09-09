@@ -16,9 +16,6 @@
 
 // ### see if any of these should be moved to the header
 unsigned int PQ_time_to_bucket(const PbmPQ * pq, long t);
-bool shift_buckets(PbmPQ * pq, long t);
-void PQ_InsertBlockGroup(PbmPQ * pq, BlockGroupData * block_group, long t);
-void PQ_RemoveBlockGroup(BlockGroupData *block_group);
 
 ///-------------------------------------------------------------------------
 /// Inline private helper functions
@@ -109,7 +106,7 @@ unsigned int PQ_time_to_bucket(const PbmPQ *const pq, const long t) {
 }
 
 /// Shift the buckets in the PQ. Returns whether it actually shifted anything
-bool shift_buckets(PbmPQ *const pq, long t) {
+bool PQ_ShiftBucketsIfNeeded(PbmPQ *const pq, long t) {
 	bool did_shift = false;
 
 	// Nothing to do if not enough time has passed. Check this before acquiring the lock
@@ -158,7 +155,27 @@ bool shift_buckets(PbmPQ *const pq, long t) {
 				pq->buckets[idx] = pq->buckets[idx + 1];
 			}
 		}
-		// TODO re-insert the "old_first_buckets_block_groups" (after the lock?)
+
+// ### re-insert the "old_first_buckets_block_groups" (after the lock?)
+// ### if keeping this: add a tail pointer in the bucket too? Or make the list circular?
+		// FOR NOW: just add them to the new first bucket...
+		if (old_first_buckets_block_groups != NULL) {
+			PbmPQBucket * bucket0 = pq->buckets[0];
+			if (NULL == bucket0->bucket_head) {
+				bucket0->bucket_head = old_first_buckets_block_groups;
+			} else {
+				BlockGroupData *old_head = old_first_buckets_block_groups;
+				BlockGroupData *old_tail = old_first_buckets_block_groups;
+				// find tail of the old first bucket list
+				while (old_tail->bucket_next != NULL) {
+					old_tail = old_tail->bucket_next;
+				}
+				// link at the start of the new first bucket's list
+				old_tail->bucket_next = bucket0->bucket_head;
+				bucket0->bucket_head->bucket_prev = old_tail;
+				bucket0->bucket_head = old_head;
+			}
+		}
 
 	} // PbmPqLock
 
