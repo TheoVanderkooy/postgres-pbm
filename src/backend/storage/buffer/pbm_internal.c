@@ -44,7 +44,7 @@ PbmPQ* InitPbmPQ(void) {
 	PbmPQ* pq = ShmemInitStruct("Predictive buffer manager PQ", sizeof(PbmPQ), &found);
 
 	// Should not be called if already initialized!
-	Assert(!found && IsUnderPostmaster);
+	Assert(!found && !IsUnderPostmaster);
 
 	// Create the buckets
 	pq->buckets = ShmemAlloc(sizeof(PbmPQBucket*) * PQ_NumBuckets);
