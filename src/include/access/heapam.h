@@ -77,7 +77,6 @@ typedef struct HeapScanDescData
 	int			rs_ntuples;		/* number of visible tuples on page */
 	OffsetNumber rs_vistuples[MaxHeapTuplesPerPage];	/* their offsets */
 
-	// TODO theo: maybe put this in TableScanDescData instead
 	// Scan ID for PBM
 	ScanId scanId;
 }			HeapScanDescData;

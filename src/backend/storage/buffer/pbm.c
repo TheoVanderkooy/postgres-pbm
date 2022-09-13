@@ -4,6 +4,7 @@
 #include "postgres.h"
 
 #include "storage/pbm.h"
+#include "storage/pbm_background.h"
 #include "storage/pbm_internal.h"
 
 #include "miscadmin.h"
@@ -27,6 +28,11 @@
 /// Structs and typedefs
 ///-------------------------------------------------------------------------
 
+// Table identifier. Used as hash key for block groups, and stored in the scan map
+typedef struct TableData {
+	RelFileNode	rnode; // physical relation
+	ForkNumber	forkNum; // fork in the relation
+} TableData;
 
 /// Structs for storing information about scans in the hash map
 // Hash map key
@@ -36,10 +42,9 @@ typedef ScanId ScanTag;
 // Note: records *blocks* NOT block *groups*
 typedef struct ScanData {
 	// Scan info (does not change after being set)
-	RelFileNode	rnode; // physical relation
-	ForkNumber	forkNum; // fork in the relation
+	TableData 	tbl; // the table being scanned
 	BlockNumber startBlock; // where the scan started
-	BlockNumber	nblocks; // # of blocks in the table
+	BlockNumber	nblocks; // # of blocks (not block *groups*) in the table
 
 // ### add range information (later when looking at BRIN indexes)
 
@@ -59,11 +64,6 @@ typedef struct ScanHashEntry {
 
 
 /// Structs for information about block groups
-// Hash key: table identifier
-typedef struct TableData {
-	RelFileNode	rnode;
-	ForkNumber	forkNum;
-} TableData;
 
 // Hash value: array of info for all block groups in the relation fork
 typedef struct BlockGroupDataVec {
@@ -136,7 +136,6 @@ static inline void remove_scan_from_block_range(const BlockGroupHashEntry * b_en
 
 // Initialization of shared data structures
 void InitPBM(void) {
-#ifdef USE_PBM
 	bool found;
 	int hash_flags;
 	HASHCTL hash_info;
@@ -189,13 +188,11 @@ void InitPBM(void) {
 
 // ### other fields to be added...
 
-#endif // USE_PBM
 }
 
 // Estimate size of PBM (including all shared structures)
 Size PbmShmemSize(void) {
 	Size size = 0;
-#ifdef USE_PBM
 	size = add_size(size, sizeof(PbmShared));
 	size = add_size(size, hash_estimate_size(ScanMapMaxSize, sizeof(ScanHashEntry)));
 	size = add_size(size, hash_estimate_size(BlockGroupMapMaxSize, sizeof(BlockGroupHashEntry)));
@@ -210,7 +207,6 @@ Size PbmShmemSize(void) {
 
 	// actually estimate the size later... for now assume 100 MiB will be enough (maybe increase this :)
 	size = add_size(size, 100 << 6);
-#endif // USE_PBM
 	return size;
 }
 
@@ -248,6 +244,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 		Assert(!found); // should be inserted...
 
 		*s_data = (ScanData) {
+				.tbl = tbl,
 				.last_pos = startblock,
 				.startBlock = startblock,
 				.nblocks = nblocks,
@@ -461,6 +458,7 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 	}
 	prevGroupPos = BLOCK_GROUP(entry->last_pos);
 	curGroupPos = BLOCK_GROUP(pos);
+	tbl = entry->tbl;
 
 	// Note: the entry is only *written* in one process.
 	// If readers aren't atomic: how bad is this? Could mis-predict next access time...
@@ -485,11 +483,10 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 
 	// Remove the scan from blocks in range [prevGroupPos, curGroupPos)
 	if (curGroupPos != prevGroupPos) {
-		tbl = (TableData){ .rnode = entry->rnode, .forkNum = entry->forkNum, };
 		LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
 			const BlockGroupHashEntry * const b_entry = hash_search(pbm->BlockGroupMap, &tbl, HASH_FIND, &found);
 			BlockNumber upper = curGroupPos;
-			Assert(found && b_entry != NULL);
+			Assert(found);
 
 			// special handling if we wrapped around (note: if we update every block group this probably does nothing
 			if (curGroupPos < prevGroupPos) {
@@ -1075,11 +1072,61 @@ BlockGroupData EmptyBlockGroupData() {
 }
 
 // TODO decide where we should run this
-// TODO see if we can put it on a timer in postmaster, and remove calls from here
 static inline
-void PQ_RefreshRequestedBuckets() {
+void PQ_RefreshRequestedBuckets(void) {
 	long t = get_time_ns();
-	while (PQ_ShiftBucketsIfNeeded(pbm->BlockQueue, t)) ;
+	long last_shifted = pbm->BlockQueue->last_shifted;
+	bool up_to_date = (last_shifted + PQ_TimeSlice > t);
+
+#if defined(TRACE_PBM) && defined(TRACE_PBM_PQ_REFRESH)
+	elog(INFO, "PBM refresh buckets: t=%ld, last=%ld, up_to_date=%s",
+		 t, last_shifted, up_to_date?"true":"false");
+#endif // TRACE_PBM_PQ_REFRESH
+
+	// Nothing to do if already up to date
+	if (up_to_date) return;
+
+	// Shift the PQ buckets as many times as necessary to catch up
+	LOCK_GUARD_V2(PbmPqLock, LW_EXCLUSIVE) {
+		while (PQ_internal_ShiftBucketsWithLock(pbm->BlockQueue, t)) ;
+	}
+}
+
+
+/// Shift buckets in the PBM PQ as necesary IF the lock can be acquired immediately.
+/// If someone else is actively using the queue for anything, then do nothing.
+void PBM_TryRefreshRequestedBuckets(void) {
+	long t = get_time_ns();
+	long last_shifted = pbm->BlockQueue->last_shifted;
+	bool up_to_date = (last_shifted + PQ_TimeSlice > t);
+
+#if defined(TRACE_PBM) && defined(TRACE_PBM_PQ_REFRESH)
+	elog(INFO, "PBM try refresh buckets: t=%ld, last=%ld, up_to_date=%s",
+		 t, last_shifted, up_to_date?"true":"false");
+#endif // TRACE_PBM_PQ_REFRESH
+
+	// Nothing to do if already up to date
+	if (up_to_date) return;
+
+	// If unable to acquire the lock, just stop here
+	bool acquired = LWLockConditionalAcquire(PbmPqLock, LW_EXCLUSIVE);
+	if (acquired) {
+
+		// if several time slices have passed since last shift, try to short-circuit by
+		// checking if the whole PQ is empty, in which case we can just update the timestamp without actually shifting anything
+		if ((t - last_shifted) / PQ_TimeSlice > 5) {
+			if (PQ_check_empty(pbm->BlockQueue)) {
+				pbm->BlockQueue->last_shifted = (t - (t % PQ_TimeSlice));
+			}
+		}
+
+		// Shift buckets until up-to-date
+		while (PQ_internal_ShiftBucketsWithLock(pbm->BlockQueue, t)) ;
+
+		LWLockRelease(PbmPqLock);
+	} else {
+		return;
+	}
 }
 
 #if 0

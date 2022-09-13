@@ -39,7 +39,9 @@
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/lmgr.h"
+#ifdef USE_PBM
 #include "storage/pbm.h"
+#endif
 #include "storage/predicate.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"

@@ -61,7 +61,7 @@ void shift_buckets(PbmPQ *const pq, long t) {
 
 		// Check if this was the last group to shift or not
 		long next_group_width = bucket_group_time_width(pq, group + 1);
-		if (new_shift % next_group_width != 0 || group+1 == pq->num_groups) {
+		if (new_shift % next_group_width >= pq->time_slice || group+1 == pq->num_groups) {
 			// The next bucket group will NOT be shifted (or does not exist)
 			// use the "spare bucket" to fill the gap left from shifting
 			unsigned int idx = (group+1) * pq->buckets_per_group - 1;

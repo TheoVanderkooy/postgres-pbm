@@ -57,7 +57,9 @@
 #include "port/atomics.h"
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
+#ifdef USE_PBM
 #include "storage/pbm.h"
+#endif
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"

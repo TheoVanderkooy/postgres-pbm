@@ -46,7 +46,9 @@
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
+#ifdef USE_PBM
 #include "storage/pbm.h"
+#endif
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"

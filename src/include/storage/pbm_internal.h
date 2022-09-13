@@ -33,13 +33,14 @@ static const size_t PQ_NumBuckets = PQ_NumBucketGroups * PQ_NumBucketsPerGroup;
 static const int64_t PQ_TimeSlice = NS_PER_SEC / 10;
 
 /// Debugging flags
-//#define TRACE_PBM
+#define TRACE_PBM
 //#define TRACE_PBM_REPORT_PROGRESS
 //#define TRACE_PBM_PRINT_SCANMAP
 //#define TRACE_PBM_PRINT_BLOCKMAP
 //#define TRACE_PBM_BUFFERS
 //#define TRACE_PBM_BUFFERS_NEW
 //#define TRACE_PBM_BUFFERS_EVICT
+#define TRACE_PBM_PQ_REFRESH
 //#define SANITY_PBM_BUFFERS
 
 
@@ -109,7 +110,8 @@ typedef struct PbmPQ {
 	PbmPQBucket ** buckets;
 	// ### keep track of "not requested" and "very far future" separately?
 
-	volatile long last_shifted;
+	// TODO keep track of the last_shifted TIME_SLICE (i.e. t / PQ_TimeSlice)
+	_Atomic(long) last_shifted;
 } PbmPQ;
 
 
@@ -123,7 +125,7 @@ typedef struct PbmShared {
 
 	/// Atomic counter for ID generation
 	/// Note: protected by PbmScansLock: could make it atomic but it is only accessed when we lock the hash table anyways.
-	volatile ScanId next_id;
+	_Atomic(ScanId) next_id;
 
 	/// Map[ scan ID -> scan stats ] to record progress & estimate speed
 	/// Protected by PbmScansLock
@@ -150,7 +152,7 @@ typedef struct PbmShared {
 
 	/// Global estimate of speed used for *new* scans
 	/// Currently NOT protected, as long as write is atomic we don't really care about lost updates...
-	volatile float initial_est_speed;
+	_Atomic(float) initial_est_speed;
 
 
 // ### Potential other fields:
@@ -172,9 +174,14 @@ extern PbmShared * pbm;
 extern PbmPQ* InitPbmPQ(void);
 extern Size PbmPqShmemSize(void);
 
+///-------------------------------------------------------------------------
+/// PBM PQ manipulation
+///-------------------------------------------------------------------------
 extern void PQ_InsertBlockGroup(PbmPQ * pq, BlockGroupData * block_group, long t);
 extern void PQ_RemoveBlockGroup(BlockGroupData *block_group);
-bool PQ_ShiftBucketsIfNeeded(PbmPQ * pq, long t);
+extern bool PQ_ShiftBucketsIfNeeded(PbmPQ * pq, long t);
+extern bool PQ_internal_ShiftBucketsWithLock(PbmPQ * pq, long t);
+extern bool PQ_check_empty(const PbmPQ * pq);
 
 ///-------------------------------------------------------------------------
 /// Helpers

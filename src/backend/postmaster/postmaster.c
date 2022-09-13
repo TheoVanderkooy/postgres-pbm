@@ -119,6 +119,7 @@
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/pbm_background.h"
 #include "storage/pg_shmem.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
@@ -1839,6 +1840,17 @@ ServerLoop(void)
 		 * special-case logic there.
 		 */
 		now = time(NULL);
+
+#ifdef USE_PBM
+		/*
+		 * Periodically refresh the PBM PQ buckets in the background. We try to
+		 * do this in the queries as well to amortize the work, but if there are
+		 * no queries over a period of time then it is better to do it here than
+		 * have several rounds of refreshing later.
+		 */
+// ### consider decreasing timeout in DetermineSleepTime to make sure this happens more than once a minute
+		PBM_TryRefreshRequestedBuckets();
+#endif // USE_PBM
 
 		/*
 		 * If we already sent SIGQUIT to children and they are slow to shut

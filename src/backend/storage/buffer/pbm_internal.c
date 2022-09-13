@@ -21,9 +21,14 @@ unsigned int PQ_time_to_bucket(const PbmPQ * pq, long t);
 /// Inline private helper functions
 ///-------------------------------------------------------------------------
 
-/// Time range of the given bucket group
+/// Width of buckets in a bucket group in # of time slices
+static inline long bucket_group_width(unsigned int group) {
+	return (1l << group);
+}
+
+/// With of buckets in the given bucket group in nanoseconds
 static inline long bucket_group_time_width(unsigned int group) {
-	return (1l << group) * PQ_TimeSlice;
+	return bucket_group_width(group) * PQ_TimeSlice;
 }
 
 /// floor(log_2(x)) for long values x
@@ -105,82 +110,82 @@ unsigned int PQ_time_to_bucket(const PbmPQ *const pq, const long t) {
 	return bucket_num;
 }
 
-/// Shift the buckets in the PQ. Returns whether it actually shifted anything
-bool PQ_ShiftBucketsIfNeeded(PbmPQ *const pq, long t) {
-	bool did_shift = false;
+/// Shifts the buckets in the PQ if necessary.
+/// Assumes the PQ is *already* locked!
+bool PQ_internal_ShiftBucketsWithLock(PbmPQ *const pq, const long t) {
+	const long last_shift = pq->last_shifted;
+	const long new_shift = last_shift + PQ_TimeSlice;
 
-	// Nothing to do if not enough time has passed. Check this before acquiring the lock
-	if (pq->last_shifted + PQ_TimeSlice > t) return did_shift;
+	// Once we have the lock, re-check whether shifting is needed
+	if (new_shift > t) {
+		return false;
+	}
 
-	// Lock the PQ and shift everything
-	LOCK_GUARD_V2(PbmPqLock, LW_EXCLUSIVE) {
-		const long last_shift = pq->last_shifted;
-		const long new_shift = last_shift + PQ_TimeSlice;
+	pq->last_shifted = new_shift;
 
-		// Once we have the lock, re-check whether shifting is needed
-		if (new_shift > t) {
-			did_shift = false;
-			EXIT_LOCK_SCOPE;
-		}
-
-		pq->last_shifted = new_shift;
-		did_shift = true;
-
-		// bucket[0] will be removed
-		PbmPQBucket *spare = pq->buckets[0];
-		struct BlockGroupData *old_first_buckets_block_groups = spare->bucket_head;
-		*spare = (PbmPQBucket) {
+	// bucket[0] will be removed
+	PbmPQBucket *spare = pq->buckets[0];
+	struct BlockGroupData *old_first_buckets_block_groups = spare->bucket_head;
+	*spare = (PbmPQBucket) {
 			.bucket_head = NULL,
-		};
+	};
 
-		// Shift each group
-		for (unsigned int group = 0; group < PQ_NumBucketGroups; ++group) {
-			// Shift the buckets in the group over 1
-			for (unsigned int b = 0; b < PQ_NumBucketsPerGroup; ++b) {
-				unsigned int idx = group * PQ_NumBucketsPerGroup + b;
-				pq->buckets[idx] = pq->buckets[idx + 1];
-			}
-
-			// Check if this was the last group to shift or not
-			long next_group_width = bucket_group_time_width(group + 1);
-			if (new_shift % next_group_width != 0 || group + 1 == PQ_NumBucketGroups) {
-				// The next bucket group will NOT be shifted (or does not exist)
-				// use the "spare bucket" to fill the gap left from shifting, then stop
-				unsigned int idx = (group + 1) * PQ_NumBucketsPerGroup - 1;
-				pq->buckets[idx] = spare;
-				break;
-			} else {
-				// next group will be shifted, steal the first bucket
-				unsigned int idx = (group + 1) * PQ_NumBucketsPerGroup - 1;
-				pq->buckets[idx] = pq->buckets[idx + 1];
-			}
+	// Shift each group
+	for (unsigned int group = 0; group < PQ_NumBucketGroups; ++group) {
+		// Shift the buckets in the group over 1
+		for (unsigned int b = 0; b < PQ_NumBucketsPerGroup; ++b) {
+			unsigned int idx = group * PQ_NumBucketsPerGroup + b;
+			pq->buckets[idx] = pq->buckets[idx + 1];
 		}
+
+		// Check if this was the last group to shift or not
+		long next_group_width = bucket_group_time_width(group + 1);
+		if (new_shift % next_group_width >= PQ_TimeSlice || group + 1 == PQ_NumBucketGroups) {
+			// The next bucket group will NOT be shifted (or does not exist)
+			// use the "spare bucket" to fill the gap left from shifting, then stop
+			unsigned int idx = (group + 1) * PQ_NumBucketsPerGroup - 1;
+			pq->buckets[idx] = spare;
+			break;
+		} else {
+			// next group will be shifted, steal the first bucket
+			unsigned int idx = (group + 1) * PQ_NumBucketsPerGroup - 1;
+			pq->buckets[idx] = pq->buckets[idx + 1];
+		}
+	}
 
 // ### re-insert the "old_first_buckets_block_groups" (after the lock?)
 // ### if keeping this: add a tail pointer in the bucket too? Or make the list circular?
-		// FOR NOW: just add them to the new first bucket...
-		if (old_first_buckets_block_groups != NULL) {
-			PbmPQBucket * bucket0 = pq->buckets[0];
-			if (NULL == bucket0->bucket_head) {
-				bucket0->bucket_head = old_first_buckets_block_groups;
-			} else {
-				BlockGroupData *old_head = old_first_buckets_block_groups;
-				BlockGroupData *old_tail = old_first_buckets_block_groups;
-				// find tail of the old first bucket list
-				while (old_tail->bucket_next != NULL) {
-					old_tail = old_tail->bucket_next;
-				}
-				// link at the start of the new first bucket's list
-				old_tail->bucket_next = bucket0->bucket_head;
-				bucket0->bucket_head->bucket_prev = old_tail;
-				bucket0->bucket_head = old_head;
+	// FOR NOW: just add them to the new first bucket...
+	if (old_first_buckets_block_groups != NULL) {
+		PbmPQBucket * bucket0 = pq->buckets[0];
+		if (NULL == bucket0->bucket_head) {
+			bucket0->bucket_head = old_first_buckets_block_groups;
+		} else {
+			BlockGroupData *old_head = old_first_buckets_block_groups;
+			BlockGroupData *old_tail = old_first_buckets_block_groups;
+			// find tail of the old first bucket list
+			while (old_tail->bucket_next != NULL) {
+				old_tail = old_tail->bucket_next;
 			}
+			// link at the start of the new first bucket's list
+			old_tail->bucket_next = bucket0->bucket_head;
+			bucket0->bucket_head->bucket_prev = old_tail;
+			bucket0->bucket_head = old_head;
 		}
+	}
 
-	} // PbmPqLock
-
-	return did_shift;
+	return true;
 }
+
+/// Return true if all buckets in the PQ are empty, so the timestamp can be updated without shifting
+/// This requires the lock to already be held!
+bool PQ_check_empty(const PbmPQ *const pq) {
+	for (int i = 0; i < PQ_NumBuckets; ++i) {
+		if (pq->buckets[i]->bucket_head != NULL) return false;
+	}
+	return true;
+}
+
 
 ///-------------------------------------------------------------------------
 /// PBM PQ Public API
