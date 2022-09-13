@@ -45,7 +45,7 @@ static const int64_t PQ_TimeSlice = NS_PER_SEC / 10;
 
 
 ///-------------------------------------------------------------------------
-/// Helper macros
+/// Helper macros & inline functions
 ///-------------------------------------------------------------------------
 
 /// Helper to make sure locks get freed
@@ -58,6 +58,12 @@ static const int64_t PQ_TimeSlice = NS_PER_SEC / 10;
 /// Group blocks by ID to reduce the amount of metadata required
 #define BLOCK_GROUP(block) ((block) >> BLOCK_GROUP_SHIFT)
 #define GROUP_TO_FIRST_BLOCK(group) ((group) << BLOCK_GROUP_SHIFT)
+
+/// Convert a timestamp in ns to the corresponding timeslice in the PQ
+static inline long ns_to_timeslice(long t) {
+	return t / PQ_TimeSlice;
+}
+
 
 ///-------------------------------------------------------------------------
 /// Forward declarations
@@ -111,7 +117,7 @@ typedef struct PbmPQ {
 	// ### keep track of "not requested" and "very far future" separately?
 
 	// TODO keep track of the last_shifted TIME_SLICE (i.e. t / PQ_TimeSlice)
-	_Atomic(long) last_shifted;
+	_Atomic(long) last_shifted_time_slice;
 } PbmPQ;
 
 
@@ -167,7 +173,6 @@ typedef struct PbmShared {
 /// Global pointer to the single PBM
 extern PbmShared * pbm;
 
-
 ///-------------------------------------------------------------------------
 /// PBM PQ Initialization
 ///-------------------------------------------------------------------------
@@ -179,9 +184,8 @@ extern Size PbmPqShmemSize(void);
 ///-------------------------------------------------------------------------
 extern void PQ_InsertBlockGroup(PbmPQ * pq, BlockGroupData * block_group, long t);
 extern void PQ_RemoveBlockGroup(BlockGroupData *block_group);
-extern bool PQ_ShiftBucketsIfNeeded(PbmPQ * pq, long t);
-extern bool PQ_internal_ShiftBucketsWithLock(PbmPQ * pq, long t);
-extern bool PQ_check_empty(const PbmPQ * pq);
+extern bool PQ_ShiftBucketsWithLock(PbmPQ * pq, long t);
+extern bool PQ_CheckEmpty(const PbmPQ * pq);
 
 ///-------------------------------------------------------------------------
 /// Helpers

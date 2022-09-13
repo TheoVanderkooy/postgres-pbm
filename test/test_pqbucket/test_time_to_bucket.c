@@ -6,101 +6,86 @@ Unit-tests for the calculation to convert a timestamp to an index in the PBM PQ.
 #include <stddef.h>
 #include <stdio.h>
 
+static long PQ_TimeSlice;
+static long PQ_NumBucketsPerGroup;
 typedef struct PbmPQ {
-    long first_bucket_time;
-    long time_slice;
-    long buckets_per_group;
+    long last_shifted_time_slice;
 } PbmPQ;
 
+static inline long ns_to_timeslice(long t) {
+    return t / PQ_TimeSlice;
+}
 
+static inline long timeslice_to_ns(long t) {
+    return t * PQ_TimeSlice;
+}
 
 // floor(log(x)) for integer values x
 unsigned int floor_llogb(unsigned long x) {
-	return 8 * sizeof(x) - 1 - __builtin_clzl(x);
+    return 8 * sizeof(x) - 1 - __builtin_clzl(x);
 }
 
 // calculate the bucket *group* of the given time. Not that each group has several buckets (same # per group)
 unsigned int bucket_group(PbmPQ * pq, long t) {
     // time since what should be at the start of the first bucket
-    long delta_t = t - pq->first_bucket_time;
+    long delta_t = ns_to_timeslice(t) - pq->last_shifted_time_slice;
 
-	return floor_llogb( 1l + delta_t/(pq->time_slice * pq->buckets_per_group));
+    return floor_llogb( 1l + delta_t/(PQ_NumBucketsPerGroup));
 }
 
-// determine the bucket index for the given time
-unsigned int time_to_bucket(PbmPQ * pq, long t) {
-    // special case of things that should already have happened
-    if (t <= pq->first_bucket_time) {
-        // ### special sentinel for this?
-        return 0;
-    }
-
-	unsigned int b_group = bucket_group(pq, t);
-
-    // Calculate start time of first bucket in the group: 
-	unsigned long group_start_time = pq->first_bucket_time + ((1 << b_group) - 1) * pq->time_slice * pq->buckets_per_group;
-
-    // Calculate width of a bucket within this group:
-    unsigned long bucket_width = ((1 << b_group) * pq->time_slice);
-
-    // (t - group_start_time) / bucket_width gives the bucket index *within the group*, then add the bucket index of the first one in the group to get the global bucket index
-	size_t bucket_num = b_group * pq->buckets_per_group + (t - group_start_time) / bucket_width;
-
-
-    // TODO handle case where it would be out of range
-    // if (bucket_num > pq->num_buckets) {
-    //     ///
-    // }
-
-	return bucket_num;
+/// Width of buckets in a bucket group in # of time slices
+static inline long bucket_group_width(unsigned int group) {
+    return (1l << group);
 }
-
 
 /// try to simplify the definition... NEVERMIND, let the compiler do it if it thinks it can... nothing obvious without being able 2^(floor(log(x))) as just x.
-unsigned int time_to_bucket2(PbmPQ * pq, long t) {
-    const size_t first_bucket_time = pq->first_bucket_time;
-    const size_t buckets_per_group = pq->buckets_per_group;
-    const long time_slice = pq->time_slice;
-
+unsigned int PQ_time_to_bucket2(PbmPQ * pq, long t) {
+    const long ts = ns_to_timeslice(t);
+    // Use "time slice" instead of NS for calculations
+    const long first_bucket_timeslice = pq->last_shifted_time_slice;
 
     // Special case of things that should already have happened
-    if (t <= first_bucket_time) {
+    if (ts <= first_bucket_timeslice) {
         // ### special sentinel for this?
         return 0;
     }
 
     // Calculate offset from the start of the time range of interest
-    const long delta_t = t - first_bucket_time;
+    const unsigned long delta_ts = ts - first_bucket_timeslice;
 
     // Calculate the bucket *group* this bucket belongs to
-    const unsigned int b_group = floor_llogb(1l + delta_t/(time_slice * buckets_per_group));
+    const unsigned int b_group = floor_llogb(1l + delta_ts / PQ_NumBucketsPerGroup);
 
     // Calculate start time of first bucket in the group
-    const unsigned long group_start_time = first_bucket_time + ((1 << b_group) - 1) * time_slice * buckets_per_group;
+    const unsigned long group_start_timeslice = first_bucket_timeslice + ((1l << b_group) - 1) * PQ_NumBucketsPerGroup;
 
     // Calculate index of first bucket in the group
-    const unsigned long group_first_bucket_idx = b_group * buckets_per_group;
+    const unsigned long group_first_bucket_idx = b_group * PQ_NumBucketsPerGroup;
 
     // Calculate width of a bucket within this group:
-    const unsigned long bucket_width = (1 << b_group) * time_slice;
+    const unsigned long bucket_width = bucket_group_width(b_group);
 
     // (t - group_start_time) / bucket_width gives the bucket index *within the group*, then add the bucket index of the first one in the group to get the global bucket index
-    const size_t bucket_num = group_first_bucket_idx + (t - group_start_time) / bucket_width;
+    const size_t bucket_num = group_first_bucket_idx + (ts - group_start_timeslice) / bucket_width;
 
-// TODO handle case where it would be out of range
+    // // Return a sentinel when it is out of range.
+    // // ### we could make this the caller's responsibility instead
+    // if (bucket_num >= PQ_NumBuckets) {
+    // 	return PQ_BucketOutOfRange;
+    // }
 
     return bucket_num;
 }
 
 void check_bucket(PbmPQ * pq, long t, size_t expect) {
-    size_t got = time_to_bucket2(pq, t);
+    size_t got = PQ_time_to_bucket2(pq, t);
     if (got != expect) {
         printf("ERROR: for time %ld expected %ld but got %ld\n", t, expect, got);
     }
 }
 
 void print(PbmPQ * pq, long t) {
-    printf("t=%ld:  got %u", t, time_to_bucket(pq,t));
+    printf("t=%ld:  got %u", t, PQ_time_to_bucket2(pq,t));
 }
 
 #define BCHECK(t, e) check_bucket(&pq, (t), (e))
@@ -114,7 +99,7 @@ void check_group(PbmPQ * pq, long t, size_t expect) {
 
 void check_group_range(PbmPQ * pq, long lo, long hi, unsigned int expect) {
     for (long t = lo; t <= hi; ++t) {
-        unsigned int got = time_to_bucket2(pq, t);
+        unsigned int got = PQ_time_to_bucket2(pq, t);
         if (got != expect) {
             printf("ERROR: for time %ld expected %u but got %u\n", t, expect, got);
             break;
@@ -127,10 +112,10 @@ void check_group_range(PbmPQ * pq, long lo, long hi, unsigned int expect) {
 #define RCHECK(lo, hi, e) check_group_range(&pq, (lo), (hi), (e))
 
 void test1_bucket(void) {
+    PQ_TimeSlice = 100;
+    PQ_NumBucketsPerGroup = 3;
     PbmPQ pq = {
-        .time_slice = 100,
-        .buckets_per_group = 3,
-        .first_bucket_time = 0,
+        .last_shifted_time_slice = 0,
     };
 
 // groups 0-2 are first group: [0,99] [100,199] [200,299]
@@ -162,10 +147,10 @@ void test1_bucket(void) {
 
 
 void test1_group(void) {
+    PQ_TimeSlice = 100;
+    PQ_NumBucketsPerGroup = 3;
     PbmPQ pq = {
-        .time_slice = 100,
-        .buckets_per_group = 3,
-        .first_bucket_time = 0,
+        .last_shifted_time_slice = 0,
     };
 
 // groups 0-2 are first group: [0,99] [100,199] [200,299]
@@ -198,10 +183,10 @@ void test1_group(void) {
 
 
 void test2_bucket(void) {
+    PQ_TimeSlice = 10;
+    PQ_NumBucketsPerGroup = 6;
     PbmPQ pq = {
-        .time_slice = 10,
-        .buckets_per_group = 6,
-        .first_bucket_time = 500,
+        .last_shifted_time_slice = 500/PQ_TimeSlice,
     };
 
 
@@ -242,6 +227,10 @@ void main(void) {
 }
 
 
+
+/*
+ *  MATH for converting timestamp -> bucket/bucket group is below
+ */
 
 
 // where f = first_bucket_time, d = time_slice, m = buckets_per_group

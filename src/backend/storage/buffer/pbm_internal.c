@@ -14,8 +14,7 @@
 /// Forward declarations
 ///-------------------------------------------------------------------------
 
-// ### see if any of these should be moved to the header
-unsigned int PQ_time_to_bucket(const PbmPQ * pq, long t);
+static unsigned int PQ_time_to_bucket(const PbmPQ * pq, long t);
 
 ///-------------------------------------------------------------------------
 /// Inline private helper functions
@@ -74,32 +73,34 @@ Size PbmPqShmemSize(void) {
 ///-------------------------------------------------------------------------
 
 /// determine the bucket index for the given time
-unsigned int PQ_time_to_bucket(const PbmPQ *const pq, const long t) {
-	const size_t first_bucket_time = pq->last_shifted;
+/// `ts` is time *slice*, not in ns
+static unsigned int PQ_time_to_bucket(const PbmPQ *const pq, const long ts) {
+	// Use "time slice" instead of NS for calculations
+	const long first_bucket_timeslice = pq->last_shifted_time_slice;
 
 	// Special case of things that should already have happened
-	if (t <= first_bucket_time) {
+	if (ts <= first_bucket_timeslice) {
 		// ### special sentinel for this?
 		return 0;
 	}
 
 	// Calculate offset from the start of the time range of interest
-	const unsigned long delta_t = t - first_bucket_time;
+	const unsigned long delta_ts = ts - first_bucket_timeslice;
 
 	// Calculate the bucket *group* this bucket belongs to
-	const unsigned int b_group = floor_llogb(1l + delta_t / (PQ_TimeSlice * PQ_NumBucketsPerGroup));
+	const unsigned int b_group = floor_llogb(1l + delta_ts / PQ_NumBucketsPerGroup);
 
 	// Calculate start time of first bucket in the group
-	const unsigned long group_start_time = first_bucket_time + ((1l << b_group) - 1) * PQ_TimeSlice * PQ_NumBucketsPerGroup;
+	const unsigned long group_start_timeslice = first_bucket_timeslice + ((1l << b_group) - 1) * PQ_NumBucketsPerGroup;
 
 	// Calculate index of first bucket in the group
 	const unsigned long group_first_bucket_idx = b_group * PQ_NumBucketsPerGroup;
 
 	// Calculate width of a bucket within this group:
-	const unsigned long bucket_width = bucket_group_time_width(b_group);
+	const unsigned long bucket_width = bucket_group_width(b_group);
 
 	// (t - group_start_time) / bucket_width gives the bucket index *within the group*, then add the bucket index of the first one in the group to get the global bucket index
-	const size_t bucket_num = group_first_bucket_idx + (t - group_start_time) / bucket_width;
+	const size_t bucket_num = group_first_bucket_idx + (ts - group_start_timeslice) / bucket_width;
 
 	// Return a sentinel when it is out of range.
 	// ### we could make this the caller's responsibility instead
@@ -110,18 +111,24 @@ unsigned int PQ_time_to_bucket(const PbmPQ *const pq, const long t) {
 	return bucket_num;
 }
 
+
+///-------------------------------------------------------------------------
+/// PBM PQ Public API
+///-------------------------------------------------------------------------
+
 /// Shifts the buckets in the PQ if necessary.
 /// Assumes the PQ is *already* locked!
-bool PQ_internal_ShiftBucketsWithLock(PbmPQ *const pq, const long t) {
-	const long last_shift = pq->last_shifted;
-	const long new_shift = last_shift + PQ_TimeSlice;
+/// `ts` is current time *slice*
+bool PQ_ShiftBucketsWithLock(PbmPQ *pq, long ts) {
+	const long last_shift_ts = pq->last_shifted_time_slice;
+	const long new_shift_ts = last_shift_ts + 1;
 
 	// Once we have the lock, re-check whether shifting is needed
-	if (new_shift > t) {
+	if (new_shift_ts > ts) {
 		return false;
 	}
 
-	pq->last_shifted = new_shift;
+	pq->last_shifted_time_slice = new_shift_ts;
 
 	// bucket[0] will be removed
 	PbmPQBucket *spare = pq->buckets[0];
@@ -139,8 +146,8 @@ bool PQ_internal_ShiftBucketsWithLock(PbmPQ *const pq, const long t) {
 		}
 
 		// Check if this was the last group to shift or not
-		long next_group_width = bucket_group_time_width(group + 1);
-		if (new_shift % next_group_width >= PQ_TimeSlice || group + 1 == PQ_NumBucketGroups) {
+		long next_group_width = bucket_group_width(group + 1);
+		if (new_shift_ts % next_group_width != 0 || group + 1 == PQ_NumBucketGroups) {
 			// The next bucket group will NOT be shifted (or does not exist)
 			// use the "spare bucket" to fill the gap left from shifting, then stop
 			unsigned int idx = (group + 1) * PQ_NumBucketsPerGroup - 1;
@@ -179,18 +186,14 @@ bool PQ_internal_ShiftBucketsWithLock(PbmPQ *const pq, const long t) {
 
 /// Return true if all buckets in the PQ are empty, so the timestamp can be updated without shifting
 /// This requires the lock to already be held!
-bool PQ_check_empty(const PbmPQ *const pq) {
+bool PQ_CheckEmpty(const PbmPQ *pq) {
 	for (int i = 0; i < PQ_NumBuckets; ++i) {
 		if (pq->buckets[i]->bucket_head != NULL) return false;
 	}
 	return true;
 }
 
-
-///-------------------------------------------------------------------------
-/// PBM PQ Public API
-///-------------------------------------------------------------------------
-
+/// Insert a block group into the PBM PQ with current time `t` (ns)
 void PQ_InsertBlockGroup(PbmPQ *const pq, BlockGroupData *const block_group, const long t) {
 	unsigned int i;
 	PbmPQBucket * bucket;
@@ -203,7 +206,7 @@ void PQ_InsertBlockGroup(PbmPQ *const pq, BlockGroupData *const block_group, con
 
 	LOCK_GUARD_V2(PbmPqLock, LW_SHARED) {
 		// Get the appropriate bucket
-		i = PQ_time_to_bucket(pq, t);
+		i = PQ_time_to_bucket(pq, ns_to_timeslice(t));
 		bucket = pq->buckets[i];
 
 // TODO lock bucket for insert!
@@ -214,6 +217,7 @@ void PQ_InsertBlockGroup(PbmPQ *const pq, BlockGroupData *const block_group, con
 	}
 }
 
+/// Remove the specified block group from the PBM PQ
 void PQ_RemoveBlockGroup(BlockGroupData *block_group) {
 	BlockGroupData * next = block_group->bucket_next;
 	BlockGroupData * prev = block_group->bucket_prev;

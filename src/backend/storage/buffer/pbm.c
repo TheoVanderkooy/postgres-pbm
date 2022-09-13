@@ -998,6 +998,10 @@ long get_time_ns(void) {
 	return NS_PER_SEC * (now.tv_sec - pbm->start_time_sec) + now.tv_nsec;
 }
 
+long get_timeslice(void) {
+	return ns_to_timeslice(get_time_ns());
+}
+
 static inline
 void RemoveBufFromBlock(BufferDesc *const buf) {
 	int next, prev;
@@ -1074,13 +1078,13 @@ BlockGroupData EmptyBlockGroupData() {
 // TODO decide where we should run this
 static inline
 void PQ_RefreshRequestedBuckets(void) {
-	long t = get_time_ns();
-	long last_shifted = pbm->BlockQueue->last_shifted;
-	bool up_to_date = (last_shifted + PQ_TimeSlice > t);
+	long ts = get_timeslice();
+	long last_shifted_ts = pbm->BlockQueue->last_shifted_time_slice;
+	bool up_to_date = (last_shifted_ts + 1 > ts);
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_PQ_REFRESH)
 	elog(INFO, "PBM refresh buckets: t=%ld, last=%ld, up_to_date=%s",
-		 t, last_shifted, up_to_date?"true":"false");
+		 ts, last_shifted_ts, up_to_date?"true":"false");
 #endif // TRACE_PBM_PQ_REFRESH
 
 	// Nothing to do if already up to date
@@ -1088,7 +1092,7 @@ void PQ_RefreshRequestedBuckets(void) {
 
 	// Shift the PQ buckets as many times as necessary to catch up
 	LOCK_GUARD_V2(PbmPqLock, LW_EXCLUSIVE) {
-		while (PQ_internal_ShiftBucketsWithLock(pbm->BlockQueue, t)) ;
+		while (PQ_ShiftBucketsWithLock(pbm->BlockQueue, ts)) ;
 	}
 }
 
@@ -1096,13 +1100,13 @@ void PQ_RefreshRequestedBuckets(void) {
 /// Shift buckets in the PBM PQ as necesary IF the lock can be acquired immediately.
 /// If someone else is actively using the queue for anything, then do nothing.
 void PBM_TryRefreshRequestedBuckets(void) {
-	long t = get_time_ns();
-	long last_shifted = pbm->BlockQueue->last_shifted;
-	bool up_to_date = (last_shifted + PQ_TimeSlice > t);
+	long ts = get_timeslice();
+	long last_shifted_ts = pbm->BlockQueue->last_shifted_time_slice;
+	bool up_to_date = (last_shifted_ts + 1 > ts);
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_PQ_REFRESH)
 	elog(INFO, "PBM try refresh buckets: t=%ld, last=%ld, up_to_date=%s",
-		 t, last_shifted, up_to_date?"true":"false");
+		 ts, last_shifted_ts, up_to_date?"true":"false");
 #endif // TRACE_PBM_PQ_REFRESH
 
 	// Nothing to do if already up to date
@@ -1114,14 +1118,14 @@ void PBM_TryRefreshRequestedBuckets(void) {
 
 		// if several time slices have passed since last shift, try to short-circuit by
 		// checking if the whole PQ is empty, in which case we can just update the timestamp without actually shifting anything
-		if ((t - last_shifted) / PQ_TimeSlice > 5) {
-			if (PQ_check_empty(pbm->BlockQueue)) {
-				pbm->BlockQueue->last_shifted = (t - (t % PQ_TimeSlice));
+		if ((ts - last_shifted_ts) > 5) {
+			if (PQ_CheckEmpty(pbm->BlockQueue)) {
+				pbm->BlockQueue->last_shifted_time_slice = ts;
 			}
 		}
 
 		// Shift buckets until up-to-date
-		while (PQ_internal_ShiftBucketsWithLock(pbm->BlockQueue, t)) ;
+		while (PQ_ShiftBucketsWithLock(pbm->BlockQueue, ts)) ;
 
 		LWLockRelease(PbmPqLock);
 	} else {

@@ -13,7 +13,7 @@ typedef struct PbmPQBucket {
 } PbmPQBucket;
 
 typedef struct PbmPQ {
-	long last_shifted;
+	long last_shifted_time_slices;
 
     PbmPQBucket ** buckets;
 
@@ -31,14 +31,19 @@ static inline long bucket_group_time_width(const PbmPQ *const pq, unsigned int g
 	return (1l << group) * PQ_TimeSlice;
 }
 
+static inline long ns_to_timeslice(long t) {
+	return t / PQ_TimeSlice;
+}
+
 void shift_buckets(PbmPQ *const pq, long t) {
-	const long last_shift = pq->last_shifted;
-	const long new_shift = last_shift + PQ_TimeSlice;
+    const long ts = ns_to_timeslice(t);
+	const long last_shift_ts = pq->last_shifted_time_slices;
+	const long new_shift = last_shift_ts + 1;
 	// ### locking!!
 
 	// Nothing to do if not enough time has passed
-	if (new_shift > t) return;
-	pq->last_shifted = new_shift;
+	if (new_shift > ts) return;
+	pq->last_shifted_time_slices = new_shift;
 
 
 	// bucket[0] will be removed
@@ -76,7 +81,7 @@ PbmPQ * InitPq(long time_slice, long num_groups, long buckets_per_group) {
     PQ_TimeSlice = time_slice;
     PbmPQ * pq = malloc(sizeof(PbmPQ));
     *pq = (PbmPQ){
-        .last_shifted = 0,
+        .last_shifted_time_slices = 0,
         .buckets = calloc(PQ_NumBuckets, sizeof(PbmPQBucket*)),
     };
 
