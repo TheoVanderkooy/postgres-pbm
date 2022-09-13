@@ -13,63 +13,56 @@ typedef struct PbmPQBucket {
 } PbmPQBucket;
 
 typedef struct PbmPQ {
-    long first_bucket_time;
-    long time_slice;
-    long buckets_per_group;
 	long last_shifted;
-    long num_groups;
-    long num_buckets;
 
     PbmPQBucket ** buckets;
 
 } PbmPQ;
 
 
+static size_t PQ_NumBucketGroups = 10;
+static size_t PQ_NumBucketsPerGroup = 5;
+static size_t PQ_NumBuckets;
+static long PQ_TimeSlice;
+
+
 /// Time range of the given bucket group
 static inline long bucket_group_time_width(const PbmPQ *const pq, unsigned int group) {
-	return (1l << group) * pq->time_slice;
+	return (1l << group) * PQ_TimeSlice;
 }
 
 void shift_buckets(PbmPQ *const pq, long t) {
 	const long last_shift = pq->last_shifted;
-	const long new_shift = last_shift + pq->time_slice;
+	const long new_shift = last_shift + PQ_TimeSlice;
 	// ### locking!!
-
-    // printf("called shift_buckets!\n");
 
 	// Nothing to do if not enough time has passed
 	if (new_shift > t) return;
 	pq->last_shifted = new_shift;
 
-    // printf("old shift: %ld   time slice:   %ld   new shift:   %ld\n", last_shift, pq->time_slice, new_shift);
-    // printf("didnt return early from shift_buckets!\nt=%ld, shift=%ld\n", t, new_shift);
 
 	// bucket[0] will be removed
 	PbmPQBucket * spare = pq->buckets[0];
-	// struct BlockGroupData * old_first_buckets_block_groups = spare->bucket_head;
-	// *spare = (PbmPQBucket) {
-	// 	.bucket_head = NULL,
-	// };
 
 	// Shift each group
-	for (unsigned int group = 0; group < pq->num_groups; ++group) {
+	for (unsigned int group = 0; group < PQ_NumBucketGroups; ++group) {
 		// Shift the buckets in the group over 1
-		for (unsigned int b = 0; b < pq->buckets_per_group; ++b) {
-			unsigned int idx = group * pq->buckets_per_group + b;
+		for (unsigned int b = 0; b < PQ_NumBucketsPerGroup; ++b) {
+			unsigned int idx = group * PQ_NumBucketsPerGroup + b;
 			pq->buckets[idx] = pq->buckets[idx+1];
 		}
 
 		// Check if this was the last group to shift or not
 		long next_group_width = bucket_group_time_width(pq, group + 1);
-		if (new_shift % next_group_width >= pq->time_slice || group+1 == pq->num_groups) {
+		if (new_shift % next_group_width >= PQ_TimeSlice || group+1 == PQ_NumBucketGroups) {
 			// The next bucket group will NOT be shifted (or does not exist)
 			// use the "spare bucket" to fill the gap left from shifting
-			unsigned int idx = (group+1) * pq->buckets_per_group - 1;
+			unsigned int idx = (group+1) * PQ_NumBucketsPerGroup - 1;
 			pq->buckets[idx] = spare;
             break;
 		} else {
 			// next group will be shifted, steal the first bucket
-			unsigned int idx = (group+1) * pq->buckets_per_group - 1;
+			unsigned int idx = (group+1) * PQ_NumBucketsPerGroup - 1;
 			pq->buckets[idx] = pq->buckets[idx+1];
 		}
 	}
@@ -77,28 +70,26 @@ void shift_buckets(PbmPQ *const pq, long t) {
 
 
 PbmPQ * InitPq(long time_slice, long num_groups, long buckets_per_group) {
-    long num_buckets = num_groups * buckets_per_group;
+    PQ_NumBucketGroups = num_groups;
+    PQ_NumBucketsPerGroup = buckets_per_group;
+    PQ_NumBuckets = num_groups * buckets_per_group;
+    PQ_TimeSlice = time_slice;
     PbmPQ * pq = malloc(sizeof(PbmPQ));
     *pq = (PbmPQ){
-        .first_bucket_time = 0,
-        .time_slice = time_slice,
-        .buckets_per_group = buckets_per_group,
-        .num_groups = num_groups,
-        .num_buckets = num_buckets,
-        .buckets = calloc(num_buckets, sizeof(PbmPQBucket*)),
+        .last_shifted = 0,
+        .buckets = calloc(PQ_NumBuckets, sizeof(PbmPQBucket*)),
     };
 
-    for (int i = 0; i < num_buckets; ++i) {
+    for (int i = 0; i < PQ_NumBuckets; ++i) {
         pq->buckets[i] = malloc(sizeof(PbmPQBucket));
         *(pq->buckets[i]) = (PbmPQBucket){ .i = i, };
     }
-
 
     return pq;
 }
 
 void print_pq(PbmPQ * pq) {
-    for (int i = 0; i < pq->num_buckets; ++i) {
+    for (int i = 0; i < PQ_NumBuckets; ++i) {
         if (pq->buckets[i] == NULL) {
             printf("null|");
         } else {
@@ -109,7 +100,7 @@ void print_pq(PbmPQ * pq) {
 }
 
 void copy_to_array(PbmPQ * pq, int * arr) {
-    for (int i = 0; i < pq->num_buckets; ++i) {
+    for (int i = 0; i < PQ_NumBuckets; ++i) {
         arr[i] = pq->buckets[i]->i;
     }
 }
@@ -153,7 +144,7 @@ void test2(void) {
         /*# groups*/        4, 
         /*buckets/group*/   5
     );
-    int len = pq->num_buckets;
+    int len = PQ_NumBuckets;
 
     int a[20];
     int b[20];
