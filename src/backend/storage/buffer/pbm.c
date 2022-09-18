@@ -667,6 +667,10 @@ void sanity_check_verify_block_group_buffers(const BufferDesc * const buf) {
 }
 
 void list_all_buffers(void) {
+	bool found;
+	BlockGroupData * data;
+	Buffer bid;
+
 	for (int i = 0; i < NBuffers; ++i) {
 		BufferDesc *buf = GetBufferDescriptor(i);
 		BufferTag tag = buf->tag;
@@ -675,15 +679,13 @@ void list_all_buffers(void) {
 			 BLOCK_GROUP(tag.blockNum), buf->pbm_bgroup_prev, buf->pbm_bgroup_next
 		);
 
-		bool found;
-		BlockGroupData *data = search_block_group(buf, &found);
+		data = search_block_group(buf, &found);
 
 		if (!found || data == NULL) {
 			elog(WARNING, "\tGROUP NOT FOUND!  prev=%d  next=%d", buf->pbm_bgroup_prev, buf->pbm_bgroup_next);
 			continue;
 		}
 
-		Buffer bid;
 		for (bid = data->buffers_head; bid >= 0 && bid <= NBuffers; bid = GetBufferDescriptor(bid)->pbm_bgroup_next) {
 			BufferDesc *buf2 = GetBufferDescriptor(bid);
 			tag = buf2->tag;
@@ -1132,27 +1134,10 @@ void PBM_TryRefreshRequestedBuckets(void) {
 	}
 }
 
+#if PBM_EVICT_MODE == 1
 BufferDesc* PBM_EvictPage(void) {
 	return PQ_Evict(pbm->BlockQueue);
 }
-
-#if 0
-void PagePush(/*TODO args --- page + header? */) {
-	/*
-	 * Recalculate priority of a block
-	 *  1. Remove from bucket if applicable
-	 *  2. Estimate next consumption time
-	 *  3. Add to bucket
-	 */
-
-	/*
-	 * This should be called:
-	 *  - after being processed by a scan
-	 *  - ...
-	 *  TODO THIS IS JUST "RefreshBlockGroup"! cleanup code!
-	 */
-}
-
 #endif
 
 /*

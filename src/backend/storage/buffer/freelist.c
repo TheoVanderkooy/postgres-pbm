@@ -186,69 +186,11 @@ have_free_buffer(void)
 		return false;
 }
 
-/*
- * StrategyGetBuffer
- *
- *	Called by the bufmgr to get the next candidate buffer to use in
- *	BufferAlloc(). The only hard requirement BufferAlloc() has is that
- *	the selected buffer must not currently be pinned by anyone.
- *
- *	strategy is a BufferAccessStrategy object, or NULL for default strategy.
- *
- *	To ensure that no one else can pin the buffer before we do, we must
- *	return the buffer with the buffer header spinlock still held.
- */
-BufferDesc *
-StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
+static inline
+BufferDesc * check_free_list(BufferAccessStrategy strategy, uint32 * buf_state)
 {
-	BufferDesc *buf;
-	int			bgwprocno;
-	int			trycounter;
-	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
-
-	/*
-	 * If given a strategy object, see whether it can select a buffer. We
-	 * assume strategy objects don't need buffer_strategy_lock.
-	 */
-	if (strategy != NULL)
-	{
-		buf = GetBufferFromRing(strategy, buf_state);
-		if (buf != NULL)
-			return buf;
-	}
-
-	/*
-	 * If asked, we need to waken the bgwriter. Since we don't want to rely on
-	 * a spinlock for this we force a read from shared memory once, and then
-	 * set the latch based on that value. We need to go through that length
-	 * because otherwise bgwprocno might be reset while/after we check because
-	 * the compiler might just reread from memory.
-	 *
-	 * This can possibly set the latch of the wrong process if the bgwriter
-	 * dies in the wrong moment. But since PGPROC->procLatch is never
-	 * deallocated the worst consequence of that is that we set the latch of
-	 * some arbitrary process.
-	 */
-	bgwprocno = INT_ACCESS_ONCE(StrategyControl->bgwprocno);
-	if (bgwprocno != -1)
-	{
-		/* reset bgwprocno first, before setting the latch */
-		StrategyControl->bgwprocno = -1;
-
-		/*
-		 * Not acquiring ProcArrayLock here which is slightly icky. It's
-		 * actually fine because procLatch isn't ever freed, so we just can
-		 * potentially set the wrong process' (or no process') latch.
-		 */
-		SetLatch(&ProcGlobal->allProcs[bgwprocno].procLatch);
-	}
-
-	/*
-	 * We count buffer allocation requests so that the bgwriter can estimate
-	 * the rate of buffer consumption.  Note that buffers recycled by a
-	 * strategy object are intentionally not counted here.
-	 */
-	pg_atomic_fetch_add_u32(&StrategyControl->numBufferAllocs, 1);
+	BufferDesc * buf;
+	uint32 local_buf_state;
 
 	/*
 	 * First check, without acquiring the lock, whether there's buffers in the
@@ -301,8 +243,11 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 			 */
 			local_buf_state = LockBufHdr(buf);
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
-				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
-// TODO theo --- allow 0 usage count (actually, just get rid of usage count for PBM?)
+#if PBM_EVICT_MODE != 0
+// only check usage count if we are using the clock algorithm
+				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0
+#endif
+			)
 			{
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
@@ -310,19 +255,129 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 				return buf;
 			}
 			UnlockBufHdr(buf, local_buf_state);
-
 		}
 	}
 
-#ifdef USE_PBM
+	/* Nothing usable on the free list */
+	return NULL;
+}
+
+
+/*
+ * StrategyGetBuffer
+ *
+ *	Called by the bufmgr to get the next candidate buffer to use in
+ *	BufferAlloc(). The only hard requirement BufferAlloc() has is that
+ *	the selected buffer must not currently be pinned by anyone.
+ *
+ *	strategy is a BufferAccessStrategy object, or NULL for default strategy.
+ *
+ *	To ensure that no one else can pin the buffer before we do, we must
+ *	return the buffer with the buffer header spinlock still held.
+ */
+BufferDesc *
+StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
+{
+	BufferDesc *buf;
+	int			bgwprocno;
+#if PBM_EVICT_MODE == 2
+	PBM_EvictState pbm_estate;
+#elif PBM_EVICT_MODE == 0
+	int			trycounter;
+	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
+#endif
+
+	/*
+	 * If given a strategy object, see whether it can select a buffer. We
+	 * assume strategy objects don't need buffer_strategy_lock.
+	 */
+	if (strategy != NULL)
+	{
+		buf = GetBufferFromRing(strategy, buf_state);
+		if (buf != NULL)
+			return buf;
+	}
+
+	/*
+	 * If asked, we need to waken the bgwriter. Since we don't want to rely on
+	 * a spinlock for this we force a read from shared memory once, and then
+	 * set the latch based on that value. We need to go through that length
+	 * because otherwise bgwprocno might be reset while/after we check because
+	 * the compiler might just reread from memory.
+	 *
+	 * This can possibly set the latch of the wrong process if the bgwriter
+	 * dies in the wrong moment. But since PGPROC->procLatch is never
+	 * deallocated the worst consequence of that is that we set the latch of
+	 * some arbitrary process.
+	 */
+	bgwprocno = INT_ACCESS_ONCE(StrategyControl->bgwprocno);
+	if (bgwprocno != -1)
+	{
+		/* reset bgwprocno first, before setting the latch */
+		StrategyControl->bgwprocno = -1;
+
+		/*
+		 * Not acquiring ProcArrayLock here which is slightly icky. It's
+		 * actually fine because procLatch isn't ever freed, so we just can
+		 * potentially set the wrong process' (or no process') latch.
+		 */
+		SetLatch(&ProcGlobal->allProcs[bgwprocno].procLatch);
+	}
+
+	/*
+	 * We count buffer allocation requests so that the bgwriter can estimate
+	 * the rate of buffer consumption.  Note that buffers recycled by a
+	 * strategy object are intentionally not counted here.
+	 */
+	pg_atomic_fetch_add_u32(&StrategyControl->numBufferAllocs, 1);
+
+#if PBM_EVICT_MODE == 2
+	PBM_InitEvictState(&pbm_estate);
+
+	for (;;) {
+		/* Check free list first */
+		buf = check_free_list(strategy, buf_state);
+		if (NULL != buf) {
+			return buf;
+		}
+
+		/* If we've exhausted the PBM, we can't return anything so error */
+		if (PBM_EvictingFailed(&pbm_estate)) {
+			elog(ERROR, "no unpinned buffers available");
+		}
+
+		/* Nothing from the free list, ask PBM to put more stuff on it */
+		PBM_EvictPages(&pbm_estate);
+	}
+
+#elif PBM_EVICT_MODE == 1
 // TODO theo --- this is where we need to get new buffer from PBM if nothing in the free list
 // TODO theo --- worry about multi-eviction later
+	/* Check the free list first */
+	buf = check_free_list(strategy, buf_state);
+	if (NULL != buf) {
+		return buf;
+	}
 
 	buf = PBM_EvictPage();
+
+	/* We didn't find anyhting in the PBM, this is an error */
+	if (NULL == buf) {
+		elog(ERROR, "no unpinned buffers available");
+	}
+
 	*buf_state = pg_atomic_read_u32(&buf->state);
 	return buf;
 
 #else // otherwise use the old clock algorithm
+	/*
+	 * Check the free list first
+	 */
+	buf = check_free_list(strategy, buf_state);
+	if (NULL != buf) {
+		return buf;
+	}
+
 	/* Nothing on the freelist, so run the "clock sweep" algorithm */
 	trycounter = NBuffers;
 	for (;;)

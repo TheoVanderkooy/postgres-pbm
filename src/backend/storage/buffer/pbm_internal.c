@@ -362,7 +362,71 @@ BlockGroupData * pq_bucket_pop_front(PbmPQBucket * bucket) {
  *  - though may really want to add block group ptr to buffer header... if can fit in 4 bytes! (or separate set of headers)
  */
 
+#if PBM_EVICT_MODE == 2
+void PBM_InitEvictState(PBM_EvictState * state) {
+	state->next_idx = PQ_NumBuckets;
+}
 
+
+void PBM_EvictPages(PBM_EvictState * state) {
+	PbmPQBucket* bucket;
+	bool stop = false;
+
+	// Skip over the empty buckets to avoid redundant checks of free list
+	for (;;) {
+		// Check not_requested first
+		if (state->next_idx >= PQ_NumBuckets) {
+			bucket = pbm->BlockQueue->not_requested_bucket;
+		} else {
+			bucket = pbm->BlockQueue->buckets[state->next_idx];
+		}
+
+		// If bucket is empty, check the next one
+		if (bucket->bucket_head == NULL) {
+			state->next_idx -= 1;
+			if (state->next_idx < 0) {
+				return;
+			} else {
+				continue;
+			}
+		}
+
+		// loop over the whole bucket and add every buffer in each group to the free list if it isn't pinned
+		// TODO need read lock?
+		LOCK_GUARD_V2(PbmPqLock, LW_SHARED) {
+			// Loop over block groups in the bucket
+			for (BlockGroupData * it = bucket->bucket_head; NULL != it; it = it->bucket_next) {
+				BufferDesc* buf;
+				int buf_id = it->buffers_head;
+
+				// Loop over buffers in the block group
+				while (buf_id >= 0) {
+					buf = GetBufferDescriptor(buf_id);
+					uint32 buf_state = pg_atomic_read_u32(&buf->state);
+
+					// Check if the buffer is pinned and remember if we found anything
+					if (BUF_STATE_GET_REFCOUNT(buf_state) == 0) {
+						stop = true;
+
+						// free the buffer (add to free list if not already there)
+						StrategyFreeBuffer(buf);
+					}
+
+					buf_id = buf->pbm_bgroup_next;
+				}
+			}
+		}
+
+		// If the bucket didn't have any buffers, go again
+		if (!stop) {
+			continue;
+		} else {
+			return;
+		}
+	}
+}
+
+#elif PBM_EVICT_MODE == 1
 // TODO!
 struct BufferDesc * PQ_Evict(PbmPQ * pq) {
 	// TODO check "not requested" first?
@@ -449,6 +513,7 @@ struct BufferDesc * PQ_Evict(PbmPQ * pq) {
 
 	return NULL;
 }
+#endif
 
 /*
  * TODO:

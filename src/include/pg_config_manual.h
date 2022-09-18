@@ -404,6 +404,19 @@
 /* #define TRACE_SYNCSCAN */
 
 /*
- * Enable predictive buffer manager
+ * Enable predictive buffer manager.
  */
 #define USE_PBM
+
+/*
+ * What eviction implementation to use:
+ *  0: existing clock algorithm w/ "strategies" (default if USE_PBM is disabled)
+ *  1: first implementation with only 1 block at a time
+ *  2: method that puts still-valid blocks on the free list and lets the normal
+ *     mechanism try multiple times to get from the free list
+ */
+#ifdef USE_PBM
+#define PBM_EVICT_MODE 2
+#else
+#define PBM_EVICT_MODE 0
+#endif

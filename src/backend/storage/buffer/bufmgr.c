@@ -1200,7 +1200,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		 */
 		buf = StrategyGetBuffer(strategy, &buf_state);
 // TODO theo --- I think we can put everything in StrategyGetBuffer --- make sure we set the refcount to 0!
-#if !defined(USE_PBM)
+#if PBM_EVICT_MODE == 0
 		Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
 #endif
 
