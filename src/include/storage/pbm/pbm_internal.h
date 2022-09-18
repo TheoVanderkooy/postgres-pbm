@@ -7,7 +7,8 @@
 /// Constants
 ///-------------------------------------------------------------------------
 
-#define NS_PER_SEC 1000000000 // 10^9 ns per second
+#define NS_PER_MS 	1000 * 1000			// 10^6 ns per millisecond
+#define NS_PER_SEC 	(1000 * NS_PER_MS) 	// 10^9 ns per second
 
 static const long AccessTimeNotRequested = 0;
 static const unsigned int PQ_BucketOutOfRange = (unsigned int)(-1);
@@ -27,10 +28,10 @@ static const long BlockGroupMapMaxSize = 1024;
 #define PBM_CLOCK CLOCK_MONOTONIC // CLOCK_MONOTONIC_COARSE
 
 /// PQ configuration
-static const size_t PQ_NumBucketGroups = 10;
-static const size_t PQ_NumBucketsPerGroup = 5;
-static const size_t PQ_NumBuckets = PQ_NumBucketGroups * PQ_NumBucketsPerGroup;
-static const int64_t PQ_TimeSlice = NS_PER_SEC / 10;
+static const int PQ_NumBucketGroups = 10;
+static const int PQ_NumBucketsPerGroup = 5;
+static const int PQ_NumBuckets = PQ_NumBucketGroups * PQ_NumBucketsPerGroup;
+static const int64_t PQ_TimeSlice = 100 * NS_PER_MS;
 
 /// Debugging flags
 #define TRACE_PBM
@@ -104,6 +105,7 @@ typedef struct BlockGroupData {
 
 typedef struct PbmPQBucket {
 	struct BlockGroupData* bucket_head;
+	struct BlockGroupData* bucket_tail;
 	// ### could also include start & end time (delta) in the bucket?
 	// TODO (spin) lock?
 } PbmPQBucket;
@@ -115,8 +117,11 @@ typedef struct PbmPQ {
 
 	PbmPQBucket ** buckets;
 	// ### keep track of "not requested" and "very far future" separately?
+	PbmPQBucket * not_requested_bucket;
+	PbmPQBucket * not_requested_other;
+	PbmPQBucket nr1;
+	PbmPQBucket nr2;
 
-	// TODO keep track of the last_shifted TIME_SLICE (i.e. t / PQ_TimeSlice)
 	_Atomic(long) last_shifted_time_slice;
 } PbmPQ;
 
@@ -182,15 +187,17 @@ extern Size PbmPqShmemSize(void);
 ///-------------------------------------------------------------------------
 /// PBM PQ manipulation
 ///-------------------------------------------------------------------------
-extern void PQ_InsertBlockGroup(PbmPQ * pq, BlockGroupData * block_group, long t);
+extern void PQ_InsertBlockGroup(PbmPQ *const pq, BlockGroupData *const block_group, const long t, bool requested);
 extern void PQ_RemoveBlockGroup(BlockGroupData *block_group);
 extern bool PQ_ShiftBucketsWithLock(PbmPQ * pq, long t);
 extern bool PQ_CheckEmpty(const PbmPQ * pq);
+extern struct BufferDesc* PQ_Evict(PbmPQ * pq);
 
 ///-------------------------------------------------------------------------
 /// Helpers
 ///-------------------------------------------------------------------------
 extern long get_time_ns(void);
+extern long get_timeslice(void);
 
 
 #endif //POSTGRESQL_PBM_INTERNAL_H

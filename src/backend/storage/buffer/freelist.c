@@ -18,6 +18,7 @@
 #include "port/atomics.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
+#include "storage/pbm.h"
 #include "storage/proc.h"
 
 #define INT_ACCESS_ONCE(var)	((int)(*((volatile int *)&(var))))
@@ -301,6 +302,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 			local_buf_state = LockBufHdr(buf);
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
+// TODO theo --- allow 0 usage count (actually, just get rid of usage count for PBM?)
 			{
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
@@ -312,11 +314,15 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 		}
 	}
 
-// TODO theo --- this is where we need to get new buffer from PBM if nothing in the free list
 #ifdef USE_PBM
+// TODO theo --- this is where we need to get new buffer from PBM if nothing in the free list
+// TODO theo --- worry about multi-eviction later
 
-#endif
+	buf = PBM_EvictPage();
+	*buf_state = pg_atomic_read_u32(&buf->state);
+	return buf;
 
+#else // otherwise use the old clock algorithm
 	/* Nothing on the freelist, so run the "clock sweep" algorithm */
 	trycounter = NBuffers;
 	for (;;)
@@ -360,6 +366,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 		}
 		UnlockBufHdr(buf, local_buf_state);
 	}
+#endif // USE_PBM
 }
 
 /*
@@ -381,6 +388,7 @@ StrategyFreeBuffer(BufferDesc *buf)
 			StrategyControl->lastFreeBuffer = buf->buf_id;
 		StrategyControl->firstFreeBuffer = buf->buf_id;
 	}
+	// TODO theo --- uses free list as a *stack* (not LRU). not ideal for us
 
 	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 }

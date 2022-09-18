@@ -4,8 +4,8 @@
 #include "postgres.h"
 
 #include "storage/pbm.h"
-#include "storage/pbm_background.h"
-#include "storage/pbm_internal.h"
+#include "storage/pbm/pbm_background.h"
+#include "storage/pbm/pbm_internal.h"
 
 #include "miscadmin.h"
 #include "lib/stringinfo.h"
@@ -98,7 +98,7 @@ static BlockGroupData * search_block_group(const BufferDesc * buf, bool* foundPt
 // various helpers to improve code reuse and readability
 static void InitScanStatsEntry(BlockGroupScanList* temp, ScanId id, ScanData* sdata, BlockGroupScanList* next, BlockNumber bgnum);
 static bool DeleteScanFromGroup(ScanId id, BlockGroupData* groupData);
-static BlockGroupData * AddBufToBlock(struct BufferDesc *buf);
+static BlockGroupData * AddBufToBlockGroup(BufferDesc *const buf);
 
 // debugging
 static void debug_append_scan_data(StringInfoData* str, ScanHashEntry* entry);
@@ -514,7 +514,7 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 // ### revisit whether to register buffers when loaded or when unpinned
 // Notify the PBM about a new buffer so it can be added to the priority queue
 void PbmNewBuffer(BufferDesc * const buf) {
-	const BlockGroupData* group;
+	BlockGroupData* group;
 #if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS) && defined(TRACE_PBM_BUFFERS_NEW)
 	if (FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_next) {
 		debug_buffer_access(buf, "new buffer");
@@ -535,7 +535,7 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	);
 #endif // TRACE_PBM && TRACE_PBM_BUFFERS && TRACE_PBM_BUFFERS_NEW
 
-	group = AddBufToBlock(buf);
+	group = AddBufToBlockGroup(buf);
 
 	// stop here if there is no group
 // ### we should instead create the group!
@@ -568,9 +568,8 @@ void PbmNewBuffer(BufferDesc * const buf) {
 #endif // tracing
 #endif // SANITY_PBM_BUFFERS
 
-	// TODO if group wasn't in the PQ already, add it
 	if (NULL == group->pq_bucket) {
-		/// TODO PagePush?
+		RefreshBlockGroup(group);
 	}
 }
 
@@ -951,7 +950,7 @@ bool DeleteScanFromGroup(const ScanId id, BlockGroupData *const groupData) {
 	}
 }
 
-BlockGroupData * AddBufToBlock(BufferDesc *const buf) {
+BlockGroupData * AddBufToBlockGroup(BufferDesc *const buf) {
 	bool found;
 	BlockGroupData * group;
 	Buffer group_head;
@@ -1059,8 +1058,8 @@ void RefreshBlockGroup(BlockGroupData *const data) {
 	PQ_RemoveBlockGroup(data);
 	long t = PageNextConsumption(data, &requested);
 
-	if (requested && has_buffers) {
-		PQ_InsertBlockGroup(pbm->BlockQueue, data, t);
+	if (has_buffers) {
+		PQ_InsertBlockGroup(pbm->BlockQueue, data, t, requested);
 	}
 }
 
@@ -1133,6 +1132,10 @@ void PBM_TryRefreshRequestedBuckets(void) {
 	}
 }
 
+BufferDesc* PBM_EvictPage(void) {
+	return PQ_Evict(pbm->BlockQueue);
+}
+
 #if 0
 void PagePush(/*TODO args --- page + header? */) {
 	/*
@@ -1150,13 +1153,6 @@ void PagePush(/*TODO args --- page + header? */) {
 	 */
 }
 
-void EvictPage(/*TODO argsg?*/) {
-	/*
-	 * 1. Evict the "not requested" bucket if not empty
-	 * 2. Otherwise, pick the last non-empty bucket
-	 * 3. Pick one page --- or multiple?
-	 */
-}
 #endif
 
 /*

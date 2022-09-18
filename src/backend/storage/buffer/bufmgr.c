@@ -1199,8 +1199,10 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		 * spinlock still held!
 		 */
 		buf = StrategyGetBuffer(strategy, &buf_state);
-
+// TODO theo --- I think we can put everything in StrategyGetBuffer --- make sure we set the refcount to 0!
+#if !defined(USE_PBM)
 		Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
+#endif
 
 		/* Must copy buffer flags while we still hold the spinlock */
 		oldFlags = buf_state & BUF_FLAG_MASK;
@@ -1911,7 +1913,7 @@ UnpinBuffer(BufferDesc *buf, bool fixOwner)
 //  2. check refcount and usage count (? what are those) are 0 (?)
 //  3. ???
 // (is it enough to check if the buf_state refcount is 0? is it possible for it to reach 0 anywhere else?)
-// TODO theo --- BufferIsPinned macro!
+// TODO theo --- consider *also* notifying on unpin, to recalculate priority early
 
 		/* Support LockBufferForCleanup() */
 		if (buf_state & BM_PIN_COUNT_WAITER)

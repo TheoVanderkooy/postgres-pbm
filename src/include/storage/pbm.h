@@ -29,7 +29,7 @@ extern void PbmNewBuffer(struct BufferDesc * buf);
 //extern void PbmBufferNotPinned(struct BufferDesc * buf);
 extern void PbmOnEvictBuffer(struct BufferDesc * buf);
 
-extern struct BufferDesc* EvictPages(void);
+extern struct BufferDesc* PBM_EvictPage(void);
 
 /*
  * TODO: Register*Scan for:
