@@ -8,6 +8,22 @@
 #include "storage/block.h"
 
 
+/// CONFIGURATION
+// (move this to pg_config_manual.h later, for now it is here because changing it forces *everything* to recompile)
+/*
+ * What eviction implementation to use:
+ *  0: existing clock algorithm w/ "strategies" (default if USE_PBM is disabled)
+ *  1: first implementation with only 1 block at a time
+ *  2: method that puts still-valid blocks on the free list and lets the normal
+ *     mechanism try multiple times to get from the free list
+ */
+#ifdef USE_PBM
+#define PBM_EVICT_MODE 0
+#else
+#define PBM_EVICT_MODE 0
+#endif
+
+
 /// Forward declarations
 struct HeapScanDescData;
 struct BufferDesc;

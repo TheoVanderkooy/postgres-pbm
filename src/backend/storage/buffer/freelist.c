@@ -443,7 +443,6 @@ StrategyFreeBuffer(BufferDesc *buf)
 			StrategyControl->lastFreeBuffer = buf->buf_id;
 		StrategyControl->firstFreeBuffer = buf->buf_id;
 	}
-	// TODO theo --- uses free list as a *stack* (not LRU). not ideal for us
 
 	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 }

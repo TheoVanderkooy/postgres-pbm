@@ -184,10 +184,9 @@ typedef struct BufferDesc
 	BufferTag	tag;			/* ID of page contained in buffer */
 	int			buf_id;			/* buffer's index number (from 0) */
 
-#ifdef USE_PBM
+	/* track buffers in the same group in the PBM */
 	int pbm_bgroup_next;				/* PBM next buffer which is loaded in a block */
 	int pbm_bgroup_prev;				/* PBM previous buffer in the chain for a given block */
-#endif
 
 	/* state of the tag, containing flags, refcount and usagecount */
 	pg_atomic_uint32 state;

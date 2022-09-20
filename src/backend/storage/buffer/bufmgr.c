@@ -1502,7 +1502,7 @@ InvalidateBuffer(BufferDesc *buf)
 	buf_state = pg_atomic_read_u32(&buf->state);
 	Assert(buf_state & BM_LOCKED);
 	UnlockBufHdr(buf, buf_state);
-
+// TODO theo --- may need to remove from PBM here ... only used for drop table though
 	/*
 	 * Need to compute the old tag's hashcode and partition lock ID. XXX is it
 	 * worth storing the hashcode in BufferDesc so we need not recompute it
@@ -3456,7 +3456,7 @@ void
 DropDatabaseBuffers(Oid dbid)
 {
 	int			i;
-// TODO theo --- can ignore this for now but proper implementation would care. Same with DropRelFileNodeBuffers/etc.
+
 	/*
 	 * We needn't consider local buffers, since by assumption the target
 	 * database isn't our own.

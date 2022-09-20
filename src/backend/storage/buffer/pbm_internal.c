@@ -263,6 +263,14 @@ void pq_bucket_prepend_range(PbmPQBucket *bucket, PbmPQBucket *other) {
 	BlockGroupData * head = other->bucket_head;
 	BlockGroupData * tail = other->bucket_tail;
 
+	// either both or neither is null
+	Assert((NULL == head) == (NULL == tail));
+
+	// If "other" is empty, nothing to do
+	if (NULL == head) {
+		return;
+	}
+
 	// reset other bucket to empty
 	init_pq_bucket(other);
 
