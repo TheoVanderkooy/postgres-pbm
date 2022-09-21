@@ -18,7 +18,7 @@
  *     mechanism try multiple times to get from the free list
  */
 #ifdef USE_PBM
-#define PBM_EVICT_MODE 1
+#define PBM_EVICT_MODE 0
 #else
 #define PBM_EVICT_MODE 0
 #endif
