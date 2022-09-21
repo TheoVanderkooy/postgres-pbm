@@ -594,6 +594,7 @@ inline void PbmOnEvictBuffer(struct BufferDesc *const buf) {
 #endif // SANITY_PBM_BUFFERS
 
 // ### need to lock the block group? (worry about it later, this needs to change anyways...)
+// ### lock the PBM (shared) (?)
 	RemoveBufFromBlock(buf);
 }
 
@@ -1028,7 +1029,7 @@ void RemoveBufFromBlock(BufferDesc *const buf) {
 // ### some way to optimize this?? maybe using pointers instead of indexes?
 		bool found;
 		BlockGroupData * group = search_block_group(buf, &found);
-// ### lock the group!
+// ### lock the group! (need to do this anyways!)
 		Assert(found);
 		group->buffers_head = next;
 
@@ -1135,8 +1136,8 @@ void PBM_TryRefreshRequestedBuckets(void) {
 }
 
 #if PBM_EVICT_MODE == 1
-BufferDesc* PBM_EvictPage(void) {
-	return PQ_Evict(pbm->BlockQueue);
+BufferDesc* PBM_EvictPage(uint32 * buf_state) {
+	return PQ_Evict(pbm->BlockQueue, buf_state);
 }
 #endif
 

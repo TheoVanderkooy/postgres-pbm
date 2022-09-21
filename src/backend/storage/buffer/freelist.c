@@ -359,14 +359,13 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 		return buf;
 	}
 
-	buf = PBM_EvictPage();
+	buf = PBM_EvictPage(buf_state);
 
 	/* We didn't find anyhting in the PBM, this is an error */
 	if (NULL == buf) {
 		elog(ERROR, "no unpinned buffers available");
 	}
 
-	*buf_state = pg_atomic_read_u32(&buf->state);
 	return buf;
 
 #else // otherwise use the old clock algorithm

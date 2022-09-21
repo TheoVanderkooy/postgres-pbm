@@ -18,7 +18,7 @@
  *     mechanism try multiple times to get from the free list
  */
 #ifdef USE_PBM
-#define PBM_EVICT_MODE 0
+#define PBM_EVICT_MODE 1
 #else
 #define PBM_EVICT_MODE 0
 #endif
@@ -47,7 +47,7 @@ extern void PbmOnEvictBuffer(struct BufferDesc * buf);
 
 /// Eviction-related methods & data structures
 #if PBM_EVICT_MODE == 1
-extern struct BufferDesc* PBM_EvictPage(void);
+extern struct BufferDesc* PBM_EvictPage(uint32 * buf_state);
 #elif PBM_EVICT_MODE == 2
 typedef struct PBM_EvictState {
 	int next_idx;

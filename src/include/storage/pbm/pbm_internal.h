@@ -42,6 +42,8 @@ static const int64_t PQ_TimeSlice = 100 * NS_PER_MS;
 //#define TRACE_PBM_BUFFERS_NEW
 //#define TRACE_PBM_BUFFERS_EVICT
 #define TRACE_PBM_PQ_REFRESH
+#define TRACE_PBM_EVICT
+
 //#define SANITY_PBM_BUFFERS
 
 
@@ -187,11 +189,11 @@ extern Size PbmPqShmemSize(void);
 ///-------------------------------------------------------------------------
 /// PBM PQ manipulation
 ///-------------------------------------------------------------------------
-extern void PQ_InsertBlockGroup(PbmPQ *const pq, BlockGroupData *const block_group, const long t, bool requested);
+extern void PQ_InsertBlockGroup(PbmPQ * pq, BlockGroupData * block_group, long t, bool requested);
 extern void PQ_RemoveBlockGroup(BlockGroupData *block_group);
 extern bool PQ_ShiftBucketsWithLock(PbmPQ * pq, long t);
 extern bool PQ_CheckEmpty(const PbmPQ * pq);
-extern struct BufferDesc* PQ_Evict(PbmPQ * pq);
+extern struct BufferDesc* PQ_Evict(PbmPQ * pq, uint32 * but_state);
 
 ///-------------------------------------------------------------------------
 /// Helpers

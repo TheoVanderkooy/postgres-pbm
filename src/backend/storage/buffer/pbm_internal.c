@@ -178,27 +178,6 @@ bool PQ_ShiftBucketsWithLock(PbmPQ *pq, long ts) {
 		}
 	}
 
-//// ### re-insert the "old_first_buckets_block_groups" (after the lock?)
-//// ### if keeping this: add a tail pointer in the bucket too? Or make the list circular?
-//	// FOR NOW: just add them to the new first bucket...
-//	if (old_first_buckets_block_groups != NULL) {
-//		PbmPQBucket * bucket0 = pq->buckets[0];
-//		if (NULL == bucket0->bucket_head) {
-//			bucket0->bucket_head = old_first_buckets_block_groups;
-//		} else {
-//			BlockGroupData *old_head = old_first_buckets_block_groups;
-//			BlockGroupData *old_tail = old_first_buckets_block_groups;
-//			// find tail of the old first bucket list
-//			while (old_tail->bucket_next != NULL) {
-//				old_tail = old_tail->bucket_next;
-//			}
-//			// link at the start of the new first bucket's list
-//			old_tail->bucket_next = bucket0->bucket_head;
-//			bucket0->bucket_head->bucket_prev = old_tail;
-//			bucket0->bucket_head = old_head;
-//		}
-//	}
-
 	return true;
 }
 
@@ -282,9 +261,10 @@ void pq_bucket_prepend_range(PbmPQBucket *bucket, PbmPQBucket *other) {
 // TODO lock the bucket!
 	if (NULL == bucket->bucket_tail) {
 		// bucket was empty:
-		tail->bucket_next = NULL;
 		head->bucket_prev = NULL;
 		bucket->bucket_head = head;
+
+		tail->bucket_next = NULL;
 		bucket->bucket_tail = tail;
 	} else {
 		// bucket was not empty:
@@ -345,15 +325,25 @@ void pq_bucket_remove(BlockGroupData *block_group) {
 static inline
 BlockGroupData * pq_bucket_pop_front(PbmPQBucket * bucket) {
 // TODO lock?
+
+	// Return NULL if bucket is empty
 	if (NULL == bucket->bucket_head) {
 		return NULL;
 	}
 
+	// First group in the bucket will be returned
 	BlockGroupData * ret = bucket->bucket_head;
 	bucket->bucket_head = ret->bucket_next;
 
-	ret->bucket_next->bucket_prev = NULL;
+	if (ret->bucket_next != NULL) {
+		// Unlink the head from its successor if applicable
+		ret->bucket_next->bucket_prev = NULL;
+	} else {
+		// If no successor, then the bucket tail should be reset too
+		bucket->bucket_tail = NULL;
+	}
 
+	// Unlink returned group grom the bucket
 	ret->bucket_next = NULL;
 	ret->bucket_prev = NULL;
 	ret->pq_bucket = NULL;
@@ -436,24 +426,41 @@ void PBM_EvictPages(PBM_EvictState * state) {
 
 #elif PBM_EVICT_MODE == 1
 // TODO!
-struct BufferDesc * PQ_Evict(PbmPQ * pq) {
+struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * buf_state_out) {
 	// TODO check "not requested" first?
 	// TODO locking!
+
+#if defined(TRACE_PBM) && defined(TRACE_PBM_EVICT)
+	static int x = 0;
+	int y = x;
+	++x;
+	elog(LOG, "PQ_Evict (%d) START", y);
+#endif // TRACE_PBM && TRACE_PBM_EVICT
 
 	int i = PQ_NumBuckets - 1;
 
 	for (;;) {
 		// step 1: try to get something from the not_requested bucket
 		for (;;) {
+#if defined(TRACE_PBM) && defined(TRACE_PBM_EVICT)
+			elog(LOG, "PQ_Evict (%d) (i=%d) CHECK NOT_REQUESTED", y, i);
+#endif // TRACE_PBM && TRACE_PBM_EVICT
+
 			// swap out the not_requested bucket to avoid contention on not_requested...
 			PbmPQBucket * temp = pq->not_requested_bucket;
 			pq->not_requested_bucket = pq->not_requested_other;
 			pq->not_requested_other = temp;
 
+			// Get a block group from the old not_requested bucket. If nothing, go to next loop
 			BlockGroupData * data = pq_bucket_pop_front(pq->not_requested_other);
 			if (NULL == data) break;
-			// push back onto not requested as well.
+
+			// Push the block group back onto not requested
 			pq_bucket_push_back(pq->not_requested_bucket, data);
+
+#if defined(TRACE_PBM) && defined(TRACE_PBM_EVICT)
+			elog(LOG, "PQ_Evict (%d) (i=%d) found candidate block group, check its buffers", y, i);
+#endif // TRACE_PBM && TRACE_PBM_EVICT
 
 			// Found a block group candidate: check all its buffers
 			Assert(data->buffers_head >= 0);
@@ -468,9 +475,23 @@ struct BufferDesc * PQ_Evict(PbmPQ * pq) {
 					if (BUF_STATE_GET_REFCOUNT(buf_state) == 0) {
 						// viable candidate, return it WITH THE HEADER STILL LOCKED!
 						// later callback to PBM will handle removing it from the block group...
+
+#if defined(TRACE_PBM) && defined(TRACE_PBM_EVICT)
+						elog(LOG, "PQ_Evict (%d) END_SUCCESS", y);
+#endif // TRACE_PBM && TRACE_PBM_EVICT
+
+						*buf_state_out = buf_state;
 						return buf;
 					}
 					UnlockBufHdr(buf, buf_state);
+				}
+
+				// If buffer isn't evictable, get the next one
+				if (buf->pbm_bgroup_next < 0) {
+					// out of buffers in this group!
+					break;
+				} else {
+					buf = GetBufferDescriptor(buf->pbm_bgroup_next);
 				}
 			}
 		}
@@ -483,42 +504,21 @@ struct BufferDesc * PQ_Evict(PbmPQ * pq) {
 		// step 2: if nothing in the not_requested bucket, move current bucket to not_requested and try again
 	// ### maybe move one at a time instead? only decrement `i` when bucket is empty
 		pq_bucket_prepend_range(pq->not_requested_bucket, pq->buckets[i]);
-		i -= i;
+		i -= 1;
 	}
+
+#if defined(TRACE_PBM) && defined(TRACE_PBM_EVICT)
+	elog(LOG, "PQ_Evict (%d) END_FAIL", y);
+
+	elog(LOG, "PQ_Evict (%d) BUCKETS:", y);
+	elog(LOG, "\tnr1={head=%p, tail=%p}", pq->nr1.bucket_head, pq->nr1.bucket_tail);
+	elog(LOG, "\tnr2={head=%p, tail=%p}", pq->nr2.bucket_head, pq->nr2.bucket_tail);
+	for (int a = 0; a < PQ_NumBuckets; ++a) {
+		elog(LOG, "\t%d={head=%p, tail=%p}", a, pq->buckets[a]->bucket_head, pq->buckets[a]->bucket_tail);
+	}
+#endif // TRACE_PBM && TRACE_PBM_EVICT
 
 	// if we got here, we can't find anything...
-	return NULL;
-
-
-	for (long i = PQ_NumBuckets - 1; i >= 0; --i) {
-		BlockGroupData * it = pq->buckets[i]->bucket_head;
-		for (  ; NULL != it; it = it->bucket_next) {
-			Assert(it->buffers_head >= 0);
-
-			BufferDesc * buf = GetBufferDescriptor(it->buffers_head);
-
-			uint32 buf_state = pg_atomic_read_u32(&buf->state);
-
-// ### check usagecount?
-			if (BUF_STATE_GET_REFCOUNT(buf_state) == 0) {
-				buf_state = LockBufHdr(buf);
-				if (BUF_STATE_GET_REFCOUNT(buf_state) == 0) {
-					// TODO return this one!
-					// remove from the *block group*
-					// find the block group?
-					// ...
-				}
-				UnlockBufHdr(buf, buf_state);
-			}
-
-		}
-
-		// TODO use buckets[i] if any buffers not pinned
-		// ...
-
-		break; // ??
-	}
-
 	return NULL;
 }
 #endif

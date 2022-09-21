@@ -1550,6 +1550,9 @@ retry:
 		goto retry;
 	}
 
+// TODO theo --- remove from PBM here! (while other lock is held... should be fine)
+	PbmOnEvictBuffer(buf);
+
 	/*
 	 * Clear out the buffer's tag and flags.  We must do this to ensure that
 	 * linear scans of the buffer array don't think the buffer is valid.
