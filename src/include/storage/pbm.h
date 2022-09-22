@@ -50,12 +50,17 @@ extern void PbmOnEvictBuffer(struct BufferDesc * buf);
 extern struct BufferDesc* PBM_EvictPage(uint32 * buf_state);
 #elif PBM_EVICT_MODE == 2
 typedef struct PBM_EvictState {
-	int next_idx;
+	int next_bucket_idx;
+//	struct PbmPQBucket * cur_bucket;
+//	struct BlockGroupData * cur_block_group;
+//	struct BufferDesc * cur_buf;
 } PBM_EvictState;
 
 extern void PBM_InitEvictState(PBM_EvictState * state);
 extern void PBM_EvictPages(PBM_EvictState * state);
-static inline bool PBM_EvictingFailed(PBM_EvictState * state) { return state->next_idx >= 0; }
+static inline bool PBM_EvictingFailed(PBM_EvictState * state) {
+	return state->next_bucket_idx < 0;
+}
 #endif
 
 /*
