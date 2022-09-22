@@ -23,8 +23,7 @@ static const unsigned int PQ_BucketOutOfRange = (unsigned int)(-1);
 
 /// Size of the hash maps
 static const long ScanMapMaxSize = 1024;
-static const long BlockGroupMapMaxSize = 1024;
-static const long BlockGroupMap2MaxSize = (1 << 16);
+static const long BlockGroupMapMaxSize = (1 << 16);
 
 /// Clock to use
 #define PBM_CLOCK CLOCK_MONOTONIC // CLOCK_MONOTONIC_COARSE
@@ -86,8 +85,7 @@ struct HTAB;
 /// Type definitions
 ///-------------------------------------------------------------------------
 
-
-// Table identifier. Used as hash key for block groups, and stored in the scan map
+// Table identifier. Stored in the scan map
 typedef struct TableData {
 	RelFileNode	rnode; // physical relation
 	ForkNumber	forkNum; // fork in the relation
@@ -115,7 +113,7 @@ typedef struct ScanData {
 	float		est_speed;
 } ScanData;
 
-// Entry (KVP) in the hash map
+// Entry (KVP) in the scans hash map
 typedef struct ScanHashEntry {
 	ScanTag		tag; // Hash key
 	ScanData	data; // Value
@@ -124,19 +122,18 @@ typedef struct ScanHashEntry {
 
 /// Structs for information about block groups
 
-
-
-/// Info about a scan for the block group. (linked list)
+// Info about a scan for the block group. (linked list)
 typedef struct BlockGroupScanList {
 	// Info about the current scan
 	ScanId		scan_id;
 	BlockNumber	blocks_behind;
 
 	// Next item in the list
+// ### consider using ilist.h for this!
 	struct BlockGroupScanList* next;
 } BlockGroupScanList;
 
-/// Record data for this block group.
+// Record data for this block group.
 typedef struct BlockGroupData {
 // ### some kind of lock?
 
@@ -152,40 +149,26 @@ typedef struct BlockGroupData {
 	struct BlockGroupData* bucket_prev;
 } BlockGroupData;
 
-/// Key in Block Group Data Map
-typedef struct BlockGroupHashKey2 {
+// Key in Block Group Data Map
+typedef struct BlockGroupHashKey {
 	RelFileNode	rnode;		// physical relation
 	ForkNumber	forkNum;	// fork in the relation
 	uint32		seg;		// "block group segment" in the hash table
-} BlockGroupHashKey2;
+} BlockGroupHashKey;
 
-/// Entry in Block Group Data Map
-typedef struct BlockGroupHashEntry2 {
+// Entry in Block Group Data Map
+typedef struct BlockGroupHashEntry {
 	// hash key
-	BlockGroupHashKey2	key;
+	BlockGroupHashKey	key;
 
 	// previous and next segment
-	struct BlockGroupHashEntry2 * seg_next;
-	struct BlockGroupHashEntry2 * seg_prev;
+	struct BlockGroupHashEntry * seg_next;
+	struct BlockGroupHashEntry * seg_prev;
 	BlockGroupData		groups[BLOCK_GROUP_SEG_SIZE];
-} BlockGroupHashEntry2;
+} BlockGroupHashEntry;
 
-//// Hash value: array of info for all block groups in the relation fork
-//typedef struct BlockGroupDataVec {
-//// ### maybe want a (spin?) lock here for searching
-//	uint32	len; // # of block *groups* in the table
-//	uint32	capacity;
-//
-//	// Each is a *set* (array) of scan information
-//	BlockGroupData*	blockGroups;
-//} BlockGroupDataVec;
 
-//// Entry (KVP) in the hash map
-//typedef struct BlockGroupHashEntry {
-//	TableData			key;
-//	BlockGroupDataVec	val;
-//} BlockGroupHashEntry;
-
+/// The priority queue structure data structures for tracking blocks to evict
 typedef struct PbmPQBucket {
 	struct BlockGroupData* bucket_head;
 	struct BlockGroupData* bucket_tail;
@@ -193,8 +176,7 @@ typedef struct PbmPQBucket {
 	// TODO (spin) lock?
 } PbmPQBucket;
 
-
-/// The priority queue structure for tracking blocks to evict
+// The actual PQ structure
 typedef struct PbmPQ {
 // protected by PbmPqLock
 
@@ -229,10 +211,9 @@ typedef struct PbmShared {
 	//struct HTAB * ScansByRange;
 
 
-//	struct HTAB * BlockGroupMap;
 	/// Map[ (table, BlockGroupSegment) -> set of scans ] + free-list of the list-nodes for tracking statistics on each buffer
 	/// Protected by PbmBlocksLock
-	struct HTAB * BlockGroupMap2;
+	struct HTAB * BlockGroupMap;
 	BlockGroupScanList* block_group_stats_free_list;
 // ### if possible, free list could be protected by its own spinlock instead of using this lock
 
