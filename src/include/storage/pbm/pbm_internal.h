@@ -1,6 +1,8 @@
 #ifndef POSTGRESQL_PBM_INTERNAL_H
 #define POSTGRESQL_PBM_INTERNAL_H
 
+#include "lib/ilist.h"
+
 #include "storage/pbm.h"
 #include "storage/relfilenode.h"
 
@@ -129,7 +131,7 @@ typedef struct BlockGroupScanList {
 	BlockNumber	blocks_behind;
 
 	// Next item in the list
-// ### consider using ilist.h for this!
+// TODO consider using ilist.h for this!
 	struct BlockGroupScanList* next;
 } BlockGroupScanList;
 
@@ -145,8 +147,7 @@ typedef struct BlockGroupData {
 
 	// Linked-list in PQ buckets
 	struct PbmPQBucket* pq_bucket;
-	struct BlockGroupData* bucket_next;
-	struct BlockGroupData* bucket_prev;
+	dlist_node blist;
 } BlockGroupData;
 
 // Key in Block Group Data Map
@@ -161,6 +162,7 @@ typedef struct BlockGroupHashEntry {
 	// hash key
 	BlockGroupHashKey	key;
 
+// TODO dlist here! (actually -- do the operations need a dlist head? that might not work)
 	// previous and next segment
 	struct BlockGroupHashEntry * seg_next;
 	struct BlockGroupHashEntry * seg_prev;
@@ -170,9 +172,8 @@ typedef struct BlockGroupHashEntry {
 
 /// The priority queue structure data structures for tracking blocks to evict
 typedef struct PbmPQBucket {
-	struct BlockGroupData* bucket_head;
-	struct BlockGroupData* bucket_tail;
-	// ### could also include start & end time (delta) in the bucket?
+	// List of BlockGroupData in the list
+	dlist_head bucket_dlist;
 	// TODO (spin) lock?
 } PbmPQBucket;
 

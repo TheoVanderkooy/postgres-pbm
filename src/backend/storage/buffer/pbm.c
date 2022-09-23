@@ -1122,8 +1122,7 @@ BlockGroupData EmptyBlockGroupData() {
 		.scans_head = NULL,
 		.buffers_head = FREENEXT_END_OF_LIST,
 		.pq_bucket = NULL,
-		.bucket_prev = NULL,
-		.bucket_next = NULL,
+		//.dlist = {},
 	};
 }
 

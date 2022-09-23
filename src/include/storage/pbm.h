@@ -27,6 +27,8 @@
 /// Forward declarations
 struct HeapScanDescData;
 struct BufferDesc;
+struct BlockGroupData;
+
 
 /// Type declarations used elsewhere
 typedef size_t ScanId;
