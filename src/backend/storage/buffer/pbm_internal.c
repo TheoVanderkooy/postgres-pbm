@@ -339,14 +339,11 @@ void PBM_InitEvictState(PBM_EvictState * state) {
  */
 void PBM_EvictPages(PBM_EvictState * state) {
 	PbmPQBucket* bucket;
-//	bool freed_anything = false;
 
 retry:
 
-// TODO: make it try again with the not_requested bucket right at the end! exit condition = idx < -1 (-1 = not_requested again)
-
-	// Check not_requested first
-	if (state->next_bucket_idx >= PQ_NumBuckets) {
+	// Check not_requested first, and last if we exhaust everything else
+	if (state->next_bucket_idx >= PQ_NumBuckets || state->next_bucket_idx < 0) {
 		bucket = pbm->BlockQueue->not_requested_bucket;
 	} else {
 		bucket = pbm->BlockQueue->buckets[state->next_bucket_idx];
@@ -384,8 +381,6 @@ retry:
 
 				// Check if the buffer is pinned and remember if we found anything
 				if (BUF_STATE_GET_REFCOUNT(buf_state) == 0) {
-//					freed_anything = true;
-
 					// free the buffer (add to free list if not already there)
 					StrategyFreeBuffer(buf);
 				}
@@ -394,14 +389,6 @@ retry:
 			}
 		}
 	}
-
-//	// If the bucket didn't have any buffers, go again
-//	if (freed_anything) {
-//		return;
-//	}
-
-
-
 }
 
 #elif PBM_EVICT_MODE == 1
@@ -504,6 +491,155 @@ struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * buf_state_out) {
 #endif
 
 /*
- * TODO:
- *  - hook it up to everything else...
+ * Check the given PBM PQ bucket is actually in the list somewhere
  */
+static inline
+void assert_bucket_in_pbm_pq(PbmPQBucket * bucket) {
+	if (&pbm->BlockQueue->nr1 == bucket) return;
+	if (&pbm->BlockQueue->nr2 == bucket) return;
+
+	for (int i = 0; i < PQ_NumBuckets; ++i) {
+		if (pbm->BlockQueue->buckets[i] == bucket) return;
+	}
+
+	// If we didn't find the bucket, something is wrong!
+	AssertState(false);
+}
+
+/*
+ * A bunch of sanity-check assertions for the PBM.
+ *  - All block groups are either empty (no buffers) or part of a bucket
+ *  - Block group -> bucket pointer is correct (the block group is in the dlist for the bucket)
+ *  - All buckets (with block groups) are actually in the PBM somewhere
+ *  - All buffers are part of a bucket -- not that if this is called, we should have already checked the free list is empty
+ */
+void PBM_sanity_check_buffers(void) {
+#ifdef SANITY_PBM_BLOCK_GROUPS
+	elog(LOG, "STARTING BUFFERS SANITY CHECK --- ran out of buffers");
+
+	// Remember which buffers were seen in some block group
+//	bool saw_buffer[NBuffers];
+	bool * saw_buffer = palloc(NBuffers * sizeof(bool));
+	for (int i = 0; i < NBuffers; ++i) {
+		saw_buffer[i] = false;
+	}
+
+	// check ALL block groups are part of a PBM PQ bucket
+	LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
+		HASH_SEQ_STATUS status;
+		BlockGroupHashEntry * entry;
+
+		// Check ALL block groups!
+		hash_seq_init(&status, pbm->BlockGroupMap);
+		for (;;) {
+			entry = hash_seq_search(&status);
+			if (NULL == entry) break;
+
+			// Check all block groups in the segment
+			for (int i = 0; i < BLOCK_GROUP_SEG_SIZE; ++i) {
+				BlockGroupData * data = &entry->groups[i];
+
+				// Skip if there are no buffers
+				if (data->buffers_head == FREENEXT_END_OF_LIST) continue;
+
+				// If there are buffers: there MUST be a bucket!
+				Assert(data->pq_bucket != NULL);
+
+				// Make sure the bucket does actually exist in the PQ
+				assert_bucket_in_pbm_pq(data->pq_bucket);
+
+				// Verify the block group is in the dlist of the bucket
+				bool found_bg = false;
+				dlist_iter it;
+				dlist_foreach(it, &data->pq_bucket->bucket_dlist) {
+					BlockGroupData * bg = dlist_container(BlockGroupData, blist, it.cur);
+					if (bg == data) {
+						found_bg = true;
+						break;
+					}
+				}
+				Assert(found_bg);
+
+				// See what buffers are in the block group
+				int b = data->buffers_head;
+				int p = FREENEXT_END_OF_LIST;
+				while (b >= 0) {
+					BufferDesc * buf = GetBufferDescriptor(b);
+
+					// Remember that we saw the buffer
+					saw_buffer[b] = true;
+
+					// Check backwards link is correct
+					Assert(buf->pbm_bgroup_prev == p);
+
+					// Next buffer
+					p = b;
+					b = buf->pbm_bgroup_next;
+				}
+			}
+		}
+	}
+
+	// Make sure we saw all the buffers in the PQ somewhere
+	for (int i = 0; i < NBuffers; ++i) {
+		Assert(saw_buffer[i]);
+	}
+
+#endif // SANITY_PBM_BLOCK_GROUPS
+}
+
+static
+void print_pq_bucket(StringInfoData * str, PbmPQBucket* bucket) {
+
+//	if (dlist_is_empty(&bucket->bucket_dlist)) {
+//		appendStringInfo(str, "");
+//	}
+
+	// append each block group
+	dlist_iter it;
+	dlist_foreach(it, &bucket->bucket_dlist) {
+		BlockGroupData * data = dlist_container(BlockGroupData,blist,it.cur);
+		appendStringInfo(str, "  {");
+
+		if (data->buffers_head < 0) {
+			appendStringInfo(str, " empty! ", data->buffers_head);
+		}
+
+		// append list of buffers for the block group
+		int b = data->buffers_head;
+		for(;b >= 0;) {
+			BufferDesc * buf = GetBufferDescriptor(b);
+			appendStringInfo(str, " %d", b);
+
+			b = buf->pbm_bgroup_next;
+		}
+		appendStringInfo(str, " %d", b);
+
+		appendStringInfo(str, " }");
+	}
+
+}
+
+void PBM_print_pmb_state(void) {
+	StringInfoData str;
+	initStringInfo(&str);
+
+	appendStringInfo(&str, "\n\tnot_requested:");
+	print_pq_bucket(&str, pbm->BlockQueue->not_requested_bucket);
+	appendStringInfo(&str, "\n\tother:        ");
+	print_pq_bucket(&str, pbm->BlockQueue->not_requested_other);
+
+	// print PBM PQ
+	LOCK_GUARD_V2(PbmPqLock, LW_EXCLUSIVE) {
+		for (int i = PQ_NumBuckets - 1; i >= 0; --i) {
+			appendStringInfo(&str, "\n\t %3d:         ", i);
+			print_pq_bucket(&str, pbm->BlockQueue->not_requested_other);
+		}
+	}
+
+	ereport(INFO,
+			(errmsg_internal("PBM PQ state:"),
+					errdetail_internal("%s", str.data)));
+	pfree(str.data);
+}
+

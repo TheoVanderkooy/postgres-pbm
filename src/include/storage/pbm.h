@@ -18,10 +18,13 @@
  *     mechanism try multiple times to get from the free list
  */
 #ifdef USE_PBM
-#define PBM_EVICT_MODE 0
+#define PBM_EVICT_MODE 2
 #else
 #define PBM_EVICT_MODE 0
 #endif
+
+
+//#define PBM_TRACE_FREE_LIST
 
 
 /// Forward declarations
@@ -61,9 +64,13 @@ typedef struct PBM_EvictState {
 extern void PBM_InitEvictState(PBM_EvictState * state);
 extern void PBM_EvictPages(PBM_EvictState * state);
 static inline bool PBM_EvictingFailed(PBM_EvictState * state) {
-	return state->next_bucket_idx < 0;
+	return state->next_bucket_idx < -1;
 }
 #endif
+
+/// Debugging sanity checks
+extern void PBM_sanity_check_buffers(void);
+extern void PBM_print_pmb_state(void);
 
 /*
  * TODO: Register*Scan for:

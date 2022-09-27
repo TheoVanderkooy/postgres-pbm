@@ -72,7 +72,7 @@ static inline void RemoveBufFromBlock(BufferDesc *buf);
 static inline BlockGroupData EmptyBlockGroupData();
 static inline void RefreshBlockGroup(BlockGroupData * data);
 static inline void PQ_RefreshRequestedBuckets();
-static inline void remove_scan_from_block_range(BlockGroupHashKey * bs_key, const ScanId id, const uint32 lo, const uint32 hi);
+static inline void remove_scan_from_block_range(BlockGroupHashKey * bs_key, ScanId id, uint32 lo, uint32 hi);
 
 ///-------------------------------------------------------------------------
 /// Initialization methods
@@ -601,14 +601,7 @@ void sanity_check_verify_block_group_buffers(const BufferDesc * const buf) {
 	// get first buffer in the list
 	const BufferDesc * it = buf;
 
-	// Buffer is not in any list (special thing here...
-	if (-3 == it->pbm_bgroup_prev) {
-		// ### this should eventually be disallowed
-		Assert(-3 == it->pbm_bgroup_next);
-		return;
-	}
-
-	Assert(it->pbm_bgroup_prev != FREENEXT_NOT_IN_LIST && it->pbm_bgroup_next != FREENEXT_NOT_IN_LIST);
+	Assert(it->pbm_bgroup_prev > FREENEXT_NOT_IN_LIST && it->pbm_bgroup_next > FREENEXT_NOT_IN_LIST);
 
 	while (it->pbm_bgroup_prev != FREENEXT_END_OF_LIST) {
 		it = GetBufferDescriptor(it->pbm_bgroup_prev);
@@ -1108,10 +1101,19 @@ static inline
 void RefreshBlockGroup(BlockGroupData *const data) {
 	bool requested;
 	bool has_buffers = (data->buffers_head >= 0);
+//#ifdef TRACE_PBM
+//elog(LOG,"RefreshBlockGroup (%p) BEFORE REMOVE", data);
+//#endif
 	PQ_RemoveBlockGroup(data);
+//#ifdef TRACE_PBM
+//	elog(LOG,"RefreshBlockGroup (%p) AFTER REMOVE, has_buffers %s", data, has_buffers ? "yes" : "no");
+//#endif
 	long t = PageNextConsumption(data, &requested);
 
 	if (has_buffers) {
+//#ifdef TRACE_PBM
+//		elog(LOG,"RefreshBlockGroup (%p) BEFORE INSERT", data);
+//#endif
 		PQ_InsertBlockGroup(pbm->BlockQueue, data, t, requested);
 	}
 }

@@ -243,7 +243,7 @@ BufferDesc * check_free_list(BufferAccessStrategy strategy, uint32 * buf_state)
 			 */
 			local_buf_state = LockBufHdr(buf);
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
-#if PBM_EVICT_MODE != 0
+#if PBM_EVICT_MODE == 0
 // only check usage count if we are using the clock algorithm
 				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0
 #endif
@@ -343,6 +343,10 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 
 		/* If we've exhausted the PBM, we can't return anything so error */
 		if (PBM_EvictingFailed(&pbm_estate)) {
+			// Run sanity checks and print state for debugging if we really can't get anything...
+			PBM_sanity_check_buffers();
+			PBM_print_pmb_state();
+
 			elog(ERROR, "no unpinned buffers available");
 		}
 
@@ -420,7 +424,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 		}
 		UnlockBufHdr(buf, local_buf_state);
 	}
-#endif // USE_PBM
+#endif // PBM_EVICT_MODE
 }
 
 /*

@@ -48,6 +48,7 @@ static const int64_t PQ_TimeSlice = 100 * NS_PER_MS;
 #define TRACE_PBM_EVICT
 
 //#define SANITY_PBM_BUFFERS
+#define SANITY_PBM_BLOCK_GROUPS
 
 
 ///-------------------------------------------------------------------------
@@ -131,7 +132,7 @@ typedef struct BlockGroupScanList {
 	BlockNumber	blocks_behind;
 
 	// Next item in the list
-// TODO consider using ilist.h for this!
+	// ### consider using ilist.h for this! (this seems to not be broken --- don't touch for now)
 	struct BlockGroupScanList* next;
 } BlockGroupScanList;
 
@@ -162,7 +163,6 @@ typedef struct BlockGroupHashEntry {
 	// hash key
 	BlockGroupHashKey	key;
 
-// TODO dlist here! (actually -- do the operations need a dlist head? that might not work)
 	// previous and next segment
 	struct BlockGroupHashEntry * seg_next;
 	struct BlockGroupHashEntry * seg_prev;
