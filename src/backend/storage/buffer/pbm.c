@@ -53,7 +53,7 @@ static BlockGroupData * AddBufToBlockGroup(BufferDesc * buf);
 static void debug_append_scan_data(StringInfoData* str, ScanHashEntry* entry);
 static void debug_log_scan_map(void);
 //static void debug_append_buffer_data(StringInfoData * str, BlockGroupHashEntry * entry);
-static void debug_log_buffers_map(void);
+//static void debug_log_buffers_map(void);
 static void debug_buffer_access(BufferDesc* buf, char* msg);
 static void list_all_buffers(void);
 
@@ -69,9 +69,9 @@ static long PageNextConsumption(const BlockGroupData* stats, bool *requestedPtr)
 // ### revisit to see which other ones should be inline
 
 static inline void RemoveBufFromBlock(BufferDesc *buf);
-static inline BlockGroupData EmptyBlockGroupData();
+static inline BlockGroupData EmptyBlockGroupData(void);
 static inline void RefreshBlockGroup(BlockGroupData * data);
-static inline void PQ_RefreshRequestedBuckets();
+static inline void PQ_RefreshRequestedBuckets(void);
 static inline void remove_scan_from_block_range(BlockGroupHashKey * bs_key, ScanId id, uint32 lo, uint32 hi);
 
 ///-------------------------------------------------------------------------
@@ -422,7 +422,7 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 	BlockGroupHashKey bs_key;
 
 #ifdef TRACE_PBM
-	elog(LOG, "ReportSeqScanPosition (%d)", id);
+	elog(LOG, "ReportSeqScanPosition (%lu)", id);
 #endif
 
 // ### how often to update stats? (see what sync scan does)
@@ -682,6 +682,7 @@ void list_all_buffers(void) {
 
 void debug_buffer_access(BufferDesc* buf, char* msg) {
 	bool found, requested;
+	char* msg2;
 	BlockNumber blockNum = buf->tag.blockNum;
 	BlockNumber blockGroup = BLOCK_GROUP(blockNum);
 	TableData tbl = (TableData){
@@ -696,7 +697,6 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 		next_access_time = PageNextConsumption(block_scans, &requested);
 	}
 
-	char* msg2;
 	if (false == found) msg2 = "NOT TRACKED";
 	else if (false == requested) msg2 = "NOT REQUESTED";
 	else msg2 = "~";
@@ -762,8 +762,7 @@ BlockGroupData * search_or_create_block_group(const BufferDesc *const buf) {
 	}
 
 	// Find the block group within the segment
-	uint32 i = bgroup % BLOCK_GROUP_SEG_SIZE;
-	return &bg_entry->groups[i];
+	return &bg_entry->groups[bgroup % BLOCK_GROUP_SEG_SIZE];
 }
 
 // Search block group map for a particular buffer returning the location in the array
@@ -989,19 +988,16 @@ bool DeleteScanFromGroup(const ScanId id, BlockGroupData *const groupData) {
  * Caller is responsible for pushing the block group to the PBM PQ if necessary.
  */
 BlockGroupData * AddBufToBlockGroup(BufferDesc *const buf) {
-	bool found;
 	BlockGroupData * group;
 	Buffer group_head;
 
 	// Buffer must not already be in a block group
-	Assert(buf->pbm_bgroup_next == FREENEXT_NOT_IN_LIST && buf->pbm_bgroup_prev == FREENEXT_NOT_IN_LIST);
-//	if (buf->pbm_bgroup_next != FREENEXT_NOT_IN_LIST) {
-//		Assert(buf->pbm_bgroup_prev != FREENEXT_NOT_IN_LIST);
-//		return NULL; // nothing to do
-//	}
+	Assert(buf->pbm_bgroup_next == FREENEXT_NOT_IN_LIST
+		&& buf->pbm_bgroup_prev == FREENEXT_NOT_IN_LIST);
 
 	// Find or create the block group
 	group = search_or_create_block_group(buf);
+	Assert(group != NULL);
 
 // ### lock the block group?
 
@@ -1075,10 +1071,11 @@ void remove_scan_from_block_range(BlockGroupHashKey *bs_key, const ScanId id, co
 	uint32 bgnum 	= lo;
 	uint32 i 		= bgnum % BLOCK_GROUP_SEG_SIZE;
 	bool found;
+	BlockGroupHashEntry * bs_entry;
 
 	// Search for the starting hash entry
 	bs_key->seg = BLOCK_GROUP_SEGMENT(lo);
-	BlockGroupHashEntry * bs_entry = hash_search(pbm->BlockGroupMap, bs_key, HASH_FIND, &found);
+	bs_entry = hash_search(pbm->BlockGroupMap, bs_key, HASH_FIND, &found);
 	Assert(found);
 
 	// Loop over the linked hash map entries
@@ -1097,29 +1094,29 @@ void remove_scan_from_block_range(BlockGroupHashKey *bs_key, const ScanId id, co
 	}
 }
 
+/*
+ * Refresh a block group in the PQ.
+ *
+ * This computes the next consumption time and moves the block group to the appropriate bucket,
+ * removing it from the current one first.
+ */
 static inline
 void RefreshBlockGroup(BlockGroupData *const data) {
 	bool requested;
 	bool has_buffers = (data->buffers_head >= 0);
-//#ifdef TRACE_PBM
-//elog(LOG,"RefreshBlockGroup (%p) BEFORE REMOVE", data);
-//#endif
+	long t;
+
+// ### consider calculating the new block group first, then only move if it has changed
 	PQ_RemoveBlockGroup(data);
-//#ifdef TRACE_PBM
-//	elog(LOG,"RefreshBlockGroup (%p) AFTER REMOVE, has_buffers %s", data, has_buffers ? "yes" : "no");
-//#endif
-	long t = PageNextConsumption(data, &requested);
+	t = PageNextConsumption(data, &requested);
 
 	if (has_buffers) {
-//#ifdef TRACE_PBM
-//		elog(LOG,"RefreshBlockGroup (%p) BEFORE INSERT", data);
-//#endif
 		PQ_InsertBlockGroup(pbm->BlockQueue, data, t, requested);
 	}
 }
 
 static inline
-BlockGroupData EmptyBlockGroupData() {
+BlockGroupData EmptyBlockGroupData(void) {
 	return (BlockGroupData){
 		.scans_head = NULL,
 		.buffers_head = FREENEXT_END_OF_LIST,
@@ -1156,6 +1153,7 @@ void PBM_TryRefreshRequestedBuckets(void) {
 	long ts = get_timeslice();
 	long last_shifted_ts = pbm->BlockQueue->last_shifted_time_slice;
 	bool up_to_date = (last_shifted_ts + 1 > ts);
+	bool acquired;
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_PQ_REFRESH)
 	elog(INFO, "PBM try refresh buckets: t=%ld, last=%ld, up_to_date=%s",
@@ -1166,7 +1164,7 @@ void PBM_TryRefreshRequestedBuckets(void) {
 	if (up_to_date) return;
 
 	// If unable to acquire the lock, just stop here
-	bool acquired = LWLockConditionalAcquire(PbmPqLock, LW_EXCLUSIVE);
+	acquired = LWLockConditionalAcquire(PbmPqLock, LW_EXCLUSIVE);
 	if (acquired) {
 
 		// if several time slices have passed since last shift, try to short-circuit by

@@ -585,28 +585,25 @@ void PBM_sanity_check_buffers(void) {
 		Assert(saw_buffer[i]);
 	}
 
+	pfree(saw_buffer);
 #endif // SANITY_PBM_BLOCK_GROUPS
 }
 
 static
 void print_pq_bucket(StringInfoData * str, PbmPQBucket* bucket) {
-
-//	if (dlist_is_empty(&bucket->bucket_dlist)) {
-//		appendStringInfo(str, "");
-//	}
-
 	// append each block group
 	dlist_iter it;
 	dlist_foreach(it, &bucket->bucket_dlist) {
+		int b;
 		BlockGroupData * data = dlist_container(BlockGroupData,blist,it.cur);
 		appendStringInfo(str, "  {");
 
 		if (data->buffers_head < 0) {
-			appendStringInfo(str, " empty! ", data->buffers_head);
+			appendStringInfo(str, " empty! ");
 		}
 
 		// append list of buffers for the block group
-		int b = data->buffers_head;
+		b = data->buffers_head;
 		for(;b >= 0;) {
 			BufferDesc * buf = GetBufferDescriptor(b);
 			appendStringInfo(str, " %d", b);
@@ -617,7 +614,6 @@ void print_pq_bucket(StringInfoData * str, PbmPQBucket* bucket) {
 
 		appendStringInfo(str, " }");
 	}
-
 }
 
 void PBM_print_pmb_state(void) {
