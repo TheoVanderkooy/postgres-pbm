@@ -198,16 +198,22 @@ typedef struct PbmShared {
 	// TODO more granular locking if it could improve performance.
 	// ### where to use `volatile`?
 
+	/* These fields never change after initialization, so no locking needed */
+
 	/// Time-related stuff
 	time_t start_time_sec;
 
-	/// Atomic counter for ID generation
-	/// Note: protected by PbmScansLock: could make it atomic but it is only accessed when we lock the hash table anyways.
-	_Atomic(ScanId) next_id;
+
+	/* These fields protected by PbmScansLock: */
 
 	/// Map[ scan ID -> scan stats ] to record progress & estimate speed
-	/// Protected by PbmScansLock
 	struct HTAB * ScanMap;
+	/// Counter for ID generation
+	ScanId next_id;
+	/// Global estimate of speed used for *new* scans
+	float initial_est_speed;
+// ### could make this atomic and move outside the scans lock in UnregisterSeqScan.
+
 
 // ### Map[ range (table -> block indexes) -> scan ] --- for looking up what scans reference a particular block, maybe useful later
 	//struct HTAB * ScansByRange;
@@ -221,10 +227,6 @@ typedef struct PbmShared {
 
 	/// Priority queue of block groups that could be evicted
 	PbmPQ * BlockQueue;
-
-	/// Global estimate of speed used for *new* scans
-	/// Currently NOT protected, as long as write is atomic we don't really care about lost updates...
-	_Atomic(float) initial_est_speed;
 
 
 // ### Potential other fields:

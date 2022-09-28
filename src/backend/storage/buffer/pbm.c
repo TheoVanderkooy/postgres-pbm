@@ -40,7 +40,7 @@ PbmShared* pbm;
 ///-------------------------------------------------------------------------
 
 // lookup in applicable hash maps
-static ScanData* search_scan(ScanId id, HASHACTION action, bool* foundPtr);
+static inline ScanData * search_scan(ScanId id, HASHACTION action, bool* foundPtr);
 static BlockGroupData * search_block_group(const BufferDesc * buf, bool* foundPtr);
 static BlockGroupData * search_or_create_block_group(const BufferDesc * buf);
 
@@ -111,10 +111,6 @@ void InitPBM(void) {
 	clock_gettime(PBM_CLOCK, &ts);
 	pbm->start_time_sec = ts.tv_sec;
 
-
-
-// ### should either of these be partitioned? (HASH_PARTITION)
-
 	// Initialize map of scans
 	hash_info = (HASHCTL){
 		.keysize = sizeof(ScanTag),
@@ -123,14 +119,8 @@ void InitPBM(void) {
 	hash_flags = HASH_ELEM | HASH_BLOBS;
 	pbm->ScanMap = ShmemInitHash("PBM active scan stats", 128, ScanMapMaxSize, &hash_info, hash_flags);
 
-//	// Initialize map of blocks
-//	hash_info = (HASHCTL) {
-//		.keysize = sizeof(TableData),
-//		.entrysize = sizeof(BlockGroupHashEntry),
-//	};
-//	hash_flags = HASH_ELEM | HASH_BLOBS;
-//	pbm->BlockGroupMap = ShmemInitHash("PBM buffer stats", 32, BlockGroupMapMaxSize, &hash_info, hash_flags);
-
+// ### should this be partitioned? (HASH_PARTITION)
+	// Initialize map of block groups
 	hash_info = (HASHCTL) {
 		.keysize = sizeof(BlockGroupHashKey),
 		.entrysize = sizeof(BlockGroupHashEntry),
@@ -212,25 +202,24 @@ void RegisterSeqScan(HeapScanDesc scan) {
 		// Create s_entry for the scan in the hash map
 		s_data = search_scan(id, HASH_ENTER, &found);
 		Assert(!found); // should be inserted...
-
-		*s_data = (ScanData) {
-				.tbl = tbl,
-				.last_pos = startblock,
-				.startBlock = startblock,
-				.nblocks = nblocks,
-				.est_speed = init_est_speed,
-				.blocks_scanned = 0,
-				.last_report_time = get_time_ns(),
-		};
 	}
 
-//#ifdef TRACE_PBM
-//	elog(LOG, "RegisterSeqScan (%d) START", id);
-//	elog(LOG, "RegisterSeqScan (%d) "
-//			  "nblocks=%u, ngroups=%u, nsegs=%u", id
-//		, nblocks, nblock_groups, nblock_segs
-//	);
-//#endif
+	/*
+	 * Initialize the entry. It is OK to do this outside the lock, because we
+	 * haven't associated the scan with any block groups yet (so no one will by
+	 * trying to access it yet.
+	 */
+	*s_data = (ScanData) {
+			// These fields never change
+			.tbl = tbl,
+			.startBlock = startblock,
+			.nblocks = nblocks,
+			// These stats will be updated later
+			.last_pos = startblock,
+			.est_speed = init_est_speed,
+			.blocks_scanned = 0,
+			.last_report_time = get_time_ns(),
+	};
 
 	// Register the scan with each buffer
 	LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
@@ -297,31 +286,16 @@ void RegisterSeqScan(HeapScanDesc scan) {
 			}
 		}
 
-
-//#ifdef TRACE_PBM
-//		elog(LOG, "RegisterSeqScan (%d) refreshing buckets", id);
-//#endif
 // ### calculate the PRIORITY of each block (group)!
 // (actually, what do we know other than the first one is needed immediately?)
 		// refresh the PQ first if needed, then insert each block into the queue
 		PQ_RefreshRequestedBuckets();
-
-//#ifdef TRACE_PBM
-//		elog(LOG, "RegisterSeqScan (%d) done refreshing buckets", id);
-//#endif
 
 		Assert(nblock_groups == 0 || NULL != bseg_first);
 		Assert(nblock_groups == 0 || NULL == bseg_first->seg_prev);
 		bgnum = 0;
 		for (bseg_cur = bseg_first; bgnum < nblock_groups; bseg_cur = bseg_cur->seg_next) {
 			Assert(bseg_cur != NULL);
-
-//#ifdef TRACE_PBM
-//			elog(LOG, "RegisterSeqScan (%d) START thingy: "
-//					  "bgnum=%u, cur=%p", id
-//				, bgnum, bseg_cur
-//			);
-//#endif
 
 			for (int i = 0; i < BLOCK_GROUP_SEG_SIZE && bgnum < nblock_groups; ++bgnum, ++i) {
 				BlockGroupData *const data = &bseg_cur->groups[i];
@@ -373,14 +347,18 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 	LOCK_GUARD_V2(PbmScansLock, LW_EXCLUSIVE) {
 		const float alpha = 0.85f; // ### pick something else? move to configuration?
 		float new_est;
-		scanData = *search_scan(id, HASH_FIND, &found);
+
+		/*
+		 * Delete the scan from the map.
+		 *
+		 * Note: the hash entry will be reused by next insert but this is safe
+		 * here since we have the lock.
+		 */
+		scanData = *search_scan(id, HASH_REMOVE, &found);
 		Assert(found);
 
-		// delete
-		search_scan(id, HASH_REMOVE, &found);
-
 		// Update global initial speed estimate: geometrically-weighted average
-		// ### Note: we don't really care about lost updates here, could put this outside the lock (make volatile)
+		// ### Note: we don't really care about lost updates here, could put this outside the lock (make _Atomic)
 		new_est = pbm->initial_est_speed * alpha + scanData.est_speed * (1 - alpha);
 		pbm->initial_est_speed = new_est;
 	}
@@ -435,13 +413,11 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 
 	// Find the scan stats
 	LOCK_GUARD_V2(PbmScansLock, LW_SHARED) {
+// TODO just keep a pointer in the HeapScan itself? and keep stats there...
 		entry = search_scan(id, HASH_FIND, &found);
 	}
-	Assert(found);
-	if (false == found || NULL == entry) {
-		elog(WARNING, "ReportSeqScanPosition(%lu): could not find scan in ScanMap", id);
-		return;
-	}
+	Assert(found && entry != NULL);
+
 	prevGroupPos = BLOCK_GROUP(entry->last_pos);
 	curGroupPos = BLOCK_GROUP(pos);
 	bs_key = (BlockGroupHashKey) {
@@ -714,8 +690,12 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 	);
 }
 
-// Search scan map for given scan and return reference to the data only (not including key)
-ScanData* search_scan(const ScanId id, HASHACTION action, bool* foundPtr) {
+/*
+ * Search scan map for given scan and return reference to the data only (not including key).
+ *
+ * Requires PqmScansLock to already be held as exclusive for insert/delete, at least shared for reads
+ */
+ScanData * search_scan(const ScanId id, HASHACTION action, bool* foundPtr) {
 	return &((ScanHashEntry*)hash_search(pbm->ScanMap, &id, action, foundPtr))->data;
 }
 
@@ -803,7 +783,7 @@ void debug_log_scan_map(void) {
 	StringInfoData str;
 	initStringInfo(&str);
 
-	LOCK_GUARD_V2(PbmScansLock, LW_EXCLUSIVE) {
+	LOCK_GUARD_V2(PbmScansLock, LW_SHARED) {
 		HASH_SEQ_STATUS status;
 		ScanHashEntry * entry;
 
@@ -872,7 +852,9 @@ void debug_log_buffers_map(void) {
 }
 #endif
 
-// Estimate the next access time of a block group based on the scan progress
+/*
+ * Estimate the next access time of a block group based on the scan progress.
+ */
 long ScanTimeToNextConsumption(const BlockGroupScanList *const stats, bool* foundPtr) {
 	const ScanId id = stats->scan_id;
 	ScanData * s_data;
@@ -882,6 +864,7 @@ long ScanTimeToNextConsumption(const BlockGroupScanList *const stats, bool* foun
 	float est_speed;
 
 	LOCK_GUARD_V2(PbmScansLock, LW_SHARED) {
+// ### consider a local map caching the scans
 		s_data = search_scan(id, HASH_FIND, foundPtr);
 	}
 
