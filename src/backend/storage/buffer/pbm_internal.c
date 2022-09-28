@@ -140,6 +140,7 @@ static unsigned int PQ_time_to_bucket(const PbmPQ *const pq, const long ts) {
 bool PQ_ShiftBucketsWithLock(PbmPQ *pq, long ts) {
 	const long last_shift_ts = pq->last_shifted_time_slice;
 	const long new_shift_ts = last_shift_ts + 1;
+	PbmPQBucket *spare;
 
 	// Once we have the lock, re-check whether shifting is needed
 	if (new_shift_ts > ts) {
@@ -149,13 +150,15 @@ bool PQ_ShiftBucketsWithLock(PbmPQ *pq, long ts) {
 	pq->last_shifted_time_slice = new_shift_ts;
 
 	// bucket[0] will be removed, move its stuff to bucket[1] first
-	PbmPQBucket *spare = pq->buckets[0];
+	spare = pq->buckets[0];
 	pq_bucket_prepend_range(pq->buckets[1], spare);
 	// TODO locking: may be better to do this one at a time if we need a spinlock
 
 
 	// Shift each group
 	for (unsigned int group = 0; group < PQ_NumBucketGroups; ++group) {
+		long next_group_width;
+
 		// Shift the buckets in the group over 1
 		for (unsigned int b = 0; b < PQ_NumBucketsPerGroup; ++b) {
 			unsigned int idx = group * PQ_NumBucketsPerGroup + b;
@@ -163,7 +166,7 @@ bool PQ_ShiftBucketsWithLock(PbmPQ *pq, long ts) {
 		}
 
 		// Check if this was the last group to shift or not
-		long next_group_width = bucket_group_width(group + 1);
+		next_group_width = bucket_group_width(group + 1);
 		if (new_shift_ts % next_group_width != 0 || group + 1 == PQ_NumBucketGroups) {
 			// The next bucket group will NOT be shifted (or does not exist)
 			// use the "spare bucket" to fill the gap left from shifting, then stop
@@ -248,6 +251,7 @@ static void my_dlist_prepend(dlist_head * list, dlist_head * other) {
 
 /// Merge two PQ buckets
 void pq_bucket_prepend_range(PbmPQBucket *bucket, PbmPQBucket *other) {
+	dlist_iter it;
 
 	// Nothing to do if the other lits is empty
 	if (dlist_is_empty(&other->bucket_dlist)) {
@@ -257,7 +261,6 @@ void pq_bucket_prepend_range(PbmPQBucket *bucket, PbmPQBucket *other) {
 // TODO locking --- lock the buckets! which one first?? (based on ptr address?)
 
 	// Adjust bucket pointer for each block group on the other bucket
-	dlist_iter it;
 	dlist_foreach(it, &other->bucket_dlist) {
 		BlockGroupData * data = dlist_container(BlockGroupData, blist, it.cur);
 
@@ -289,6 +292,9 @@ void PQ_RemoveBlockGroup(BlockGroupData *block_group) {
 
 static inline
 BlockGroupData * pq_bucket_pop_front(PbmPQBucket * bucket) {
+	dlist_node * node;
+	BlockGroupData * ret;
+
 // TODO lock?
 
 	// Return NULL if bucket is empty
@@ -297,8 +303,8 @@ BlockGroupData * pq_bucket_pop_front(PbmPQBucket * bucket) {
 	}
 
 	// Pop off the dlist
-	dlist_node * node = dlist_pop_head_node(&bucket->bucket_dlist);
-	BlockGroupData * ret = dlist_container(BlockGroupData, blist, node);
+	node = dlist_pop_head_node(&bucket->bucket_dlist);
+	ret = dlist_container(BlockGroupData, blist, node);
 
 	// Unset the PQ bucket pointer
 	ret->pq_bucket = NULL;
@@ -317,13 +323,9 @@ BlockGroupData * pq_bucket_pop_front(PbmPQBucket * bucket) {
  *  - though may really want to add block group ptr to buffer header... if can fit in 4 bytes! (or separate set of headers)
  */
 
-#if PBM_EVICT_MODE == 2
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_MULTI
 void PBM_InitEvictState(PBM_EvictState * state) {
 	state->next_bucket_idx = PQ_NumBuckets;
-//	state->cur_bucket = NULL;
-//	state->cur_block_group = NULL;
-//	state->cur_buf = NULL;
-	// TODO figure out what fields are actually needed!
 }
 
 
@@ -364,7 +366,7 @@ retry:
 	}
 
 	// loop over the whole bucket and add every buffer in each group to the free list if it isn't pinned
-// TODO locking --- ???
+// TODO LwLockAcquire returns true if we didn't have to sleep. If had to wait (!_lock_acquired_immediately), and freelist isn't empty, maybe can return early?
 	LOCK_GUARD_V2(PbmPqLock, LW_SHARED) {
 		// Loop over block groups in the bucket
 		dlist_iter d_it;
@@ -372,12 +374,13 @@ retry:
 			BlockGroupData * it = dlist_container(BlockGroupData, blist, d_it.cur);
 
 			BufferDesc* buf;
+			uint32 buf_state;
 			int buf_id = it->buffers_head;
 
 			// Loop over buffers in the block group
 			while (buf_id >= 0) {
 				buf = GetBufferDescriptor(buf_id);
-				uint32 buf_state = pg_atomic_read_u32(&buf->state);
+				buf_state = pg_atomic_read_u32(&buf->state);
 
 				// Check if the buffer is pinned and remember if we found anything
 				if (BUF_STATE_GET_REFCOUNT(buf_state) == 0) {
@@ -391,11 +394,9 @@ retry:
 	}
 }
 
-#elif PBM_EVICT_MODE == 1
-// TODO!
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE
 struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * buf_state_out) {
-	// TODO check "not requested" first?
-	// TODO locking!
+// TODO locking!
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_EVICT)
 	static int x = 0;
@@ -478,11 +479,6 @@ struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * buf_state_out) {
 	elog(LOG, "PQ_Evict (%d) END_FAIL", y);
 
 	elog(LOG, "PQ_Evict (%d) BUCKETS:", y);
-//	elog(LOG, "\tnr1={head=%p, tail=%p}", pq->nr1.bucket_head, pq->nr1.bucket_tail);
-//	elog(LOG, "\tnr2={head=%p, tail=%p}", pq->nr2.bucket_head, pq->nr2.bucket_tail);
-//	for (int a = 0; a < PQ_NumBuckets; ++a) {
-//		elog(LOG, "\t%d={head=%p, tail=%p}", a, pq->buckets[a]->bucket_head, pq->buckets[a]->bucket_tail);
-//	}
 #endif // TRACE_PBM && TRACE_PBM_EVICT
 
 	// if we got here, we can't find anything...
@@ -515,10 +511,9 @@ void assert_bucket_in_pbm_pq(PbmPQBucket * bucket) {
  */
 void PBM_sanity_check_buffers(void) {
 #ifdef SANITY_PBM_BLOCK_GROUPS
-	elog(LOG, "STARTING BUFFERS SANITY CHECK --- ran out of buffers");
+//	elog(LOG, "STARTING BUFFERS SANITY CHECK --- ran out of buffers");
 
 	// Remember which buffers were seen in some block group
-//	bool saw_buffer[NBuffers];
 	bool * saw_buffer = palloc(NBuffers * sizeof(bool));
 	for (int i = 0; i < NBuffers; ++i) {
 		saw_buffer[i] = false;
@@ -538,6 +533,9 @@ void PBM_sanity_check_buffers(void) {
 			// Check all block groups in the segment
 			for (int i = 0; i < BLOCK_GROUP_SEG_SIZE; ++i) {
 				BlockGroupData * data = &entry->groups[i];
+				bool found_bg = false;
+				dlist_iter it;
+				int b, p;
 
 				// Skip if there are no buffers
 				if (data->buffers_head == FREENEXT_END_OF_LIST) continue;
@@ -549,8 +547,6 @@ void PBM_sanity_check_buffers(void) {
 				assert_bucket_in_pbm_pq(data->pq_bucket);
 
 				// Verify the block group is in the dlist of the bucket
-				bool found_bg = false;
-				dlist_iter it;
 				dlist_foreach(it, &data->pq_bucket->bucket_dlist) {
 					BlockGroupData * bg = dlist_container(BlockGroupData, blist, it.cur);
 					if (bg == data) {
@@ -561,8 +557,8 @@ void PBM_sanity_check_buffers(void) {
 				Assert(found_bg);
 
 				// See what buffers are in the block group
-				int b = data->buffers_head;
-				int p = FREENEXT_END_OF_LIST;
+				b = data->buffers_head;
+				p = FREENEXT_END_OF_LIST;
 				while (b >= 0) {
 					BufferDesc * buf = GetBufferDescriptor(b);
 
@@ -586,6 +582,8 @@ void PBM_sanity_check_buffers(void) {
 	}
 
 	pfree(saw_buffer);
+
+	elog(LOG, "BUFFERS SANITY CHECK --- ran out of buffers, but not assertions failed ????");
 #endif // SANITY_PBM_BLOCK_GROUPS
 }
 

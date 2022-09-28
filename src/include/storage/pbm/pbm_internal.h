@@ -58,8 +58,9 @@ static const int64_t PQ_TimeSlice = 100 * NS_PER_MS;
 /// Helper to make sure locks get freed
 /// NOTE: do NOT `return` or `break` from inside the lock guard (break inside nested loop is OK), the lock won't be released.
 /// `continue` from the lock guard is OK, will go to the end.
+/// `_lock_acquired_immediately` is the return value of the LWLockAcquire call
 #define LOCK_GUARD_V2(lock, mode) \
-  for (bool _c_ = true, pg_attribute_unused() _unused = LWLockAcquire((lock), (mode)); _c_; LWLockRelease((lock)), _c_ = false)
+  for (bool _c_ = true, pg_attribute_unused() _lock_acquired_immediately = LWLockAcquire((lock), (mode)); _c_; LWLockRelease((lock)), _c_ = false)
 #define EXIT_LOCK_SCOPE continue
 
 /// Group blocks by ID to reduce the amount of metadata required

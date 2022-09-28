@@ -1199,8 +1199,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		 * spinlock still held!
 		 */
 		buf = StrategyGetBuffer(strategy, &buf_state);
-// TODO theo --- I think we can put everything in StrategyGetBuffer --- make sure we set the refcount to 0!
-#if PBM_EVICT_MODE == 0
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_CLOCK
 		Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
 #endif
 
@@ -1737,6 +1736,8 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 			/* increase refcount */
 			buf_state += BUF_REFCOUNT_ONE;
 
+			/* Only increase usage_count if using clock sweep */
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_CLOCK
 			if (strategy == NULL)
 			{
 				/* Default case: increase usagecount unless already max. */
@@ -1752,6 +1753,7 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 				if (BUF_STATE_GET_USAGECOUNT(buf_state) == 0)
 					buf_state += BUF_USAGECOUNT_ONE;
 			}
+#endif /* PBM_EVICT_MOE */
 
 			if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state,
 											   buf_state))
@@ -2564,8 +2566,11 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	 */
 	buf_state = LockBufHdr(bufHdr);
 
-	if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 &&
-		BUF_STATE_GET_USAGECOUNT(buf_state) == 0)
+	if (BUF_STATE_GET_REFCOUNT(buf_state) == 0
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_CLOCK
+		&& BUF_STATE_GET_USAGECOUNT(buf_state) == 0
+#endif /* PBM_EVICT_MODE */
+	)
 	{
 		result |= BUF_REUSABLE;
 	}

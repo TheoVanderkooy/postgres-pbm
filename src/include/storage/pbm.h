@@ -17,10 +17,13 @@
  *  2: method that puts still-valid blocks on the free list and lets the normal
  *     mechanism try multiple times to get from the free list
  */
+#define PBM_EVICT_MODE_CLOCK 0
+#define PBM_EVICT_MODE_SINGLE 1
+#define PBM_EVICT_MODE_MULTI 2
 #ifdef USE_PBM
-#define PBM_EVICT_MODE 2
+#define PBM_EVICT_MODE PBM_EVICT_MODE_MULTI
 #else
-#define PBM_EVICT_MODE 0
+#define PBM_EVICT_MODE PBM_EVICT_MODE_CLOCK
 #endif
 
 
@@ -51,14 +54,11 @@ extern void PbmNewBuffer(struct BufferDesc * buf);
 extern void PbmOnEvictBuffer(struct BufferDesc * buf);
 
 /// Eviction-related methods & data structures
-#if PBM_EVICT_MODE == 1
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE
 extern struct BufferDesc* PBM_EvictPage(uint32 * buf_state);
-#elif PBM_EVICT_MODE == 2
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_MULTI
 typedef struct PBM_EvictState {
 	int next_bucket_idx;
-//	struct PbmPQBucket * cur_bucket;
-//	struct BlockGroupData * cur_block_group;
-//	struct BufferDesc * cur_buf;
 } PBM_EvictState;
 
 extern void PBM_InitEvictState(PBM_EvictState * state);

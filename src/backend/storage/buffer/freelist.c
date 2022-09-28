@@ -243,7 +243,7 @@ BufferDesc * check_free_list(BufferAccessStrategy strategy, uint32 * buf_state)
 			 */
 			local_buf_state = LockBufHdr(buf);
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
-#if PBM_EVICT_MODE == 0
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_CLOCK
 // only check usage count if we are using the clock algorithm
 				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0
 #endif
@@ -280,9 +280,9 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 {
 	BufferDesc *buf;
 	int			bgwprocno;
-#if PBM_EVICT_MODE == 2
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_MULTI
 	PBM_EvictState pbm_estate;
-#elif PBM_EVICT_MODE == 0
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_CLOCK
 	int			trycounter;
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
 #endif
@@ -331,7 +331,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 	 */
 	pg_atomic_fetch_add_u32(&StrategyControl->numBufferAllocs, 1);
 
-#if PBM_EVICT_MODE == 2
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_MULTI
 	PBM_InitEvictState(&pbm_estate);
 
 	for (;;) {
@@ -354,9 +354,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 		PBM_EvictPages(&pbm_estate);
 	}
 
-#elif PBM_EVICT_MODE == 1
-// TODO theo --- this is where we need to get new buffer from PBM if nothing in the free list
-// TODO theo --- worry about multi-eviction later
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE
 	/* Check the free list first */
 	buf = check_free_list(strategy, buf_state);
 	if (NULL != buf) {
@@ -611,6 +609,7 @@ StrategyInitialize(bool init)
 BufferAccessStrategy
 GetAccessStrategy(BufferAccessStrategyType btype)
 {
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_CLOCK
 	BufferAccessStrategy strategy;
 	int			ring_size;
 
@@ -655,6 +654,12 @@ GetAccessStrategy(BufferAccessStrategyType btype)
 	strategy->ring_size = ring_size;
 
 	return strategy;
+#else
+	(void) btype; // parameter unused
+
+	// if using PBM, don't use strategies
+	return NULL;
+#endif // PBM_EVICT_MODE
 }
 
 /*
