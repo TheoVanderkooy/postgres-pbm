@@ -96,12 +96,20 @@ typedef struct TableData {
 } TableData;
 
 /// Structs for storing information about scans in the hash map
-// Hash map key
-typedef ScanId ScanTag;
+
+// This struct stores scan stats that are only updated in the single process
+// (in the main header file, because it is embedded in the scan operator)
+typedef struct PBM_LocalScanStats LocalScanStats;
+
+// Scan stats that need to be read by other threads when estimating scan speed
+typedef struct PBM_SharedScanStats {
+	BlockNumber	blocks_scanned;
+	float		est_speed;
+} SharedScanStats;
 
 // Hash map value: scan info & statistics
 // Note: records *blocks* NOT block *groups*
-typedef struct ScanData {
+typedef struct PBM_ScanData {
 	// Scan info (does not change after being set)
 	TableData 	tbl; // the table being scanned
 	BlockNumber startBlock; // where the scan started
@@ -109,18 +117,15 @@ typedef struct ScanData {
 
 // ### add range information (later when looking at BRIN indexes)
 
-	// Statistics
-// ### Consider concurrency control for these. Only *written* from one thread, but could be read concurrently from others
-	long		last_report_time;
-	BlockNumber	last_pos;
-	BlockNumber	blocks_scanned;
-	float		est_speed;
+	// Statistics written by one thread, but read by all
+// ### needs to be atomic? or volatile good enough?
+	_Atomic(SharedScanStats) stats;
 } ScanData;
 
 // Entry (KVP) in the scans hash map
 typedef struct ScanHashEntry {
-	ScanTag		tag; // Hash key
-	ScanData	data; // Value
+	ScanId		id;		// Hash key
+	ScanData	data;	// Value
 } ScanHashEntry;
 
 
@@ -131,6 +136,10 @@ typedef struct BlockGroupScanList {
 	// Info about the current scan
 	ScanId		scan_id;
 	BlockNumber	blocks_behind;
+
+// TODO consider another list here from the ScanData to reduce lookups needed?
+// TODO consider a pointer to the scan data to reduce hash lookups
+// TODO ^ actually, can just replace the scan_id entirely with the pointer..... why do we need a map at all??
 
 	// Next item in the list
 	// ### consider using ilist.h for this! (this seems to not be broken --- don't touch for now)
@@ -244,7 +253,7 @@ extern PbmShared * pbm;
 ///-------------------------------------------------------------------------
 /// PBM PQ Initialization
 ///-------------------------------------------------------------------------
-extern PbmPQ* InitPbmPQ(void);
+extern PbmPQ * InitPbmPQ(void);
 extern Size PbmPqShmemSize(void);
 
 ///-------------------------------------------------------------------------

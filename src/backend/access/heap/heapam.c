@@ -803,7 +803,7 @@ heapgettup(HeapScanDesc scan,
 
 #ifdef USE_PBM
 		// TODO theo is this the right place for it? Only report on new page?
-		ReportSeqScanPosition(scan->scanId, page);
+		ReportSeqScanPosition(scan, page);
 #endif // USE_PBM
 		/*
 		 * return NULL if we've exhausted all the pages
@@ -1114,7 +1114,7 @@ heapgettup_pagemode(HeapScanDesc scan,
 				ss_report_location(scan->rs_base.rs_rd, page);
 		}
 #ifdef USE_PBM
-		ReportSeqScanPosition(scan->scanId, page);
+		ReportSeqScanPosition(scan, page);
 #endif // USE_PBM
 		/*
 		 * return NULL if we've exhausted all the pages

@@ -113,7 +113,7 @@ void InitPBM(void) {
 
 	// Initialize map of scans
 	hash_info = (HASHCTL){
-		.keysize = sizeof(ScanTag),
+		.keysize = sizeof(ScanId),
 		.entrysize = sizeof(ScanHashEntry),
 	};
 	hash_flags = HASH_ELEM | HASH_BLOBS;
@@ -215,11 +215,20 @@ void RegisterSeqScan(HeapScanDesc scan) {
 			.startBlock = startblock,
 			.nblocks = nblocks,
 			// These stats will be updated later
-			.last_pos = startblock,
-			.est_speed = init_est_speed,
-			.blocks_scanned = 0,
-			.last_report_time = get_time_ns(),
+			.stats = (SharedScanStats) {
+				.est_speed = init_est_speed,
+				.blocks_scanned = 0,
+			},
 	};
+
+	/* Scan remembers the ID, shared stats, and local stats */
+	scan->scanId = id;
+	scan->pbmSharedScanData = s_data;
+	scan->pbmLocalScanStats = (LocalScanStats) {
+		.last_report_time = get_time_ns(),
+		.last_pos = startblock,
+	};
+
 
 	// Register the scan with each buffer
 	LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
@@ -304,8 +313,6 @@ void RegisterSeqScan(HeapScanDesc scan) {
 		}
 	} // LOCK_GUARD
 
-	// Scan remembers the ID
-	scan->scanId = id;
 
 	// debugging
 #ifdef TRACE_PBM
@@ -347,6 +354,7 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 	LOCK_GUARD_V2(PbmScansLock, LW_EXCLUSIVE) {
 		const float alpha = 0.85f; // ### pick something else? move to configuration?
 		float new_est;
+		SharedScanStats stats;
 
 		/*
 		 * Delete the scan from the map.
@@ -356,10 +364,11 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 		 */
 		scanData = *search_scan(id, HASH_REMOVE, &found);
 		Assert(found);
+		stats = scanData.stats;
 
 		// Update global initial speed estimate: geometrically-weighted average
 		// ### Note: we don't really care about lost updates here, could put this outside the lock (make _Atomic)
-		new_est = pbm->initial_est_speed * alpha + scanData.est_speed * (1 - alpha);
+		new_est = pbm->initial_est_speed * alpha + stats.est_speed * (1 - alpha);
 		pbm->initial_est_speed = new_est;
 	}
 
@@ -372,7 +381,7 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 	// For each block in the scan: remove it from the list of scans
 	LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
 		const uint32 upper = BLOCK_GROUP(scanData.nblocks);
-		const uint32 start = scanData.last_pos;
+		const uint32 start = scan->pbmLocalScanStats.last_pos;
 		const uint32 end   = (0 == scanData.startBlock ? upper : scanData.startBlock);
 
 		// Everything before `start` should already be removed when the scan passed that location
@@ -389,15 +398,19 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 	}
 }
 
-
-void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
-	bool found;
+/*
+ * Update progress of a sequential scan
+ */
+void ReportSeqScanPosition(HeapScanDescData *const scan, BlockNumber pos) {
+	const ScanId id = scan->scanId;
+//	bool found;
 	long curTime, elapsed;
-	ScanData *entry;
+	ScanData *const entry = scan->pbmSharedScanData;
 	BlockNumber blocks;
 	BlockNumber prevGroupPos, curGroupPos;
 	float speed;
 	BlockGroupHashKey bs_key;
+	SharedScanStats stats = entry->stats;
 
 #ifdef TRACE_PBM
 	elog(LOG, "ReportSeqScanPosition (%lu)", id);
@@ -411,14 +424,9 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 		return;
 	}
 
-	// Find the scan stats
-	LOCK_GUARD_V2(PbmScansLock, LW_SHARED) {
-// TODO just keep a pointer in the HeapScan itself? and keep stats there...
-		entry = search_scan(id, HASH_FIND, &found);
-	}
-	Assert(found && entry != NULL);
+	Assert(entry != NULL);
 
-	prevGroupPos = BLOCK_GROUP(entry->last_pos);
+	prevGroupPos = BLOCK_GROUP(scan->pbmLocalScanStats.last_pos);
 	curGroupPos = BLOCK_GROUP(pos);
 	bs_key = (BlockGroupHashKey) {
 		.rnode = entry->tbl.rnode,
@@ -429,20 +437,21 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 	// Note: the entry is only *written* in one process.
 	// If readers aren't atomic: how bad is this? Could mis-predict next access time...
 	curTime = get_time_ns();
-	elapsed = curTime - entry->last_report_time;
-	if (pos > entry->last_pos) {
-		blocks = pos - entry->last_pos;
+	elapsed = curTime - scan->pbmLocalScanStats.last_report_time;
+	if (pos > scan->pbmLocalScanStats.last_pos) {
+		blocks = pos - scan->pbmLocalScanStats.last_pos;
 	} else {
 		// looped around back to the start block
-		blocks = pos + entry->nblocks - entry->last_pos;
+		blocks = pos + entry->nblocks - scan->pbmLocalScanStats.last_pos;
 	}
 	speed = (float)(blocks) / (float)(elapsed);
 // ### estimating speed: should do better than this. e.g. exponentially weighted average, or moving average.
-// ### MAYBE some kind of locking? Spin-lock should be good enough but a read-write spin lock would be preferable...
-	entry->last_report_time = curTime;
-	entry->last_pos = pos;
-	entry->blocks_scanned += blocks;
-	entry->est_speed = speed;
+	scan->pbmLocalScanStats.last_report_time = curTime;
+	scan->pbmLocalScanStats.last_pos = pos;
+	// update shared stats with a single assignment
+	stats.blocks_scanned += blocks;
+	stats.est_speed = speed;
+	entry->stats = stats;
 
 
 	PQ_RefreshRequestedBuckets();
@@ -472,7 +481,7 @@ void ReportSeqScanPosition(ScanId id, BlockNumber pos) {
 #endif
 
 
-// TODO: maybe want to track whether scan is forwards or backwards...
+// ### maybe want to track whether scan is forwards or backwards... (not sure if relevant)
 }
 
 // ### revisit whether to register buffers when loaded or when unpinned
@@ -768,13 +777,12 @@ BlockGroupData * search_block_group(const BufferDesc *const buf, bool* foundPtr)
 
 // Print debugging information for a single entry in the scans hash map.
 void debug_append_scan_data(StringInfoData* str, ScanHashEntry* entry) {
-	appendStringInfo(str, "{id=%lu, start=%u, nblocks=%u, last_post=%u, last_time=%ld, speed=%f}",
-					 entry->tag,
+	SharedScanStats stats = entry->data.stats;
+	appendStringInfo(str, "{id=%lu, start=%u, nblocks=%u, speed=%f}",
+					 entry->id,
 					 entry->data.startBlock,
 					 entry->data.nblocks,
-					 entry->data.last_pos,
-					 entry->data.last_report_time,
-					 entry->data.est_speed
+					 stats.est_speed
 	);
 }
 
@@ -855,13 +863,12 @@ void debug_log_buffers_map(void) {
 /*
  * Estimate the next access time of a block group based on the scan progress.
  */
-long ScanTimeToNextConsumption(const BlockGroupScanList *const stats, bool* foundPtr) {
-	const ScanId id = stats->scan_id;
+long ScanTimeToNextConsumption(const BlockGroupScanList *const bg_scan, bool* foundPtr) {
+	const ScanId id = bg_scan->scan_id;
 	ScanData * s_data;
-	const BlockNumber blocks_behind = GROUP_TO_FIRST_BLOCK(stats->blocks_behind);
-	BlockNumber blocks_scanned;
+	const BlockNumber blocks_behind = GROUP_TO_FIRST_BLOCK(bg_scan->blocks_behind);
 	BlockNumber blocks_remaining;
-	float est_speed;
+	SharedScanStats stats;
 
 	LOCK_GUARD_V2(PbmScansLock, LW_SHARED) {
 // ### consider a local map caching the scans
@@ -871,19 +878,20 @@ long ScanTimeToNextConsumption(const BlockGroupScanList *const stats, bool* foun
 	// Might be possible the scan has just ended
 	if (false == *foundPtr) return AccessTimeNotRequested;
 
+	// read stats from the struct
+	stats = s_data->stats;
+
 	// Estimate time to next access time
 	// First: estimate distance (# blocks) to the block based on # of blocks scanned and position
 	// 		of the block group in the scan
 	// Then: distance/speed = time to next access (estimate)
-	blocks_scanned = s_data->blocks_scanned;
-	est_speed = s_data->est_speed;
-	if (blocks_behind < blocks_scanned) {
+	if (blocks_behind < stats.blocks_scanned) {
 		blocks_remaining = 0;
 	} else {
-		blocks_remaining = blocks_behind - blocks_scanned;
+		blocks_remaining = blocks_behind - stats.blocks_scanned;
 	}
 
-	return (long)((float)blocks_remaining / est_speed);
+	return (long)((float)blocks_remaining / stats.est_speed);
 }
 
 long PageNextConsumption(const BlockGroupData *const stats, bool *requestedPtr) {

@@ -34,10 +34,18 @@
 struct HeapScanDescData;
 struct BufferDesc;
 struct BlockGroupData;
+struct PBM_ScanData;
 
 
 /// Type declarations used elsewhere
 typedef size_t ScanId;
+
+// Store scan statistics locally when they don't need to be read by other processes
+struct PBM_LocalScanStats{
+	long last_report_time;
+	BlockNumber	last_pos;
+};
+
 
 /// Initialization
 extern void InitPBM(void);
@@ -46,7 +54,7 @@ extern Size PbmShmemSize(void);
 /// Public API called by *sequential* scan operators
 extern void RegisterSeqScan(struct HeapScanDescData * scan);
 extern void UnregisterSeqScan(struct HeapScanDescData * scan);
-extern void ReportSeqScanPosition(ScanId id, BlockNumber pos);
+extern void ReportSeqScanPosition(struct HeapScanDescData *scan, BlockNumber pos);
 
 /// Forward certain operations from the normal buffer manager to PBM.
 extern void PbmNewBuffer(struct BufferDesc * buf);
