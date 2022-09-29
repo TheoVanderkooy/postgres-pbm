@@ -283,7 +283,7 @@ extern Size PbmPqShmemSize(void);
 ///-------------------------------------------------------------------------
 /// PBM PQ manipulation
 ///-------------------------------------------------------------------------
-extern void PQ_InsertBlockGroup(BlockGroupData * block_group, long t, bool requested);
+extern void PQ_RefreshBlockGroup(BlockGroupData * block_group, long t, bool requested);
 extern void PQ_RemoveBlockGroup(BlockGroupData * block_group);
 extern bool PQ_ShiftBucketsWithLock(long ts);
 extern bool PQ_CheckEmpty(void);

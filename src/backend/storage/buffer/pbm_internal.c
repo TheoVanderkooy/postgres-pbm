@@ -25,6 +25,9 @@ static unsigned int PQ_time_to_bucket(const PbmPQ * pq, long t);
 ///-------------------------------------------------------------------------
 
 static inline
+void pq_bucket_remove_locked(BlockGroupData *const block_group);
+
+static inline
 void pq_bucket_push_back(PbmPQBucket *bucket, BlockGroupData *block_group);
 
 static inline
@@ -194,14 +197,18 @@ bool PQ_CheckEmpty(void) {
 	return true;
 }
 
-/// Insert a block group into the PBM PQ with current time `t` (ns)
-void PQ_InsertBlockGroup(BlockGroupData *const block_group, const long t, bool requested) {
+/*
+ * Refresh the block group with current time `t` (ns). Will move the block group
+ * from its current bucket (if any) to the new appropriate bucket based on the
+ * timestamp (if it is requested).
+ *
+ * Requires that the block group has buffers and belong in the PQ (otherwise,
+ * just call remove instead).
+ */
+void PQ_RefreshBlockGroup(BlockGroupData *const block_group, const long t, bool requested) {
 	PbmPQ *const pq = pbm->BlockQueue;
 	unsigned int i;
 	PbmPQBucket * bucket;
-
-	// Should not already be in a bucket
-	Assert(NULL == block_group->pq_bucket);
 
 	LOCK_GUARD_V2(PbmPqBucketsLock, LW_SHARED) {
 		// Get the appropriate bucket index
@@ -218,8 +225,18 @@ void PQ_InsertBlockGroup(BlockGroupData *const block_group, const long t, bool r
 			bucket = pq->buckets[i];
 		}
 
-// TODO locking: lock the bucket! (doesn't really matter if this stays in the PQ lock)
-		pq_bucket_push_back(bucket, block_group);
+		if (bucket == block_group->pq_bucket) {
+			// Nothing to do if it should go to the same bucket
+		} else {
+// TODO locking: lock *both* buckets! (doesn't really matter if this stays in the PQ lock)
+// ### decide if need to lock both at the same time, or it is OK to release the remove one first.
+			// Remove the block group if it is already in a bucket
+			if (block_group->pq_bucket != NULL) {
+				pq_bucket_remove_locked(block_group);
+			}
+			// Then push to the new bucket
+			pq_bucket_push_back(bucket, block_group);
+		}
 	}
 }
 
@@ -279,6 +296,20 @@ void pq_bucket_prepend_range(PbmPQBucket *bucket, PbmPQBucket *other) {
 
 }
 
+/*
+ * Remove the block group from its bucket, assuming the bucket itself is already locked.
+ */
+static inline
+void pq_bucket_remove_locked(BlockGroupData *const block_group) {
+	Assert(block_group != NULL);
+	Assert(block_group->pq_bucket != NULL);
+
+	dlist_delete(&block_group->blist);
+
+	// Clear the links from the block group after unlinking from the rest of the bucket
+	block_group->pq_bucket = NULL;
+}
+
 /// Remove the specified block group from the PBM PQ
 void PQ_RemoveBlockGroup(BlockGroupData *const block_group) {
 
@@ -289,10 +320,7 @@ void PQ_RemoveBlockGroup(BlockGroupData *const block_group) {
 
 // TODO locking: we probably only need to lock the bucket, not the whole list
 	LOCK_GUARD_V2(PbmPqBucketsLock, LW_SHARED) {
-		dlist_delete(&block_group->blist);
-
-		// Clear the links from the block group after unlinking from the rest of the bucket
-		block_group->pq_bucket = NULL;
+		pq_bucket_remove_locked(block_group);
 	}
 }
 

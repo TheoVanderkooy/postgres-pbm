@@ -1099,12 +1099,13 @@ void RefreshBlockGroup(BlockGroupData *const data) {
 	bool has_buffers = (data->buffers_head >= 0);
 	long t;
 
-// ### consider calculating the new block group first, then only move if it has changed
-	PQ_RemoveBlockGroup(data);
-	t = PageNextConsumption(data, &requested);
-
+	// Check if this group should be in the PQ.
+	// If so, move it to the appropriate bucket. If not, remove it from its bucket if applicable.
 	if (has_buffers) {
-		PQ_InsertBlockGroup(data, t, requested);
+		t = PageNextConsumption(data, &requested);
+		PQ_RefreshBlockGroup(data, t, requested);
+	} else {
+		PQ_RemoveBlockGroup(data);
 	}
 }
 
@@ -1114,7 +1115,6 @@ BlockGroupData EmptyBlockGroupData(void) {
 		.scans_head = NULL,
 		.buffers_head = FREENEXT_END_OF_LIST,
 		.pq_bucket = NULL,
-		//.dlist = {},
 	};
 }
 
