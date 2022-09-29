@@ -59,8 +59,13 @@ static const int64_t PQ_TimeSlice = 100 * NS_PER_MS;
 /// NOTE: do NOT `return` or `break` from inside the lock guard (break inside nested loop is OK), the lock won't be released.
 /// `continue` from the lock guard is OK, will go to the end.
 /// `_lock_acquired_immediately` is the return value of the LWLockAcquire call
+#define LOCK_GUARD_WITH_RES(var, lock, mode) \
+  for ( \
+    bool (_c ## var) = true, pg_attribute_unused() (var) = LWLockAcquire((lock), (mode)); \
+  	(_c ## var); \
+    LWLockRelease((lock)), (_c ## var) = false)
 #define LOCK_GUARD_V2(lock, mode) \
-  for (bool _c_ = true, pg_attribute_unused() _lock_acquired_immediately = LWLockAcquire((lock), (mode)); _c_; LWLockRelease((lock)), _c_ = false)
+  LOCK_GUARD_WITH_RES(_ignore_, lock, mode)
 #define EXIT_LOCK_SCOPE continue
 
 /// Group blocks by ID to reduce the amount of metadata required
@@ -176,6 +181,8 @@ typedef struct BlockGroupHashEntry {
 	// previous and next segment
 	struct BlockGroupHashEntry * seg_next;
 	struct BlockGroupHashEntry * seg_prev;
+
+	// list of groups in the segment
 	BlockGroupData		groups[BLOCK_GROUP_SEG_SIZE];
 } BlockGroupHashEntry;
 
@@ -189,10 +196,24 @@ typedef struct PbmPQBucket {
 
 // The actual PQ structure
 typedef struct PbmPQ {
-// protected by PbmPqLock
+	/*
+	 * LOCKING:
+	 *
+	 * PbmPqBucketsLock: protects the list of buckets. Exclusive lock for shifting
+	 * buckets, shared lock for everything else.
+	 *
+	 * PbmEvictionLock: lock exclusively when evicting. If we had to wait to
+	 * acquire the lock, it means someone else was evicting something. So check
+	 * the free list first before evicting again. Note: we still actually wait
+	 * to acquire the lock (instead of doing a ConditionalAcquire) to avoid
+	 * contention on the free-list spinlock.
+	 */
 
+	// List of buckets, protected by PbmPqBucketsLock
 	PbmPQBucket ** buckets;
-	// ### keep track of "not requested" and "very far future" separately?
+
+// ### can maybe get rid of "not_requested_other", only used for single-eviction mode (which I'm not sure it even works well)
+// ### keep track of "not requested" and "very far future" separately?
 	PbmPQBucket * not_requested_bucket;
 	PbmPQBucket * not_requested_other;
 	PbmPQBucket nr1;
@@ -233,6 +254,9 @@ typedef struct PbmShared {
 	struct HTAB * BlockGroupMap;
 	BlockGroupScanList* block_group_stats_free_list;
 // ### if possible, free list could be protected by its own spinlock instead of using this lock
+
+
+	/* Protected by PbmPqBucketsLock and PbmEvictionLock */
 
 	/// Priority queue of block groups that could be evicted
 	PbmPQ * BlockQueue;

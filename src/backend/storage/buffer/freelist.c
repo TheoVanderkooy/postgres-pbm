@@ -345,7 +345,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 		if (PBM_EvictingFailed(&pbm_estate)) {
 			// Run sanity checks and print state for debugging if we really can't get anything...
 			PBM_sanity_check_buffers();
-			PBM_print_pmb_state();
+			PBM_print_pbm_state();
 
 			elog(ERROR, "no unpinned buffers available");
 		}

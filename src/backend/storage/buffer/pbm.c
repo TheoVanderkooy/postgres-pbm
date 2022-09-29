@@ -473,6 +473,8 @@ void ReportSeqScanPosition(HeapScanDescData *const scan, BlockNumber pos) {
 			remove_scan_from_block_range(&bs_key, id, prevGroupPos, upper);
 		}
 	}
+
+// ### consider refreshing (at least some) block groups shortly after the scan starts --- avoid case where initial speed estimate is bad.
 	
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_REPORT_PROGRESS)
@@ -1132,7 +1134,7 @@ void PQ_RefreshRequestedBuckets(void) {
 	if (up_to_date) return;
 
 	// Shift the PQ buckets as many times as necessary to catch up
-	LOCK_GUARD_V2(PbmPqLock, LW_EXCLUSIVE) {
+	LOCK_GUARD_V2(PbmPqBucketsLock, LW_EXCLUSIVE) {
 		while (PQ_ShiftBucketsWithLock(pbm->BlockQueue, ts)) ;
 	}
 }
@@ -1155,7 +1157,7 @@ void PBM_TryRefreshRequestedBuckets(void) {
 	if (up_to_date) return;
 
 	// If unable to acquire the lock, just stop here
-	acquired = LWLockConditionalAcquire(PbmPqLock, LW_EXCLUSIVE);
+	acquired = LWLockConditionalAcquire(PbmPqBucketsLock, LW_EXCLUSIVE);
 	if (acquired) {
 
 		// if several time slices have passed since last shift, try to short-circuit by
@@ -1169,7 +1171,7 @@ void PBM_TryRefreshRequestedBuckets(void) {
 		// Shift buckets until up-to-date
 		while (PQ_ShiftBucketsWithLock(pbm->BlockQueue, ts)) ;
 
-		LWLockRelease(PbmPqLock);
+		LWLockRelease(PbmPqBucketsLock);
 	} else {
 		return;
 	}

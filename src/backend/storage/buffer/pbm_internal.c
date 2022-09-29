@@ -200,18 +200,22 @@ void PQ_InsertBlockGroup(PbmPQ *const pq, BlockGroupData *const block_group, con
 	// Should not already be in a bucket
 	Assert(NULL == block_group->pq_bucket);
 
-
-	LOCK_GUARD_V2(PbmPqLock, LW_SHARED) {
-		// Get the appropriate bucket
+	LOCK_GUARD_V2(PbmPqBucketsLock, LW_SHARED) {
+		// Get the appropriate bucket index
 		if (requested) {
 			i = PQ_time_to_bucket(pq, ns_to_timeslice(t));
-			bucket = pq->buckets[i];
 		} else {
-			// not requested bucket
-			bucket = pq->not_requested_bucket;
+			i = PQ_BucketOutOfRange;
 		}
 
-// TODO should this be inside the lock??
+		// not_requested if not requested or bucket is out of range, otherwise find the bucket
+		if (PQ_BucketOutOfRange == i) {
+			bucket = pq->not_requested_bucket;
+		} else {
+			bucket = pq->buckets[i];
+		}
+
+// TODO locking: lock the bucket! (doesn't really matter if this stays in the PQ lock)
 		pq_bucket_push_back(bucket, block_group);
 	}
 }
@@ -280,8 +284,8 @@ void PQ_RemoveBlockGroup(BlockGroupData *block_group) {
 		return;
 	}
 
-// ### is locking the whole thing actually necessary?
-	LOCK_GUARD_V2(PbmPqLock, LW_SHARED) {
+// TODO locking: we probably only need to lock the bucket, not the whole list
+	LOCK_GUARD_V2(PbmPqBucketsLock, LW_SHARED) {
 		dlist_delete(&block_group->blist);
 
 		// Clear the links from the block group after unlinking from the rest of the bucket
@@ -340,36 +344,59 @@ void PBM_InitEvictState(PBM_EvictState * state) {
  * called again for the next buffer index.
  */
 void PBM_EvictPages(PBM_EvictState * state) {
-	PbmPQBucket* bucket;
+	PbmPQBucket* bucket = NULL;
+	dlist_iter d_it;
 
-retry:
+	/*
+	 * LOCKING:
+	 *  - Need the eviction lock for the entire duration
+	 *  - Need shared bucket lock while selecting a bucket, then lock just the bucket
+	 */
 
-	// Check not_requested first, and last if we exhaust everything else
-	if (state->next_bucket_idx >= PQ_NumBuckets || state->next_bucket_idx < 0) {
-		bucket = pbm->BlockQueue->not_requested_bucket;
-	} else {
-		bucket = pbm->BlockQueue->buckets[state->next_bucket_idx];
-	}
-
-	// decrement the next_bucket index
-	state->next_bucket_idx -= 1;
-
-	// If bucket is empty, try with the next one
-	if (dlist_is_empty(&bucket->bucket_dlist)) {
-		if (state->next_bucket_idx < 0) {
-			// If out of buckets, just return
-			return;
-		} else {
-			// Otherwise, we should start again with the next bucket
-			goto retry;
+	LOCK_GUARD_WITH_RES(evict_lock_no_wait, PbmEvictionLock, LW_EXCLUSIVE) {
+		/*
+		 * If we had to *wait* for the lock, re-check the buffer free list first
+		 * because someone else just evicted multiple buffers.
+		 */
+		if (!evict_lock_no_wait && have_free_buffer()) {
+			EXIT_LOCK_SCOPE;
 		}
-	}
 
-	// loop over the whole bucket and add every buffer in each group to the free list if it isn't pinned
-// TODO LwLockAcquire returns true if we didn't have to sleep. If had to wait (!_lock_acquired_immediately), and freelist isn't empty, maybe can return early?
-	LOCK_GUARD_V2(PbmPqLock, LW_SHARED) {
-		// Loop over block groups in the bucket
-		dlist_iter d_it;
+		/*
+		 * Determine which bucket to check next. Loop until we find a non-empty
+		 * bucket OR have checked everything and decide to give up.
+		 */
+		LOCK_GUARD_V2(PbmPqBucketsLock, LW_SHARED) {
+			while (NULL == bucket && !PBM_EvictingFailed(state)) {
+
+				/* Check not_requested first, and last if we exhaust everything else */
+				if (state->next_bucket_idx >= PQ_NumBuckets || state->next_bucket_idx < 0) {
+					bucket = pbm->BlockQueue->not_requested_bucket;
+				} else {
+					bucket = pbm->BlockQueue->buckets[state->next_bucket_idx];
+				}
+
+				/* Ignore buckets which are empty */
+				if (dlist_is_empty(&bucket->bucket_dlist)) {
+					bucket = NULL;
+				}
+
+				/* Advance to the next_bucket index, either for next loop or next call */
+				state->next_bucket_idx -= 1;
+			}
+
+			if (bucket != NULL) {
+// TODO locking: lock the bucket if we found one!
+			}
+		}
+
+		/* Didn't find anything, stop here */
+		if (NULL == bucket) {
+			EXIT_LOCK_SCOPE;
+		}
+
+
+		/* Loop over block groups in the bucket */
 		dlist_foreach(d_it, &bucket->bucket_dlist) {
 			BlockGroupData * it = dlist_container(BlockGroupData, blist, d_it.cur);
 
@@ -377,42 +404,49 @@ retry:
 			uint32 buf_state;
 			int buf_id = it->buffers_head;
 
-			// Loop over buffers in the block group
+			/* Loop over buffers in the block group */
 			while (buf_id >= 0) {
 				buf = GetBufferDescriptor(buf_id);
 				buf_state = pg_atomic_read_u32(&buf->state);
 
-				// Check if the buffer is pinned and remember if we found anything
+				/*
+				 * Free the buffer if it isn't pinned.
+				 *
+				 * We do not invalidate the buffer, just add to the free list.
+				 * It can still be used and will be skipped if it gets pinned
+				 * before it is removed from the free list.
+				 *
+				 * Note: we do NOT need to lock the buffer header to add it
+				 */
 				if (BUF_STATE_GET_REFCOUNT(buf_state) == 0) {
-					// free the buffer (add to free list if not already there)
 					StrategyFreeBuffer(buf);
 				}
 
+				/* Next buffer in the group */
 				buf_id = buf->pbm_bgroup_next;
 			}
-		}
-	}
+		} // dlist_foreach
+
+// TODO locking: free bucket lock!
+
+	} // PbmEvictionLock
 }
 
 #elif PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE
 struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * buf_state_out) {
 // TODO locking!
-
-#if defined(TRACE_PBM) && defined(TRACE_PBM_EVICT)
-	static int x = 0;
-	int y = x;
-	++x;
-	elog(LOG, "PQ_Evict (%d) START", y);
-#endif // TRACE_PBM && TRACE_PBM_EVICT
+/* Actually just in general, this mode is not fully supported and can probably be improved.
+ * If re-enabled: need to check:
+ *  - Locking!
+ *  - make sure the 2 not_requested buckets are handled everywhere
+ *  - ...
+ */
 
 	int i = PQ_NumBuckets - 1;
 
 	for (;;) {
 		// step 1: try to get something from the not_requested bucket
 		for (;;) {
-#if defined(TRACE_PBM) && defined(TRACE_PBM_EVICT)
-			elog(LOG, "PQ_Evict (%d) (i=%d) CHECK NOT_REQUESTED", y, i);
-#endif // TRACE_PBM && TRACE_PBM_EVICT
 
 			// swap out the not_requested bucket to avoid contention on not_requested...
 			PbmPQBucket * temp = pq->not_requested_bucket;
@@ -426,10 +460,6 @@ struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * buf_state_out) {
 			// Push the block group back onto not requested
 			pq_bucket_push_back(pq->not_requested_bucket, data);
 
-#if defined(TRACE_PBM) && defined(TRACE_PBM_EVICT)
-			elog(LOG, "PQ_Evict (%d) (i=%d) found candidate block group, check its buffers", y, i);
-#endif // TRACE_PBM && TRACE_PBM_EVICT
-
 			// Found a block group candidate: check all its buffers
 			Assert(data->buffers_head >= 0);
 			BufferDesc * buf = GetBufferDescriptor(data->buffers_head);
@@ -437,16 +467,11 @@ struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * buf_state_out) {
 				uint32 buf_state = pg_atomic_read_u32(&buf->state);
 
 				// check if the buffer is evictable
-// ### check usagecount?
 				if (BUF_STATE_GET_REFCOUNT(buf_state) == 0) {
 					buf_state = LockBufHdr(buf);
 					if (BUF_STATE_GET_REFCOUNT(buf_state) == 0) {
 						// viable candidate, return it WITH THE HEADER STILL LOCKED!
 						// later callback to PBM will handle removing it from the block group...
-
-#if defined(TRACE_PBM) && defined(TRACE_PBM_EVICT)
-						elog(LOG, "PQ_Evict (%d) END_SUCCESS", y);
-#endif // TRACE_PBM && TRACE_PBM_EVICT
 
 						*buf_state_out = buf_state;
 						return buf;
@@ -474,12 +499,6 @@ struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * buf_state_out) {
 		pq_bucket_prepend_range(pq->not_requested_bucket, pq->buckets[i]);
 		i -= 1;
 	}
-
-#if defined(TRACE_PBM) && defined(TRACE_PBM_EVICT)
-	elog(LOG, "PQ_Evict (%d) END_FAIL", y);
-
-	elog(LOG, "PQ_Evict (%d) BUCKETS:", y);
-#endif // TRACE_PBM && TRACE_PBM_EVICT
 
 	// if we got here, we can't find anything...
 	return NULL;
@@ -614,7 +633,7 @@ void print_pq_bucket(StringInfoData * str, PbmPQBucket* bucket) {
 	}
 }
 
-void PBM_print_pmb_state(void) {
+void PBM_print_pbm_state(void) {
 	StringInfoData str;
 	initStringInfo(&str);
 
@@ -624,7 +643,7 @@ void PBM_print_pmb_state(void) {
 	print_pq_bucket(&str, pbm->BlockQueue->not_requested_other);
 
 	// print PBM PQ
-	LOCK_GUARD_V2(PbmPqLock, LW_EXCLUSIVE) {
+	LOCK_GUARD_V2(PbmPqBucketsLock, LW_EXCLUSIVE) {
 		for (int i = PQ_NumBuckets - 1; i >= 0; --i) {
 			appendStringInfo(&str, "\n\t %3d:         ", i);
 			print_pq_bucket(&str, pbm->BlockQueue->not_requested_other);
