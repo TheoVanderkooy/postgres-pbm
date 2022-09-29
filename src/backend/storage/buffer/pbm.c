@@ -1104,7 +1104,7 @@ void RefreshBlockGroup(BlockGroupData *const data) {
 	t = PageNextConsumption(data, &requested);
 
 	if (has_buffers) {
-		PQ_InsertBlockGroup(pbm->BlockQueue, data, t, requested);
+		PQ_InsertBlockGroup(data, t, requested);
 	}
 }
 
@@ -1135,7 +1135,7 @@ void PQ_RefreshRequestedBuckets(void) {
 
 	// Shift the PQ buckets as many times as necessary to catch up
 	LOCK_GUARD_V2(PbmPqBucketsLock, LW_EXCLUSIVE) {
-		while (PQ_ShiftBucketsWithLock(pbm->BlockQueue, ts)) ;
+		while (PQ_ShiftBucketsWithLock(ts)) ;
 	}
 }
 
@@ -1163,13 +1163,13 @@ void PBM_TryRefreshRequestedBuckets(void) {
 		// if several time slices have passed since last shift, try to short-circuit by
 		// checking if the whole PQ is empty, in which case we can just update the timestamp without actually shifting anything
 		if ((ts - last_shifted_ts) > 5) {
-			if (PQ_CheckEmpty(pbm->BlockQueue)) {
+			if (PQ_CheckEmpty()) {
 				pbm->BlockQueue->last_shifted_time_slice = ts;
 			}
 		}
 
 		// Shift buckets until up-to-date
-		while (PQ_ShiftBucketsWithLock(pbm->BlockQueue, ts)) ;
+		while (PQ_ShiftBucketsWithLock(ts)) ;
 
 		LWLockRelease(PbmPqBucketsLock);
 	} else {

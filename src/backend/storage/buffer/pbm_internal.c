@@ -137,7 +137,8 @@ static unsigned int PQ_time_to_bucket(const PbmPQ *const pq, const long ts) {
 /// Shifts the buckets in the PQ if necessary.
 /// Assumes the PQ is *already* locked!
 /// `ts` is current time *slice*
-bool PQ_ShiftBucketsWithLock(PbmPQ *pq, long ts) {
+bool PQ_ShiftBucketsWithLock(const long ts) {
+	PbmPQ *const pq = pbm->BlockQueue;
 	const long last_shift_ts = pq->last_shifted_time_slice;
 	const long new_shift_ts = last_shift_ts + 1;
 	PbmPQBucket *spare;
@@ -185,7 +186,8 @@ bool PQ_ShiftBucketsWithLock(PbmPQ *pq, long ts) {
 
 /// Return true if all buckets in the PQ are empty, so the timestamp can be updated without shifting
 /// This requires the lock to already be held!
-bool PQ_CheckEmpty(const PbmPQ *pq) {
+bool PQ_CheckEmpty(void) {
+	const PbmPQ *const pq = pbm->BlockQueue;
 	for (int i = 0; i < PQ_NumBuckets; ++i) {
 		if (!dlist_is_empty(&pq->buckets[i]->bucket_dlist)) return false;
 	}
@@ -193,7 +195,8 @@ bool PQ_CheckEmpty(const PbmPQ *pq) {
 }
 
 /// Insert a block group into the PBM PQ with current time `t` (ns)
-void PQ_InsertBlockGroup(PbmPQ *const pq, BlockGroupData *const block_group, const long t, bool requested) {
+void PQ_InsertBlockGroup(BlockGroupData *const block_group, const long t, bool requested) {
+	PbmPQ *const pq = pbm->BlockQueue;
 	unsigned int i;
 	PbmPQBucket * bucket;
 
@@ -277,7 +280,7 @@ void pq_bucket_prepend_range(PbmPQBucket *bucket, PbmPQBucket *other) {
 }
 
 /// Remove the specified block group from the PBM PQ
-void PQ_RemoveBlockGroup(BlockGroupData *block_group) {
+void PQ_RemoveBlockGroup(BlockGroupData *const block_group) {
 
 	// Nothing to do if not in a bucket
 	if (NULL == block_group->pq_bucket) {

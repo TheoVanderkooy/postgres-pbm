@@ -283,11 +283,13 @@ extern Size PbmPqShmemSize(void);
 ///-------------------------------------------------------------------------
 /// PBM PQ manipulation
 ///-------------------------------------------------------------------------
-extern void PQ_InsertBlockGroup(PbmPQ * pq, BlockGroupData * block_group, long t, bool requested);
-extern void PQ_RemoveBlockGroup(BlockGroupData *block_group);
-extern bool PQ_ShiftBucketsWithLock(PbmPQ * pq, long t);
-extern bool PQ_CheckEmpty(const PbmPQ * pq);
-extern struct BufferDesc* PQ_Evict(PbmPQ * pq, uint32 * but_state);
+extern void PQ_InsertBlockGroup(BlockGroupData * block_group, long t, bool requested);
+extern void PQ_RemoveBlockGroup(BlockGroupData * block_group);
+extern bool PQ_ShiftBucketsWithLock(long ts);
+extern bool PQ_CheckEmpty(void);
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE
+extern struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * but_state);
+#endif
 
 ///-------------------------------------------------------------------------
 /// Helpers
