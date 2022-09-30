@@ -5,6 +5,7 @@
 
 #include "storage/pbm.h"
 #include "storage/relfilenode.h"
+#include "storage/spin.h"
 
 ///-------------------------------------------------------------------------
 /// Constants
@@ -35,6 +36,8 @@ static const int PQ_NumBucketGroups = 10;
 static const int PQ_NumBucketsPerGroup = 5;
 static const int PQ_NumBuckets = PQ_NumBucketGroups * PQ_NumBucketsPerGroup;
 static const int64_t PQ_TimeSlice = 100 * NS_PER_MS;
+
+#define PBM_PQ_BUCKETS_USE_SPINLOCK
 
 /// Debugging flags
 #define TRACE_PBM
@@ -161,8 +164,9 @@ typedef struct BlockGroupData {
 	// Set of (### unpinned?) buffers holding data in this block group
 	int buffers_head;
 
+// TODO locking: if block group is locked maybe this doesn't need to be volatile.
 	// Linked-list in PQ buckets
-	struct PbmPQBucket* pq_bucket;
+	struct PbmPQBucket *volatile pq_bucket;
 	dlist_node blist;
 } BlockGroupData;
 
@@ -189,9 +193,15 @@ typedef struct BlockGroupHashEntry {
 
 /// The priority queue structure data structures for tracking blocks to evict
 typedef struct PbmPQBucket {
+	// Lock for this bucket
+#ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
+	slock_t slock;
+#else
+	// TODO spinlock vs LWLock?
+#endif // PBM_PQ_BUCKETS_USE_SPINLOCK
+
 	// List of BlockGroupData in the list
 	dlist_head bucket_dlist;
-	// TODO (spin) lock?
 } PbmPQBucket;
 
 // The actual PQ structure

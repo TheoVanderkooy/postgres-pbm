@@ -25,13 +25,23 @@ static unsigned int PQ_time_to_bucket(const PbmPQ * pq, long t);
 ///-------------------------------------------------------------------------
 
 static inline
-void pq_bucket_remove_locked(BlockGroupData *const block_group);
+void pq_bucket_lock(PbmPQBucket * bucket);
+static inline
+void pq_bucket_unlock(PbmPQBucket * bucket);
 
 static inline
-void pq_bucket_push_back(PbmPQBucket *bucket, BlockGroupData *block_group);
+void pq_bucket_lock_two(PbmPQBucket * b1, PbmPQBucket * b2);
+static inline
+void pq_bucket_unlock_two(PbmPQBucket * b1, PbmPQBucket * b2);
 
 static inline
-void pq_bucket_prepend_range(PbmPQBucket *bucket, PbmPQBucket *other);
+void pq_bucket_remove_locked(BlockGroupData * block_group);
+
+static inline
+void pq_bucket_push_back_locked(PbmPQBucket * bucket, BlockGroupData * block_group);
+
+static inline
+void pq_bucket_prepend_range(PbmPQBucket * bucket, PbmPQBucket * other);
 
 /// Width of buckets in a bucket group in # of time slices
 static inline long bucket_group_width(unsigned int group) {
@@ -55,6 +65,10 @@ static inline unsigned int floor_llogb(unsigned long x) {
 
 static inline
 void init_pq_bucket(PbmPQBucket* b) {
+#ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
+	SpinLockInit(&b->slock);
+#else
+#endif // PBM_PQ_BUCKETS_USE_SPINLOCK
 	dlist_init(&b->bucket_dlist);
 }
 
@@ -156,7 +170,6 @@ bool PQ_ShiftBucketsWithLock(const long ts) {
 	// bucket[0] will be removed, move its stuff to bucket[1] first
 	spare = pq->buckets[0];
 	pq_bucket_prepend_range(pq->buckets[1], spare);
-	// TODO locking: may be better to do this one at a time if we need a spinlock
 
 
 	// Shift each group
@@ -227,22 +240,41 @@ void PQ_RefreshBlockGroup(BlockGroupData *const block_group, const long t, bool 
 
 		if (bucket == block_group->pq_bucket) {
 			// Nothing to do if it should go to the same bucket
+		} else if (NULL == block_group->pq_bucket) {
+			// Not removing -- only one bucket to lock
+			pq_bucket_lock(bucket);
+			pq_bucket_push_back_locked(bucket, block_group);
+			pq_bucket_unlock(bucket);
 		} else {
-// TODO locking: lock *both* buckets! (doesn't really matter if this stays in the PQ lock)
+			PbmPQBucket * removed_from;
+
+// TODO locking --- not sure if we need the retry loop -- maybe can just lock the block_group?
 // ### decide if need to lock both at the same time, or it is OK to release the remove one first.
-			// Remove the block group if it is already in a bucket
-			if (block_group->pq_bucket != NULL) {
-				pq_bucket_remove_locked(block_group);
+			// Lock the buckets
+			for (;;) {
+				removed_from = block_group->pq_bucket;
+				pq_bucket_lock_two(removed_from, bucket);
+
+				// make sure the bucket is in the right one when we lock it
+				if (removed_from == block_group->pq_bucket) break;
+
+				// otherwise try again
+				pq_bucket_unlock_two(removed_from, bucket);
 			}
+
+			// Remove from the old bucket
+			pq_bucket_remove_locked(block_group);
+			pq_bucket_unlock(removed_from);
+
 			// Then push to the new bucket
-			pq_bucket_push_back(bucket, block_group);
+			pq_bucket_push_back_locked(bucket, block_group);
+			pq_bucket_unlock(bucket);
 		}
 	}
 }
 
 /// Insert into a PQ bucket
-void pq_bucket_push_back(PbmPQBucket *bucket, BlockGroupData *block_group) {
-// TODO lock the bucket!
+void pq_bucket_push_back_locked(PbmPQBucket *bucket, BlockGroupData *block_group) {
 	dlist_push_tail(&bucket->bucket_dlist, &block_group->blist);
 	block_group->pq_bucket = bucket;
 }
@@ -277,23 +309,23 @@ static void my_dlist_prepend(dlist_head * list, dlist_head * other) {
 void pq_bucket_prepend_range(PbmPQBucket *bucket, PbmPQBucket *other) {
 	dlist_iter it;
 
-	// Nothing to do if the other lits is empty
-	if (dlist_is_empty(&other->bucket_dlist)) {
-		return;
+	pq_bucket_lock_two(bucket, other);
+
+	// Nothing to do if the other list is empty
+	if (!dlist_is_empty(&other->bucket_dlist)) {
+
+		// Adjust bucket pointer for each block group on the other bucket
+		dlist_foreach(it, &other->bucket_dlist) {
+			BlockGroupData *data = dlist_container(BlockGroupData, blist, it.cur);
+
+			data->pq_bucket = bucket;
+		}
+
+		// Merge elements from `other` to the start of the bucket and clear `other`
+		my_dlist_prepend(&bucket->bucket_dlist, &other->bucket_dlist);
 	}
 
-// TODO locking --- lock the buckets! which one first?? (based on ptr address?)
-
-	// Adjust bucket pointer for each block group on the other bucket
-	dlist_foreach(it, &other->bucket_dlist) {
-		BlockGroupData * data = dlist_container(BlockGroupData, blist, it.cur);
-
-		data->pq_bucket = bucket;
-	}
-
-	// Merge elements from `other` to the start of the bucket and clear `other`
-	my_dlist_prepend(&bucket->bucket_dlist, &other->bucket_dlist);
-
+	pq_bucket_unlock_two(bucket, other);
 }
 
 /*
@@ -318,9 +350,27 @@ void PQ_RemoveBlockGroup(BlockGroupData *const block_group) {
 		return;
 	}
 
-// TODO locking: we probably only need to lock the bucket, not the whole list
+// ### locking: we might be able to only to lock the bucket, not the whole list (take shared lock anyways for safety)
 	LOCK_GUARD_V2(PbmPqBucketsLock, LW_SHARED) {
+		PbmPQBucket * removed_from = block_group->pq_bucket;
+
+//		// Lock the bucket to be removed from
+//		for (;;) {
+//			removed_from = block_group->pq_bucket;
+//			pq_bucket_lock(removed_from);
+//
+//			// Need to make sure it didn't change
+//			if (removed_from == block_group->pq_bucket) break;
+//
+//			// Otherwise retry
+//			pq_bucket_unlock(removed_from);
+//		}
+
+// TODO locking: I'm not sure if this is safe -- make sure we have the block_group locked first!
+		pq_bucket_lock(removed_from);
+
 		pq_bucket_remove_locked(block_group);
+		pq_bucket_unlock(removed_from);
 	}
 }
 
@@ -328,35 +378,65 @@ void PQ_RemoveBlockGroup(BlockGroupData *const block_group) {
 static inline
 BlockGroupData * pq_bucket_pop_front(PbmPQBucket * bucket) {
 	dlist_node * node;
-	BlockGroupData * ret;
+	BlockGroupData * ret = NULL;
 
-// TODO lock?
+	pq_bucket_lock(bucket);
 
-	// Return NULL if bucket is empty
-	if (dlist_is_empty(&bucket->bucket_dlist)) {
-		return NULL;
+	// Do nothing if the bucket is empty
+	if (!dlist_is_empty(&bucket->bucket_dlist)) {
+		// Pop off the dlist
+		node = dlist_pop_head_node(&bucket->bucket_dlist);
+		ret = dlist_container(BlockGroupData, blist, node);
+
+		// Unset the PQ bucket pointer
+		ret->pq_bucket = NULL;
 	}
 
-	// Pop off the dlist
-	node = dlist_pop_head_node(&bucket->bucket_dlist);
-	ret = dlist_container(BlockGroupData, blist, node);
-
-	// Unset the PQ bucket pointer
-	ret->pq_bucket = NULL;
-
+	pq_bucket_unlock(bucket);
 	return ret;
 }
 
-/*
- * TODO: alternate implementation
- *  - in freelist: we instead repeatedly try to get from freelist and only ask PBM if that is empty
- *  - PBM will instead take everything from a bucket and put the buffers on the free list (maybe check not pinned first)
- *  	- unless it is already there, or *maybe* it has refcount
- *  - need a "evicting state" which keeps track of last buffer # tried to evict for each loop
- *  - after calling this freelist will try again until we run out of buckets
- *  - don't need to worry about cleanup: the call later will handle unlinking buffers/buckets as needed!
- *  - though may really want to add block group ptr to buffer header... if can fit in 4 bytes! (or separate set of headers)
- */
+static inline
+void pq_bucket_lock(PbmPQBucket * bucket) {
+#ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
+	SpinLockAcquire(&bucket->slock);
+#else
+
+#endif // PBM_PQ_BUCKETS_USE_SPINLOCK
+}
+
+static inline
+void pq_bucket_unlock(PbmPQBucket * bucket) {
+#ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
+	SpinLockRelease(&bucket->slock);
+#else
+
+#endif // PBM_PQ_BUCKETS_USE_SPINLOCK
+}
+
+static inline
+void pq_bucket_lock_two(PbmPQBucket * b1, PbmPQBucket * b2) {
+	// ensure consistent order to avoid deadlocks
+	if (b1 > b2) {
+		PbmPQBucket * temp = b1;
+		b1 = b2;
+		b2 = temp;
+	}
+
+#ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
+	SpinLockAcquire(&b1->slock);
+	SpinLockAcquire(&b2->slock);
+#else
+
+#endif // PBM_PQ_BUCKETS_USE_SPINLOCK
+}
+
+static inline
+void pq_bucket_unlock_two(PbmPQBucket * b1, PbmPQBucket * b2) {
+	pq_bucket_unlock(b1);
+	pq_bucket_unlock(b2);
+}
+
 
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_MULTI
 void PBM_InitEvictState(PBM_EvictState * state) {
@@ -407,17 +487,17 @@ void PBM_EvictPages(PBM_EvictState * state) {
 					bucket = pbm->BlockQueue->buckets[state->next_bucket_idx];
 				}
 
+				/* Lock bucket */
+				pq_bucket_lock(bucket);
+
 				/* Ignore buckets which are empty */
 				if (dlist_is_empty(&bucket->bucket_dlist)) {
+					pq_bucket_unlock(bucket);
 					bucket = NULL;
 				}
 
 				/* Advance to the next_bucket index, either for next loop or next call */
 				state->next_bucket_idx -= 1;
-			}
-
-			if (bucket != NULL) {
-// TODO locking: lock the bucket if we found one!
 			}
 		}
 
@@ -458,7 +538,8 @@ void PBM_EvictPages(PBM_EvictState * state) {
 			}
 		} // dlist_foreach
 
-// TODO locking: free bucket lock!
+		/* Unlock bucket */
+		pq_bucket_unlock(bucket);
 
 	} // PbmEvictionLock
 }
@@ -540,7 +621,7 @@ struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * buf_state_out) {
  * Check the given PBM PQ bucket is actually in the list somewhere
  */
 static inline
-void assert_bucket_in_pbm_pq(PbmPQBucket * bucket) {
+void DEBUG_assert_bucket_in_pbm_pq(PbmPQBucket * bucket) {
 	if (&pbm->BlockQueue->nr1 == bucket) return;
 	if (&pbm->BlockQueue->nr2 == bucket) return;
 
@@ -559,7 +640,7 @@ void assert_bucket_in_pbm_pq(PbmPQBucket * bucket) {
  *  - All buckets (with block groups) are actually in the PBM somewhere
  *  - All buffers are part of a bucket -- not that if this is called, we should have already checked the free list is empty
  */
-void PBM_sanity_check_buffers(void) {
+void PBM_DEBUG_sanity_check_buffers(void) {
 #ifdef SANITY_PBM_BLOCK_GROUPS
 //	elog(LOG, "STARTING BUFFERS SANITY CHECK --- ran out of buffers");
 
@@ -594,7 +675,7 @@ void PBM_sanity_check_buffers(void) {
 				Assert(data->pq_bucket != NULL);
 
 				// Make sure the bucket does actually exist in the PQ
-				assert_bucket_in_pbm_pq(data->pq_bucket);
+				DEBUG_assert_bucket_in_pbm_pq(data->pq_bucket);
 
 				// Verify the block group is in the dlist of the bucket
 				dlist_foreach(it, &data->pq_bucket->bucket_dlist) {
@@ -638,7 +719,7 @@ void PBM_sanity_check_buffers(void) {
 }
 
 static
-void print_pq_bucket(StringInfoData * str, PbmPQBucket* bucket) {
+void DEBUG_print_pq_bucket(StringInfoData * str, PbmPQBucket* bucket) {
 	// append each block group
 	dlist_iter it;
 	dlist_foreach(it, &bucket->bucket_dlist) {
@@ -664,20 +745,20 @@ void print_pq_bucket(StringInfoData * str, PbmPQBucket* bucket) {
 	}
 }
 
-void PBM_print_pbm_state(void) {
+void PBM_DEBUG_print_pbm_state(void) {
 	StringInfoData str;
 	initStringInfo(&str);
 
 	appendStringInfo(&str, "\n\tnot_requested:");
-	print_pq_bucket(&str, pbm->BlockQueue->not_requested_bucket);
+	DEBUG_print_pq_bucket(&str, pbm->BlockQueue->not_requested_bucket);
 	appendStringInfo(&str, "\n\tother:        ");
-	print_pq_bucket(&str, pbm->BlockQueue->not_requested_other);
+	DEBUG_print_pq_bucket(&str, pbm->BlockQueue->not_requested_other);
 
 	// print PBM PQ
 	LOCK_GUARD_V2(PbmPqBucketsLock, LW_EXCLUSIVE) {
 		for (int i = PQ_NumBuckets - 1; i >= 0; --i) {
 			appendStringInfo(&str, "\n\t %3d:         ", i);
-			print_pq_bucket(&str, pbm->BlockQueue->not_requested_other);
+			DEBUG_print_pq_bucket(&str, pbm->BlockQueue->not_requested_other);
 		}
 	}
 

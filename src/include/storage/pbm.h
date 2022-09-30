@@ -77,8 +77,8 @@ static inline bool PBM_EvictingFailed(PBM_EvictState * state) {
 #endif
 
 /// Debugging sanity checks
-extern void PBM_sanity_check_buffers(void);
-extern void PBM_print_pbm_state(void);
+extern void PBM_DEBUG_sanity_check_buffers(void);
+extern void PBM_DEBUG_print_pbm_state(void);
 
 /*
  * TODO: Register*Scan for:
