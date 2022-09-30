@@ -447,6 +447,8 @@ void PBM_InitEvictState(PBM_EvictState * state) {
 /*
  * Choose some buffers for eviction.
  *
+ * Requires PbmEvictionLock to be held before calling.
+ *
  * This takes the current bucket in the PBM PQ (skipping any empty ones), and for ALL block groups
  * in the bucket it puts ALL the non-pinned buffers in the group on the normal buffer free list.
  *
@@ -459,89 +461,71 @@ void PBM_EvictPages(PBM_EvictState * state) {
 	dlist_iter d_it;
 
 	/*
-	 * LOCKING:
-	 *  - Need the eviction lock for the entire duration
-	 *  - Need shared bucket lock while selecting a bucket, then lock just the bucket
+	 * Determine which bucket to check next. Loop until we find a non-empty
+	 * bucket OR have checked everything and decide to give up.
 	 */
+	LOCK_GUARD_V2(PbmPqBucketsLock, LW_SHARED) {
+		while (NULL == bucket && !PBM_EvictingFailed(state)) {
 
-	LOCK_GUARD_WITH_RES(evict_lock_no_wait, PbmEvictionLock, LW_EXCLUSIVE) {
-		/*
-		 * If we had to *wait* for the lock, re-check the buffer free list first
-		 * because someone else just evicted multiple buffers.
-		 */
-		if (!evict_lock_no_wait && have_free_buffer()) {
-			EXIT_LOCK_SCOPE;
-		}
-
-		/*
-		 * Determine which bucket to check next. Loop until we find a non-empty
-		 * bucket OR have checked everything and decide to give up.
-		 */
-		LOCK_GUARD_V2(PbmPqBucketsLock, LW_SHARED) {
-			while (NULL == bucket && !PBM_EvictingFailed(state)) {
-
-				/* Check not_requested first, and last if we exhaust everything else */
-				if (state->next_bucket_idx >= PQ_NumBuckets || state->next_bucket_idx < 0) {
-					bucket = pbm->BlockQueue->not_requested_bucket;
-				} else {
-					bucket = pbm->BlockQueue->buckets[state->next_bucket_idx];
-				}
-
-				/* Lock bucket */
-				pq_bucket_lock(bucket);
-
-				/* Ignore buckets which are empty */
-				if (dlist_is_empty(&bucket->bucket_dlist)) {
-					pq_bucket_unlock(bucket);
-					bucket = NULL;
-				}
-
-				/* Advance to the next_bucket index, either for next loop or next call */
-				state->next_bucket_idx -= 1;
+			/* Check not_requested first, and last if we exhaust everything else */
+			if (state->next_bucket_idx >= PQ_NumBuckets || state->next_bucket_idx < 0) {
+				bucket = pbm->BlockQueue->not_requested_bucket;
+			} else {
+				bucket = pbm->BlockQueue->buckets[state->next_bucket_idx];
 			}
-		}
 
-		/* Didn't find anything, stop here */
-		if (NULL == bucket) {
-			EXIT_LOCK_SCOPE;
-		}
+			/* Lock bucket */
+			pq_bucket_lock(bucket);
 
-
-		/* Loop over block groups in the bucket */
-		dlist_foreach(d_it, &bucket->bucket_dlist) {
-			BlockGroupData * it = dlist_container(BlockGroupData, blist, d_it.cur);
-
-			BufferDesc* buf;
-			uint32 buf_state;
-			int buf_id = it->buffers_head;
-
-			/* Loop over buffers in the block group */
-			while (buf_id >= 0) {
-				buf = GetBufferDescriptor(buf_id);
-				buf_state = pg_atomic_read_u32(&buf->state);
-
-				/*
-				 * Free the buffer if it isn't pinned.
-				 *
-				 * We do not invalidate the buffer, just add to the free list.
-				 * It can still be used and will be skipped if it gets pinned
-				 * before it is removed from the free list.
-				 *
-				 * Note: we do NOT need to lock the buffer header to add it
-				 */
-				if (BUF_STATE_GET_REFCOUNT(buf_state) == 0) {
-					StrategyFreeBuffer(buf);
-				}
-
-				/* Next buffer in the group */
-				buf_id = buf->pbm_bgroup_next;
+			/* Ignore buckets which are empty */
+			if (dlist_is_empty(&bucket->bucket_dlist)) {
+				pq_bucket_unlock(bucket);
+				bucket = NULL;
 			}
-		} // dlist_foreach
 
-		/* Unlock bucket */
-		pq_bucket_unlock(bucket);
+			/* Advance to the next_bucket index, either for next loop or next call */
+			state->next_bucket_idx -= 1;
+		}
+	}
 
-	} // PbmEvictionLock
+	/* Didn't find anything, stop here */
+	if (NULL == bucket) {
+		return;
+	}
+
+	/* Loop over block groups in the bucket */
+	dlist_foreach(d_it, &bucket->bucket_dlist) {
+		BlockGroupData * it = dlist_container(BlockGroupData, blist, d_it.cur);
+
+		BufferDesc* buf;
+		uint32 buf_state;
+		int buf_id = it->buffers_head;
+
+		/* Loop over buffers in the block group */
+		while (buf_id >= 0) {
+			buf = GetBufferDescriptor(buf_id);
+			buf_state = pg_atomic_read_u32(&buf->state);
+
+			/*
+			 * Free the buffer if it isn't pinned.
+			 *
+			 * We do not invalidate the buffer, just add to the free list.
+			 * It can still be used and will be skipped if it gets pinned
+			 * before it is removed from the free list.
+			 *
+			 * Note: we do NOT need to lock the buffer header to add it
+			 */
+			if (BUF_STATE_GET_REFCOUNT(buf_state) == 0) {
+				StrategyFreeBuffer(buf);
+			}
+
+			/* Next buffer in the group */
+			buf_id = buf->pbm_bgroup_next;
+		}
+	} // dlist_foreach
+
+	/* Unlock bucket */
+	pq_bucket_unlock(bucket);
 }
 
 #elif PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE

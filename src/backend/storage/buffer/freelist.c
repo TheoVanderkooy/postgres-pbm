@@ -282,6 +282,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 	int			bgwprocno;
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_MULTI
 	PBM_EvictState pbm_estate;
+	bool lock_acquired_no_wait;
 #elif PBM_EVICT_MODE == PBM_EVICT_MODE_CLOCK
 	int			trycounter;
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
@@ -332,15 +333,29 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 	pg_atomic_fetch_add_u32(&StrategyControl->numBufferAllocs, 1);
 
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_MULTI
+
+	/* Check free list first */
+	buf = check_free_list(strategy, buf_state);
+	if (NULL != buf) {
+		return buf;
+	}
+
+	/* If free-list check fails, use the PBM to evict more */
+	lock_acquired_no_wait = LWLockAcquire(PbmEvictionLock, LW_EXCLUSIVE);
+
+	/* If we had to wait (because someone else got the lock first), check the free-list again. */
+	if (!lock_acquired_no_wait) {
+		buf = check_free_list(strategy, buf_state);
+		if (NULL != buf) {
+			LWLockRelease(PbmEvictionLock);
+			return buf;
+		}
+	}
+
+	/* Nothing on the free list, run the PBM eviction strategy */
 	PBM_InitEvictState(&pbm_estate);
 
 	for (;;) {
-		/* Check free list first */
-		buf = check_free_list(strategy, buf_state);
-		if (NULL != buf) {
-			return buf;
-		}
-
 		/* If we've exhausted the PBM, we can't return anything so error */
 		if (PBM_EvictingFailed(&pbm_estate)) {
 			// Run sanity checks and print state for debugging if we really can't get anything...
@@ -352,7 +367,18 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 
 		/* Nothing from the free list, ask PBM to put more stuff on it */
 		PBM_EvictPages(&pbm_estate);
+
+		/* Check free list after hopefully adding some stuff to it */
+		buf = check_free_list(strategy, buf_state);
+		if (NULL != buf) {
+			break;
+		}
 	}
+
+	LWLockRelease(PbmEvictionLock);
+
+	Assert(buf != NULL);
+	return buf;
 
 #elif PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE
 	/* Check the free list first */
