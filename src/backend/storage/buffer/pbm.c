@@ -45,8 +45,8 @@ static BlockGroupData * search_block_group(const BufferDesc * buf, bool* foundPt
 static BlockGroupData * search_or_create_block_group(const BufferDesc * buf);
 
 // various helpers to improve code reuse and readability
-static void InitScanStatsEntry(BlockGroupScanList* temp, ScanId id, ScanData* sdata, BlockGroupScanList* next, BlockNumber bgnum);
-static bool DeleteScanFromGroup(ScanId id, BlockGroupData* groupData);
+static void InitScanStatsEntry(BlockGroupScanList * temp, ScanId id, ScanData *sdata, BlockNumber bgnum);
+static bool DeleteScanFromGroup(ScanId id, BlockGroupData * groupData);
 static BlockGroupData * AddBufToBlockGroup(BufferDesc * buf);
 
 // debugging
@@ -61,8 +61,8 @@ static void list_all_buffers(void);
 static void sanity_check_verify_block_group_buffers(const BufferDesc * buf);
 
 // managing buffer priority
-static long ScanTimeToNextConsumption(const BlockGroupScanList* stats, bool* foundPtr);
-static long PageNextConsumption(const BlockGroupData* stats, bool *requestedPtr);
+static long ScanTimeToNextConsumption(const BlockGroupScanList * stats, bool * foundPtr);
+static long PageNextConsumption(BlockGroupData * stats, bool * requestedPtr);
 
 
 /// Inline private helpers
@@ -102,7 +102,7 @@ void InitPBM(void) {
 	Assert(!IsUnderPostmaster);
 
 	pbm->next_id = 0;
-	pbm->block_group_stats_free_list = NULL;
+	slist_init(&pbm->bg_scan_free_list);
 	pbm->initial_est_speed = 0.0001f;
 // ### what should be initial-initial speed estimate lol
 // ### need to adjust it for units...
@@ -272,10 +272,9 @@ void RegisterSeqScan(HeapScanDesc scan) {
 			// Add the scan for each block group in the list
 			for (int i = 0; i < BLOCK_GROUP_SEG_SIZE && bgnum < nblock_groups; ++bgnum, ++i) {
 				BlockGroupScanList * scan_entry;
-				if (pbm->block_group_stats_free_list != NULL) {
+				if (!slist_is_empty(&pbm->bg_scan_free_list)) {
 					// pop off the free list if possible
-					scan_entry = pbm->block_group_stats_free_list;
-					pbm->block_group_stats_free_list = pbm->block_group_stats_free_list->next;
+					scan_entry = slist_container(BlockGroupScanList, slist, slist_pop_head_node(&pbm->bg_scan_free_list));
 				} else if (new_stats != NULL) {
 					// if no free list, but we already allocated, use that
 					scan_entry = new_stats;
@@ -287,11 +286,9 @@ void RegisterSeqScan(HeapScanDesc scan) {
 					new_stats += 1;
 				}
 
-				// Initialize the list element
-				InitScanStatsEntry(scan_entry, id, s_data, bseg_cur->groups[i].scans_head, bgnum);
-
-				// Link it in
-				bseg_cur->groups[i].scans_head = scan_entry;
+				// Initialize the list element & push to the list
+				InitScanStatsEntry(scan_entry, id, s_data, bgnum);
+				slist_push_head(&bseg_cur->groups[i].scans_list, &scan_entry->slist);
 			}
 		}
 
@@ -679,7 +676,7 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 	long next_access_time = AccessTimeNotRequested;
 	long now = get_time_ns();
 
-	const BlockGroupData *const block_scans = search_block_group(buf, &found);
+	BlockGroupData *const block_scans = search_block_group(buf, &found);
 	if (true == found) {
 		next_access_time = PageNextConsumption(block_scans, &requested);
 	}
@@ -896,21 +893,24 @@ long ScanTimeToNextConsumption(const BlockGroupScanList *const bg_scan, bool* fo
 	return (long)((float)blocks_remaining / stats.est_speed);
 }
 
-long PageNextConsumption(const BlockGroupData *const stats, bool *requestedPtr) {
+long PageNextConsumption(BlockGroupData *const stats, bool *requestedPtr) {
 	long min_next_access = -1;
 	bool found = false;
+	slist_iter iter;
 
 // ### lock the entry in some way?
 
 	*requestedPtr = false;
 
 	// not requested if there are no scans
-	if (NULL == stats || NULL == stats->scans_head) {
+	if (NULL == stats || slist_is_empty(&stats->scans_list)) {
 		return AccessTimeNotRequested;
 	}
 
 	// loop over the scans and check the next access time estimate from that scan
-	for (const BlockGroupScanList * it = stats->scans_head; it != NULL; it = it->next) {
+	slist_foreach(iter, &stats->scans_list) {
+		BlockGroupScanList * it = slist_container(BlockGroupScanList, slist, iter.cur);
+
 		const long time_to_next_access = ScanTimeToNextConsumption(it, &found);
 
 		if (true == found && (false == *requestedPtr || time_to_next_access < min_next_access)) {
@@ -928,7 +928,7 @@ long PageNextConsumption(const BlockGroupData *const stats, bool *requestedPtr) 
 }
 
 // Initialize an entry in the list of scans for a block group
-void InitScanStatsEntry(BlockGroupScanList *const temp, ScanId id, ScanData* sdata, BlockGroupScanList *const next, const BlockNumber bgnum) {
+void InitScanStatsEntry(BlockGroupScanList *const temp, ScanId id, ScanData *sdata, const BlockNumber bgnum) {
 	const BlockNumber startblock = sdata->startBlock;
 	const BlockNumber nblocks = sdata->nblocks;
 	// convert group # -> block #
@@ -946,32 +946,27 @@ void InitScanStatsEntry(BlockGroupScanList *const temp, ScanId id, ScanData* sda
 	*temp = (BlockGroupScanList){
 			.scan_id = id,
 			.blocks_behind = blocks_behind,
-			.next = next,
 	};
 }
 
 // Delete a specific scan from the list of the given block group
 bool DeleteScanFromGroup(const ScanId id, BlockGroupData *const groupData) {
-	BlockGroupScanList *it = groupData->scans_head;
-	BlockGroupScanList **prev = &groupData->scans_head;
+	slist_mutable_iter iter;
 
-	// find the scan in the list
-	while (it != NULL && it->scan_id != id) {
-		prev = &it->next;
-		it = it->next;
+	// Search the list to remove the scan
+	slist_foreach_modify(iter, &groupData->scans_list) {
+		BlockGroupScanList * it = slist_container(BlockGroupScanList, slist, iter.cur);
+
+		// If we find the scan: remove it and add to free list
+		if (it->scan_id == id) {
+			slist_delete_current(&iter);
+			slist_push_head(&pbm->bg_scan_free_list, &it->slist);
+			return true;
+		}
 	}
 
-	// if found: remove it and return whether it was found
-	if (NULL == it) {
-		return false;
-	} else {
-		// unlink
-		*prev = it->next;
-		// add to free list
-		it->next = pbm->block_group_stats_free_list;
-		pbm->block_group_stats_free_list = it;
-		return true;
-	}
+	// Didn't find it
+	return false;
 }
 
 /*
@@ -1112,7 +1107,7 @@ void RefreshBlockGroup(BlockGroupData *const data) {
 static inline
 BlockGroupData EmptyBlockGroupData(void) {
 	return (BlockGroupData){
-		.scans_head = NULL,
+		.scans_list = SLIST_STATIC_INIT(scans_list),
 		.buffers_head = FREENEXT_END_OF_LIST,
 		.pq_bucket = NULL,
 	};

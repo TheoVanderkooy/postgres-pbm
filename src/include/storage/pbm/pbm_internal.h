@@ -150,8 +150,7 @@ typedef struct BlockGroupScanList {
 // TODO ^ actually, can just replace the scan_id entirely with the pointer..... why do we need a map at all??
 
 	// Next item in the list
-	// ### consider using ilist.h for this! (this seems to not be broken --- don't touch for now)
-	struct BlockGroupScanList* next;
+	slist_node slist;
 } BlockGroupScanList;
 
 // Record data for this block group.
@@ -159,7 +158,7 @@ typedef struct BlockGroupData {
 // ### some kind of lock?
 
 	// Set of scans which care about this block group
-	BlockGroupScanList* scans_head;
+	slist_head scans_list;
 
 	// Set of (### unpinned?) buffers holding data in this block group
 	int buffers_head;
@@ -255,14 +254,11 @@ typedef struct PbmShared {
 // ### could make this atomic and move outside the scans lock in UnregisterSeqScan.
 
 
-// ### Map[ range (table -> block indexes) -> scan ] --- for looking up what scans reference a particular block, maybe useful later
-	//struct HTAB * ScansByRange;
-
+	/* These fields protected by PbmBlocksLock: */
 
 	/// Map[ (table, BlockGroupSegment) -> set of scans ] + free-list of the list-nodes for tracking statistics on each buffer
-	/// Protected by PbmBlocksLock
 	struct HTAB * BlockGroupMap;
-	BlockGroupScanList* block_group_stats_free_list;
+	slist_head bg_scan_free_list;
 // ### if possible, free list could be protected by its own spinlock instead of using this lock
 
 
@@ -271,9 +267,6 @@ typedef struct PbmShared {
 	/// Priority queue of block groups that could be evicted
 	PbmPQ * BlockQueue;
 
-
-// ### Potential other fields:
-// ...
 } PbmShared;
 
 
