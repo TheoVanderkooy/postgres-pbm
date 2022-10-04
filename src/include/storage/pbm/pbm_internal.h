@@ -234,14 +234,16 @@ typedef struct PbmPQ {
 
 /// Main PBM data structure
 typedef struct PbmShared {
-	// TODO more granular locking if it could improve performance.
-	// ### where to use `volatile`?
-
 	/* These fields never change after initialization, so no locking needed */
 
 	/// Time-related stuff
 	time_t start_time_sec;
 
+	/* These fields have their own lock here */
+
+	/// Free list of BlockGroupScanList elements to be re-used
+	slock_t scan_free_list_lock;
+	slist_head bg_scan_free_list;
 
 	/* These fields protected by PbmScansLock: */
 
@@ -258,8 +260,6 @@ typedef struct PbmShared {
 
 	/// Map[ (table, BlockGroupSegment) -> set of scans ] + free-list of the list-nodes for tracking statistics on each buffer
 	struct HTAB * BlockGroupMap;
-	slist_head bg_scan_free_list;
-// ### if possible, free list could be protected by its own spinlock instead of using this lock
 
 
 	/* Protected by PbmPqBucketsLock and PbmEvictionLock */

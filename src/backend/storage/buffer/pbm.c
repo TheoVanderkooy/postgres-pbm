@@ -68,6 +68,8 @@ static long PageNextConsumption(BlockGroupData * stats, bool * requestedPtr);
 /// Inline private helpers
 // ### revisit to see which other ones should be inline
 
+static inline BlockGroupScanList * try_get_BlockGroupScanList(void);
+static inline void free_BlockGroupScanList(BlockGroupScanList *it);
 static inline void RemoveBufFromBlock(BufferDesc *buf);
 static inline BlockGroupData EmptyBlockGroupData(void);
 static inline void RefreshBlockGroup(BlockGroupData * data);
@@ -81,6 +83,7 @@ static inline void remove_scan_from_block_range(BlockGroupHashKey * bs_key, Scan
 ///-------------------------------------------------------------------------
 /// PBM PQ public API
 ///-------------------------------------------------------------------------
+
 
 // Initialization of shared data structures
 void InitPBM(void) {
@@ -102,6 +105,7 @@ void InitPBM(void) {
 	Assert(!IsUnderPostmaster);
 
 	pbm->next_id = 0;
+	SpinLockInit(&pbm->scan_free_list_lock);
 	slist_init(&pbm->bg_scan_free_list);
 	pbm->initial_est_speed = 0.0001f;
 // ### what should be initial-initial speed estimate lol
@@ -244,6 +248,10 @@ void RegisterSeqScan(HeapScanDesc scan) {
 				bseg_cur = hash_search(pbm->BlockGroupMap, &bgkey, HASH_ENTER, &found);
 
 				if (bseg_prev != NULL) {
+					// the links should only be initialized once, ever
+					Assert(bseg_prev->seg_next == NULL);
+					Assert(bseg_cur->seg_prev == NULL);
+
 					// link to previous if applicable
 					bseg_prev->seg_next = bseg_cur;
 					bseg_cur->seg_prev = bseg_prev;
@@ -271,10 +279,12 @@ void RegisterSeqScan(HeapScanDesc scan) {
 
 			// Add the scan for each block group in the list
 			for (int i = 0; i < BLOCK_GROUP_SEG_SIZE && bgnum < nblock_groups; ++bgnum, ++i) {
-				BlockGroupScanList * scan_entry;
-				if (!slist_is_empty(&pbm->bg_scan_free_list)) {
-					// pop off the free list if possible
-					scan_entry = slist_container(BlockGroupScanList, slist, slist_pop_head_node(&pbm->bg_scan_free_list));
+				BlockGroupScanList * scan_entry = NULL;
+
+				scan_entry = try_get_BlockGroupScanList();
+
+				if (scan_entry != NULL) {
+					// Nothing to do if we got somethign off the free list
 				} else if (new_stats != NULL) {
 					// if no free list, but we already allocated, use that
 					scan_entry = new_stats;
@@ -291,24 +301,31 @@ void RegisterSeqScan(HeapScanDesc scan) {
 				slist_push_head(&bseg_cur->groups[i].scans_list, &scan_entry->slist);
 			}
 		}
+	} // LOCK_GUARD
+
+	/*
+	 * LOCKING: once we have created the entries, we no longer need to read or
+	 * write the hash map so release the lock. We will iterate through the
+	 * linked entries, but the relevant pointers will never change and individual
+	 * block groups have separate concurrency control.
+	 */
 
 // ### calculate the PRIORITY of each block (group)!
 // (actually, what do we know other than the first one is needed immediately?)
-		// refresh the PQ first if needed, then insert each block into the queue
-		PQ_RefreshRequestedBuckets();
+	// refresh the PQ first if needed, then insert each block into the queue
+	PQ_RefreshRequestedBuckets();
 
-		Assert(nblock_groups == 0 || NULL != bseg_first);
-		Assert(nblock_groups == 0 || NULL == bseg_first->seg_prev);
-		bgnum = 0;
-		for (bseg_cur = bseg_first; bgnum < nblock_groups; bseg_cur = bseg_cur->seg_next) {
-			Assert(bseg_cur != NULL);
+	Assert(nblock_groups == 0 || NULL != bseg_first);
+	Assert(nblock_groups == 0 || NULL == bseg_first->seg_prev);
+	bgnum = 0;
+	for (bseg_cur = bseg_first; bgnum < nblock_groups; bseg_cur = bseg_cur->seg_next) {
+		Assert(bseg_cur != NULL);
 
-			for (int i = 0; i < BLOCK_GROUP_SEG_SIZE && bgnum < nblock_groups; ++bgnum, ++i) {
-				BlockGroupData *const data = &bseg_cur->groups[i];
-				RefreshBlockGroup(data);
-			}
+		for (int i = 0; i < BLOCK_GROUP_SEG_SIZE && bgnum < nblock_groups; ++bgnum, ++i) {
+			BlockGroupData *const data = &bseg_cur->groups[i];
+			RefreshBlockGroup(data);
 		}
-	} // LOCK_GUARD
+	}
 
 
 	// debugging
@@ -376,7 +393,7 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 	if (scanData.nblocks == 0) return;
 
 	// For each block in the scan: remove it from the list of scans
-	LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
+	LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
 		const uint32 upper = BLOCK_GROUP(scanData.nblocks);
 		const uint32 start = scan->pbmLocalScanStats.last_pos;
 		const uint32 end   = (0 == scanData.startBlock ? upper : scanData.startBlock);
@@ -455,7 +472,7 @@ void ReportSeqScanPosition(HeapScanDescData *const scan, BlockNumber pos) {
 
 	// Remove the scan from blocks in range [prevGroupPos, curGroupPos)
 	if (curGroupPos != prevGroupPos) {
-		LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
+		LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
 			BlockNumber upper = curGroupPos;
 
 			// special handling if we wrapped around (note: if we update every block group this probably does nothing
@@ -574,6 +591,26 @@ inline void PbmOnEvictBuffer(struct BufferDesc *const buf) {
 ///-------------------------------------------------------------------------
 /// Private helpers:
 ///-------------------------------------------------------------------------
+
+/*
+ * Pop something of the scan stats free list. Returns NULL if it is empty
+ */
+BlockGroupScanList * try_get_BlockGroupScanList(void) {
+	BlockGroupScanList * ret = NULL;
+
+	if (slist_is_empty(&pbm->bg_scan_free_list)) {
+		return NULL;
+	}
+
+	SpinLockAcquire(&pbm->scan_free_list_lock);
+	if (!slist_is_empty(&pbm->bg_scan_free_list)) {
+		slist_node * snode = slist_pop_head_node(&pbm->bg_scan_free_list);
+		ret = slist_container(BlockGroupScanList, slist, snode);
+	}
+	SpinLockRelease(&pbm->scan_free_list_lock);
+
+	return ret;
+}
 
 void sanity_check_verify_block_group_buffers(const BufferDesc * const buf) {
 	const RelFileNode rnode = buf->tag.rnode;
@@ -710,6 +747,8 @@ ScanData * search_scan(const ScanId id, HASHACTION action, bool* foundPtr) {
 
 /*
  * Find the block group for the given buffer, or create it if it doesn't exist.
+ *
+ * This internally acquires PbmBlocksLock in the required mode when searching the hash table.
  */
 BlockGroupData * search_or_create_block_group(const BufferDesc *const buf) {
 	bool found;
@@ -753,7 +792,11 @@ BlockGroupData * search_or_create_block_group(const BufferDesc *const buf) {
 	return &bg_entry->groups[bgroup % BLOCK_GROUP_SEG_SIZE];
 }
 
-// Search block group map for a particular buffer returning the location in the array
+/*
+ * Find the data in the PBM corresponding to the given buffer, if we are tracking it.
+ *
+ * This acquires PbmBlocksLock internally for the hash lookup.
+ */
 BlockGroupData * search_block_group(const BufferDesc *const buf, bool* foundPtr) {
 	const BlockNumber blockNum = buf->tag.blockNum;
 	const BlockNumber bgroup = BLOCK_GROUP(blockNum);
@@ -762,9 +805,12 @@ BlockGroupData * search_block_group(const BufferDesc *const buf, bool* foundPtr)
 		.forkNum = buf->tag.forkNum,
 		.seg = BLOCK_GROUP_SEGMENT(bgroup),
 	};
+	BlockGroupHashEntry * bg_entry;
 
 	// Look up the block group
-	BlockGroupHashEntry * bg_entry = hash_search(pbm->BlockGroupMap, &bgkey, HASH_FIND, foundPtr);
+	LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
+		bg_entry = hash_search(pbm->BlockGroupMap, &bgkey, HASH_FIND, foundPtr);
+	}
 
 	if (false == *foundPtr) {
 		return NULL;
@@ -949,6 +995,13 @@ void InitScanStatsEntry(BlockGroupScanList *const temp, ScanId id, ScanData *sda
 	};
 }
 
+static inline
+void free_BlockGroupScanList(BlockGroupScanList *it) {
+	SpinLockAcquire(&pbm->scan_free_list_lock);
+	slist_push_head(&pbm->bg_scan_free_list, &it->slist);
+	SpinLockRelease(&pbm->scan_free_list_lock);
+}
+
 // Delete a specific scan from the list of the given block group
 bool DeleteScanFromGroup(const ScanId id, BlockGroupData *const groupData) {
 	slist_mutable_iter iter;
@@ -960,7 +1013,7 @@ bool DeleteScanFromGroup(const ScanId id, BlockGroupData *const groupData) {
 		// If we find the scan: remove it and add to free list
 		if (it->scan_id == id) {
 			slist_delete_current(&iter);
-			slist_push_head(&pbm->bg_scan_free_list, &it->slist);
+			free_BlockGroupScanList(it);
 			return true;
 		}
 	}
@@ -1053,7 +1106,12 @@ void RemoveBufFromBlock(BufferDesc *const buf) {
 	buf->pbm_bgroup_next = FREENEXT_NOT_IN_LIST;
 }
 
-
+/*
+ * When the given scan is done, remove it from the remaining range of blocks.
+ *
+ * This requires at least SHARED lock on PbmBlocksLock, and locks the individual
+ * block groups as required.
+ */
 static inline
 void remove_scan_from_block_range(BlockGroupHashKey *bs_key, const ScanId id, const uint32 lo, const uint32 hi) {
 	uint32 bgnum 	= lo;
