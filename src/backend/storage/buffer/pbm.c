@@ -226,7 +226,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 			if (NULL == bseg_prev || NULL == bseg_prev->seg_next) {
 				bseg_cur = hash_search(pbm->BlockGroupMap, &bgkey, HASH_ENTER, &found);
 
-				// if a new entry, initialize it!
+				// if created a new entry, initialize it!
 				if (!found) {
 					bseg_cur->seg_next = NULL;
 					bseg_cur->seg_prev = bseg_prev;
@@ -247,7 +247,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 				if (bseg_prev != NULL) {
 					// the links should only be initialized once, ever
 					Assert(bseg_prev->seg_next == NULL);
-					Assert(bseg_cur->seg_prev == NULL);
+					Assert(!found || bseg_cur->seg_prev == NULL);
 
 					// link to previous if applicable
 					bseg_prev->seg_next = bseg_cur;
@@ -286,7 +286,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 				}
 
 				// Initialize the list element & push to the list
-				InitScanStatsEntry(scan_entry, id, s_entry, bgnum);
+				InitScanStatsEntry(scan_entry, id, &s_entry->data, bgnum);
 		// TODO locking: lock block group here!
 				slist_push_head(&bseg_cur->groups[i].scans_list, &scan_entry->slist);
 			}
@@ -909,7 +909,7 @@ void debug_log_buffers_map(void) {
  */
 long ScanTimeToNextConsumption(const BlockGroupScanList *const bg_scan, bool* foundPtr) {
 	const ScanId id = bg_scan->scan_id;
-	ScanData * s_data;
+	ScanHashEntry * s_data;
 	const BlockNumber blocks_behind = GROUP_TO_FIRST_BLOCK(bg_scan->blocks_behind);
 	BlockNumber blocks_remaining;
 	SharedScanStats stats;
@@ -923,7 +923,7 @@ long ScanTimeToNextConsumption(const BlockGroupScanList *const bg_scan, bool* fo
 	if (false == *foundPtr) return AccessTimeNotRequested;
 
 	// read stats from the struct
-	stats = s_data->stats;
+	stats = s_data->data.stats;
 
 	// Estimate time to next access time
 	// First: estimate distance (# blocks) to the block based on # of blocks scanned and position

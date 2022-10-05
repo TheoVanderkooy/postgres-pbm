@@ -10,6 +10,7 @@
 #include "storage/lwlock.h"
 
 #include "storage/buf_internals.h"
+#include "common/hashfn.h"
 
 #include <time.h>
 
@@ -24,24 +25,18 @@ static unsigned int PQ_time_to_bucket(const PbmPQ * pq, long t);
 /// Inline private helper functions
 ///-------------------------------------------------------------------------
 
-static inline
-void pq_bucket_lock(PbmPQBucket * bucket);
-static inline
-void pq_bucket_unlock(PbmPQBucket * bucket);
+static inline void pq_bucket_lock(PbmPQBucket * bucket);
+static inline void pq_bucket_unlock(PbmPQBucket * bucket);
 
-static inline
-void pq_bucket_lock_two(PbmPQBucket * b1, PbmPQBucket * b2);
-static inline
-void pq_bucket_unlock_two(PbmPQBucket * b1, PbmPQBucket * b2);
+static inline void pq_bucket_null_lock(BlockGroupData * data);
+static inline void pq_bucket_null_unlock(BlockGroupData * data);
 
-static inline
-void pq_bucket_remove_locked(BlockGroupData * block_group);
+static inline void pq_bucket_lock_two(PbmPQBucket * b1, PbmPQBucket * b2);
+static inline void pq_bucket_unlock_two(PbmPQBucket * b1, PbmPQBucket * b2);
 
-static inline
-void pq_bucket_push_back_locked(PbmPQBucket * bucket, BlockGroupData * block_group);
-
-static inline
-void pq_bucket_prepend_range(PbmPQBucket * bucket, PbmPQBucket * other);
+static inline void pq_bucket_remove_locked(BlockGroupData * block_group);
+static inline void pq_bucket_push_back_locked(PbmPQBucket * bucket, BlockGroupData * block_group);
+static inline void pq_bucket_prepend_range(PbmPQBucket * bucket, PbmPQBucket * other);
 
 /// Width of buckets in a bucket group in # of time slices
 static inline long bucket_group_width(unsigned int group) {
@@ -91,6 +86,15 @@ PbmPQ* InitPbmPQ(void) {
 
 	pq->not_requested_bucket = &pq->nr1;
 	pq->not_requested_other = &pq->nr2;
+
+	// Initialize the extra bucket locks
+	for (int i = 0; i < PQ_NUM_NULL_BUCKETS; ++i) {
+#ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
+		SpinLockInit(&pq->null_bucket_locks[i]);
+#else
+		LWLockInitialize(&pq->null_bucket_locks[i], LWTRANCHE_PBM_PQ_BUCKET);
+#endif // PBM_PQ_BUCKETS_USE_SPINLOCK
+	}
 
 	return pq;
 }
@@ -222,6 +226,7 @@ void PQ_RefreshBlockGroup(BlockGroupData *const block_group, const long t, bool 
 	PbmPQ *const pq = pbm->BlockQueue;
 	unsigned int i;
 	PbmPQBucket * bucket;
+	PbmPQBucket * removed_from;
 
 	LOCK_GUARD_V2(PbmPqBucketsLock, LW_SHARED) {
 		// Get the appropriate bucket index
@@ -238,39 +243,70 @@ void PQ_RefreshBlockGroup(BlockGroupData *const block_group, const long t, bool 
 			bucket = pq->buckets[i];
 		}
 
-		if (bucket == block_group->pq_bucket) {
-			// Nothing to do if it should go to the same bucket
-		} else if (NULL == block_group->pq_bucket) {
-			// Not removing -- only one bucket to lock
-			pq_bucket_lock(bucket);
-			pq_bucket_push_back_locked(bucket, block_group);
-			pq_bucket_unlock(bucket);
-		} else {
-			PbmPQBucket * removed_from;
 
-// TODO locking --- not sure if we need the retry loop -- maybe can just lock the block_group?
-// ### decide if need to lock both at the same time, or it is OK to release the remove one first.
-			// Lock the buckets
-			for (;;) {
-				removed_from = block_group->pq_bucket;
+		/*
+		 * Move it to the new bucket. This requires a loop.
+		 */
+		for (;;) {
+			removed_from = block_group->pq_bucket;
+
+			/* If we want to move it to the same bucket, nothing to do. */
+			if (removed_from == bucket) {
+				break;
+			}
+
+			if (removed_from == NULL) {
+				/* NOT currently in a bucket: need some kind of lock to prevent
+				 * someone else inserting into a different bucket at the same time
+				 *
+				 * Note in this case: we always acquire the NULL lock first (and
+				 * we never acquire it when releasing) so we don't need to get
+				 * both locks to check.
+				 */
+
+				// Acquire NULL lock when dealing with a new bucket
+				pq_bucket_null_lock(block_group);
+
+				// Someone removed it before we got the lock, try again
+				if (removed_from != block_group->pq_bucket) {
+					pq_bucket_null_unlock(block_group);
+					continue;
+				}
+
+				// Insert into new bucket
+				pq_bucket_lock(bucket);
+				pq_bucket_push_back_locked(bucket, block_group);
+
+				// Release the locks
+				pq_bucket_null_unlock(block_group);
+				pq_bucket_unlock(bucket);
+			} else {
+				/* Currently in a bucket, need to lock both.
+				 *
+				 * To avoid deadlocks: we always lock in a deterministic order.
+				 * Lock them together before we check if we the bucket changed.
+				 */
 				pq_bucket_lock_two(removed_from, bucket);
 
-				// make sure the bucket is in the right one when we lock it
-				if (removed_from == block_group->pq_bucket) break;
+				// Someone removed it before we got the lock, try again
+				if (removed_from != block_group->pq_bucket) {
+					pq_bucket_unlock_two(removed_from, bucket);
+					continue;
+				}
 
-				// otherwise try again
+				// Move the block group
+				pq_bucket_remove_locked(block_group);
+				pq_bucket_push_back_locked(bucket, block_group);
+
+				// Release locks and stop
 				pq_bucket_unlock_two(removed_from, bucket);
 			}
 
-			// Remove from the old bucket
-			pq_bucket_remove_locked(block_group);
-			pq_bucket_unlock(removed_from);
-
-			// Then push to the new bucket
-			pq_bucket_push_back_locked(bucket, block_group);
-			pq_bucket_unlock(bucket);
+			// If we get here, it is because we didn't `continue` so we succeeded
+			break;
 		}
-	}
+
+	} // LOCK_GUARD
 }
 
 /// Insert into a PQ bucket
@@ -330,6 +366,9 @@ void pq_bucket_prepend_range(PbmPQBucket *bucket, PbmPQBucket *other) {
 
 /*
  * Remove the block group from its bucket, assuming the bucket itself is already locked.
+ *
+ * Does NOT change the pq_bucket pointer here! This must either be set to a new
+ * bucket, or NULL explicitly.
  */
 static inline
 void pq_bucket_remove_locked(BlockGroupData *const block_group) {
@@ -337,9 +376,6 @@ void pq_bucket_remove_locked(BlockGroupData *const block_group) {
 	Assert(block_group->pq_bucket != NULL);
 
 	dlist_delete(&block_group->blist);
-
-	// Clear the links from the block group after unlinking from the rest of the bucket
-	block_group->pq_bucket = NULL;
 }
 
 /// Remove the specified block group from the PBM PQ
@@ -369,8 +405,19 @@ void PQ_RemoveBlockGroup(BlockGroupData *const block_group) {
 // TODO locking: I'm not sure if this is safe -- make sure we have the block_group locked first!
 		pq_bucket_lock(removed_from);
 
-		pq_bucket_remove_locked(block_group);
-		pq_bucket_unlock(removed_from);
+		if (removed_from != block_group->pq_bucket) {
+			// TODO someone moved it while we got the lock... assume we don't need to do anything?
+
+			// I guess don't do anything?
+
+			pq_bucket_unlock(removed_from);
+			elog(WARNING, "Block group moved to a different bucket while we were waiting to remove it!");
+		} else {
+			pq_bucket_remove_locked(block_group);
+			block_group->pq_bucket = NULL;
+
+			pq_bucket_unlock(removed_from);
+		}
 	}
 }
 
@@ -414,6 +461,32 @@ void pq_bucket_unlock(PbmPQBucket * bucket) {
 	LWLockRelease(&bucket->lock);
 #endif // PBM_PQ_BUCKETS_USE_SPINLOCK
 }
+
+
+static inline uint32 pq_bucket_get_null_lock_idx(BlockGroupData * data) {
+	uint32 k = (uint32) ((size_t)(data) / sizeof(BlockGroupData));
+	// ### consider simpler hash function
+	return hash_bytes_uint32(k) % PQ_NUM_NULL_BUCKETS;
+}
+
+static inline void pq_bucket_null_lock(BlockGroupData * data) {
+	uint32 lock_idx = pq_bucket_get_null_lock_idx(data);
+#ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
+	SpinLockAcquire(&pbm->BlockQueue->null_bucket_locks[lock_idx]);
+#else
+	LWLockAcquire(&pbm->BlockQueue->null_bucket_locks[lock_idx], LW_EXCLUSIVE);
+#endif // PBM_PQ_BUCKETS_USE_SPINLOCK
+}
+
+static inline void pq_bucket_null_unlock(BlockGroupData * data) {
+	uint32 lock_idx = pq_bucket_get_null_lock_idx(data);
+#ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
+	SpinLockRelease(&pbm->BlockQueue->null_bucket_locks[lock_idx]);
+#else
+	LWLockRelease(&pbm->BlockQueue->null_bucket_locks[lock_idx]);
+#endif // PBM_PQ_BUCKETS_USE_SPINLOCK
+}
+
 
 static inline
 void pq_bucket_lock_two(PbmPQBucket * b1, PbmPQBucket * b2) {

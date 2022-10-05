@@ -33,6 +33,7 @@ static const long BlockGroupMapMaxSize = (1 << 16);
 #define PBM_CLOCK CLOCK_MONOTONIC // CLOCK_MONOTONIC_COARSE
 
 /// PQ configuration
+#define PQ_NUM_NULL_BUCKETS 128
 static const int PQ_NumBucketGroups = 10;
 static const int PQ_NumBucketsPerGroup = 5;
 static const int PQ_NumBuckets = PQ_NumBucketGroups * PQ_NumBucketsPerGroup;
@@ -229,6 +230,13 @@ typedef struct PbmPQ {
 	PbmPQBucket * not_requested_other;
 	PbmPQBucket nr1;
 	PbmPQBucket nr2;
+
+	// Locks for "null" buckets
+#ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
+	slock_t null_bucket_locks[PQ_NUM_NULL_BUCKETS];
+#else
+	LWLock null_bucket_locks[PQ_NUM_NULL_BUCKETS];
+#endif // PBM_PQ_BUCKETS_USE_SPINLOCK
 
 	_Atomic(long) last_shifted_time_slice;
 } PbmPQ;
