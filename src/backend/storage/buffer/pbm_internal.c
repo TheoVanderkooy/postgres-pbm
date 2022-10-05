@@ -68,6 +68,7 @@ void init_pq_bucket(PbmPQBucket* b) {
 #ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
 	SpinLockInit(&b->slock);
 #else
+	LWLockInitialize(&b->lock, LWTRANCHE_PBM_PQ_BUCKET);
 #endif // PBM_PQ_BUCKETS_USE_SPINLOCK
 	dlist_init(&b->bucket_dlist);
 }
@@ -400,7 +401,8 @@ void pq_bucket_lock(PbmPQBucket * bucket) {
 #ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
 	SpinLockAcquire(&bucket->slock);
 #else
-
+	// We never just read the bucket, so always lock exclusively
+	LWLockAcquire(&bucket->lock, LW_EXCLUSIVE);
 #endif // PBM_PQ_BUCKETS_USE_SPINLOCK
 }
 
@@ -409,7 +411,7 @@ void pq_bucket_unlock(PbmPQBucket * bucket) {
 #ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
 	SpinLockRelease(&bucket->slock);
 #else
-
+	LWLockRelease(&bucket->lock);
 #endif // PBM_PQ_BUCKETS_USE_SPINLOCK
 }
 
@@ -426,7 +428,8 @@ void pq_bucket_lock_two(PbmPQBucket * b1, PbmPQBucket * b2) {
 	SpinLockAcquire(&b1->slock);
 	SpinLockAcquire(&b2->slock);
 #else
-
+	LWLockAcquire(&b1->lock, LW_EXCLUSIVE);
+	LWLockAcquire(&b2->lock, LW_EXCLUSIVE);
 #endif // PBM_PQ_BUCKETS_USE_SPINLOCK
 }
 

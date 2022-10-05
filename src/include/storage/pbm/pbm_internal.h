@@ -6,6 +6,7 @@
 #include "storage/pbm.h"
 #include "storage/relfilenode.h"
 #include "storage/spin.h"
+#include "storage/lwlock.h"
 
 ///-------------------------------------------------------------------------
 /// Constants
@@ -37,6 +38,10 @@ static const int PQ_NumBucketsPerGroup = 5;
 static const int PQ_NumBuckets = PQ_NumBucketGroups * PQ_NumBucketsPerGroup;
 static const int64_t PQ_TimeSlice = 100 * NS_PER_MS;
 
+/*
+ * Whether tp use spinlocks or LWLocks for PBM PQ buckets.
+ * Probably spinlocks are better, but with both implementations we can test it!
+ */
 #define PBM_PQ_BUCKETS_USE_SPINLOCK
 
 /// Debugging flags
@@ -193,7 +198,7 @@ typedef struct PbmPQBucket {
 #ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
 	slock_t slock;
 #else
-	// TODO spinlock vs LWLock?
+	LWLock lock;
 #endif // PBM_PQ_BUCKETS_USE_SPINLOCK
 
 	// List of BlockGroupData in the list
