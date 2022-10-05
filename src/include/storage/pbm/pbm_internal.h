@@ -135,7 +135,7 @@ typedef struct PBM_ScanData {
 } ScanData;
 
 // Entry (KVP) in the scans hash map
-typedef struct ScanHashEntry {
+typedef struct PBM_ScanHashEntry {
 	ScanId		id;		// Hash key
 	ScanData	data;	// Value
 } ScanHashEntry;

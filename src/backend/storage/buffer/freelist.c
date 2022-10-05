@@ -340,6 +340,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 		return buf;
 	}
 
+// ### could use LWLockAcquireOrWait, and check the free list again without the lock. Then need a retry-loop around the lock
 	/* If free-list check fails, use the PBM to evict more */
 	lock_acquired_no_wait = LWLockAcquire(PbmEvictionLock, LW_EXCLUSIVE);
 

@@ -31,7 +31,7 @@ PbmShared* pbm;
 ///-------------------------------------------------------------------------
 
 // lookup in applicable hash maps
-static inline ScanData * search_scan(ScanId id, HASHACTION action, bool* foundPtr);
+static inline ScanHashEntry * search_scan(const ScanId id, HASHACTION action, bool* foundPtr);
 static BlockGroupData * search_block_group(const BufferDesc * buf, bool* foundPtr);
 static BlockGroupData * search_or_create_block_group(const BufferDesc * buf);
 
@@ -149,7 +149,7 @@ Size PbmShmemSize(void) {
 void RegisterSeqScan(HeapScanDesc scan) {
 	bool found;
 	ScanId id;
-	ScanData * s_data;
+	ScanHashEntry * s_entry;
 	TableData tbl;
 	BlockGroupHashKey bgkey;
 	BlockGroupHashEntry * bseg_cur, *bseg_prev, *bseg_first;
@@ -176,14 +176,14 @@ void RegisterSeqScan(HeapScanDesc scan) {
 	};
 
 
-	// Insert the scan metadata
+	/* Insert the scan metadata */
 	LOCK_GUARD_V2(PbmScansLock, LW_EXCLUSIVE) {
 		// Generate scan ID
 		id = pbm->next_id;
 		pbm->next_id += 1;
 
 		// Create s_entry for the scan in the hash map
-		s_data = search_scan(id, HASH_ENTER, &found);
+		s_entry = search_scan(id, HASH_ENTER, &found);
 		Assert(!found); // should be inserted...
 	}
 
@@ -192,7 +192,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 	 * haven't associated the scan with any block groups yet (so no one will by
 	 * trying to access it yet.
 	 */
-	*s_data = (ScanData) {
+	s_entry->data = (ScanData) {
 			// These fields never change
 			.tbl = tbl,
 			.startBlock = startblock,
@@ -206,7 +206,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 
 	/* Scan remembers the ID, shared stats, and local stats */
 	scan->scanId = id;
-	scan->pbmSharedScanData = s_data;
+	scan->pbmSharedScanData = s_entry;
 	scan->pbmLocalScanStats = (LocalScanStats) {
 		.last_report_time = get_time_ns(),
 		.last_pos = startblock,
@@ -226,6 +226,24 @@ void RegisterSeqScan(HeapScanDesc scan) {
 			if (NULL == bseg_prev || NULL == bseg_prev->seg_next) {
 				bseg_cur = hash_search(pbm->BlockGroupMap, &bgkey, HASH_ENTER, &found);
 
+				// if a new entry, initialize it!
+				if (!found) {
+					bseg_cur->seg_next = NULL;
+					bseg_cur->seg_prev = bseg_prev;
+					for (int i = 0; i < BLOCK_GROUP_SEG_SIZE; ++i) {
+						bseg_cur->groups[i] = EmptyBlockGroupData();
+					}
+				}
+
+				/*
+				 * Link the previous segment to the current one.
+				 *
+				 * Locking: Do this AFTER initializing all the block groups!
+				 * So that someone else traversing the in-order links can't
+				 * find this before the block groups are initialized. (someone
+				 * searching the map won't find it, because we have an exclusive
+				 * lock on the map)
+				 */
 				if (bseg_prev != NULL) {
 					// the links should only be initialized once, ever
 					Assert(bseg_prev->seg_next == NULL);
@@ -239,15 +257,6 @@ void RegisterSeqScan(HeapScanDesc scan) {
 					// remember the *first* segment if there was no previous
 					bseg_first = bseg_cur;
 				}
-
-				// if a new entry, initialize it!
-				if (!found) {
-					bseg_cur->seg_next = NULL;
-					bseg_cur->seg_prev = bseg_prev;
-					for (int i = 0; i < BLOCK_GROUP_SEG_SIZE; ++i) {
-						bseg_cur->groups[i] = EmptyBlockGroupData();
-					}
-				}
 			} else {
 				bseg_cur = bseg_prev->seg_next;
 			}
@@ -255,6 +264,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 			// remember current segment as previous for next iteration
 			bseg_prev = bseg_cur;
 
+// TODO locking: move this to the loop outside the lock guard once block groups have their own locks
 
 			// Add the scan for each block group in the list
 			for (int i = 0; i < BLOCK_GROUP_SEG_SIZE && bgnum < nblock_groups; ++bgnum, ++i) {
@@ -276,7 +286,8 @@ void RegisterSeqScan(HeapScanDesc scan) {
 				}
 
 				// Initialize the list element & push to the list
-				InitScanStatsEntry(scan_entry, id, s_data, bgnum);
+				InitScanStatsEntry(scan_entry, id, s_entry, bgnum);
+		// TODO locking: lock block group here!
 				slist_push_head(&bseg_cur->groups[i].scans_list, &scan_entry->slist);
 			}
 		}
@@ -342,7 +353,7 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 #endif // TRACE_PBM_PRINT_BLOCKMAP
 #endif // TRACE_PBM
 
-
+// ### remove from the blocks first if we change this to no use a map at all
 	// Remove the scan metadata from the map (grab a copy first)
 	LOCK_GUARD_V2(PbmScansLock, LW_EXCLUSIVE) {
 		const float alpha = 0.85f; // ### pick something else? move to configuration?
@@ -355,7 +366,7 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 		 * Note: the hash entry will be reused by next insert but this is safe
 		 * here since we have the lock.
 		 */
-		scanData = *search_scan(id, HASH_REMOVE, &found);
+		scanData = search_scan(id, HASH_REMOVE, &found)->data;
 		Assert(found);
 		stats = scanData.stats;
 
@@ -397,12 +408,15 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
 void ReportSeqScanPosition(HeapScanDescData *const scan, BlockNumber pos) {
 	const ScanId id = scan->scanId;
 	long curTime, elapsed;
-	ScanData *const entry = scan->pbmSharedScanData;
+	ScanHashEntry *const entry = scan->pbmSharedScanData;
 	BlockNumber blocks;
 	BlockNumber prevGroupPos, curGroupPos;
 	float speed;
 	BlockGroupHashKey bs_key;
-	SharedScanStats stats = entry->stats;
+	SharedScanStats stats;
+
+	Assert(entry != NULL);
+	stats = entry->data.stats;
 
 #ifdef TRACE_PBM
 	elog(LOG, "ReportSeqScanPosition (%lu)", id);
@@ -421,8 +435,8 @@ void ReportSeqScanPosition(HeapScanDescData *const scan, BlockNumber pos) {
 	prevGroupPos = BLOCK_GROUP(scan->pbmLocalScanStats.last_pos);
 	curGroupPos = BLOCK_GROUP(pos);
 	bs_key = (BlockGroupHashKey) {
-		.rnode = entry->tbl.rnode,
-		.forkNum = entry->tbl.forkNum,
+		.rnode = entry->data.tbl.rnode,
+		.forkNum = entry->data.tbl.forkNum,
 		.seg = BLOCK_GROUP_SEGMENT(prevGroupPos),
 	};
 
@@ -434,7 +448,7 @@ void ReportSeqScanPosition(HeapScanDescData *const scan, BlockNumber pos) {
 		blocks = pos - scan->pbmLocalScanStats.last_pos;
 	} else {
 		// looped around back to the start block
-		blocks = pos + entry->nblocks - scan->pbmLocalScanStats.last_pos;
+		blocks = pos + entry->data.nblocks - scan->pbmLocalScanStats.last_pos;
 	}
 	speed = (float)(blocks) / (float)(elapsed);
 // ### estimating speed: should do better than this. e.g. exponentially weighted average, or moving average.
@@ -443,7 +457,7 @@ void ReportSeqScanPosition(HeapScanDescData *const scan, BlockNumber pos) {
 	// update shared stats with a single assignment
 	stats.blocks_scanned += blocks;
 	stats.est_speed = speed;
-	entry->stats = stats;
+	entry->data.stats = stats;
 
 
 	PQ_RefreshRequestedBuckets();
@@ -458,7 +472,7 @@ void ReportSeqScanPosition(HeapScanDescData *const scan, BlockNumber pos) {
 				// First delete the start part
 				remove_scan_from_block_range(&bs_key, id, 0, curGroupPos);
 				// find last block
-				upper = BLOCK_GROUP(entry->nblocks);
+				upper = BLOCK_GROUP(entry->data.nblocks);
 			}
 
 			// Remove the scan from the blocks
@@ -726,8 +740,8 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
  *
  * Requires PqmScansLock to already be held as exclusive for insert/delete, at least shared for reads
  */
-ScanData * search_scan(const ScanId id, HASHACTION action, bool* foundPtr) {
-	return &((ScanHashEntry*)hash_search(pbm->ScanMap, &id, action, foundPtr))->data;
+ScanHashEntry * search_scan(const ScanId id, HASHACTION action, bool* foundPtr) {
+	return ((ScanHashEntry*)hash_search(pbm->ScanMap, &id, action, foundPtr));
 }
 
 
@@ -1111,7 +1125,7 @@ void remove_scan_from_block_range(BlockGroupHashKey *bs_key, const ScanId id, co
 	bs_key->seg = BLOCK_GROUP_SEGMENT(lo);
 	bs_entry = hash_search(pbm->BlockGroupMap, bs_key, HASH_FIND, &found);
 	Assert(found);
-
+// TODO locking for block groups!
 	// Loop over the linked hash map entries
 	for ( ; bs_entry != NULL; bs_entry = bs_entry->seg_next) {
 		// Loop over block groups in the entry
