@@ -18,16 +18,7 @@
 
 #include <time.h>
 
-
 // TODO! look for ### comments --- low-priority/later TODOs
-
-
-
-
-///-------------------------------------------------------------------------
-/// Structs and typedefs
-///-------------------------------------------------------------------------
-
 
 
 
@@ -61,7 +52,7 @@ static void list_all_buffers(void);
 static void sanity_check_verify_block_group_buffers(const BufferDesc * buf);
 
 // managing buffer priority
-static long ScanTimeToNextConsumption(const BlockGroupScanList * stats, bool * foundPtr);
+static long ScanTimeToNextConsumption(const BlockGroupScanList * bg_scan, bool * foundPtr);
 static long PageNextConsumption(BlockGroupData * stats, bool * requestedPtr);
 
 
@@ -76,14 +67,10 @@ static inline void RefreshBlockGroup(BlockGroupData * data);
 static inline void PQ_RefreshRequestedBuckets(void);
 static inline void remove_scan_from_block_range(BlockGroupHashKey * bs_key, ScanId id, uint32 lo, uint32 hi);
 
+
 ///-------------------------------------------------------------------------
 /// Initialization methods
 ///-------------------------------------------------------------------------
-
-///-------------------------------------------------------------------------
-/// PBM PQ public API
-///-------------------------------------------------------------------------
-
 
 // Initialization of shared data structures
 void InitPBM(void) {
@@ -132,12 +119,8 @@ void InitPBM(void) {
 	hash_flags = HASH_ELEM | HASH_BLOBS;
 	pbm->BlockGroupMap = ShmemInitHash("PBM block group stats", 1024, BlockGroupMapMaxSize, &hash_info, hash_flags);
 
-
 	// Priority queue
 	pbm->BlockQueue = InitPbmPQ();
-
-// ### other fields to be added...
-
 }
 
 // Estimate size of PBM (including all shared structures)
@@ -147,16 +130,12 @@ Size PbmShmemSize(void) {
 	size = add_size(size, hash_estimate_size(ScanMapMaxSize, sizeof(ScanHashEntry)));
 	size = add_size(size, hash_estimate_size(BlockGroupMapMaxSize, sizeof(BlockGroupHashEntry)));
 
-// ### total size estimate for the lists of block groups
-//	size = add_size(size, sizeof(BlockGroupData) * ???)
 // ### total size estimate of list of scans on each block group
 //	size = add_size(size, sizeof(BlockGroupScanList) * ???)
 	size = add_size(size, PbmPqShmemSize());
 
-// ### ADD SIZE ESTIMATES
 
-
-	// actually estimate the size later... for now assume 100 MiB will be enough (maybe increase this :)
+	// actually estimate the size later... for now assume 100 MiB will be enough
 	size = add_size(size, 100 << 6);
 	return size;
 }
@@ -234,7 +213,7 @@ void RegisterSeqScan(HeapScanDesc scan) {
 	};
 
 
-	// Register the scan with each buffer
+	/* Register the scan with each buffer */
 	LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
 		// For each segment, create entry in the buffer map if it doesn't exist already
 		bseg_prev = NULL;
@@ -310,9 +289,9 @@ void RegisterSeqScan(HeapScanDesc scan) {
 	 * block groups have separate concurrency control.
 	 */
 
-// ### calculate the PRIORITY of each block (group)!
-// (actually, what do we know other than the first one is needed immediately?)
-	// refresh the PQ first if needed, then insert each block into the queue
+	/* Insert each block group into the PQ if applicable */
+
+	// refresh the PQ first if needed
 	PQ_RefreshRequestedBuckets();
 
 	Assert(nblock_groups == 0 || NULL != bseg_first);
@@ -417,7 +396,6 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
  */
 void ReportSeqScanPosition(HeapScanDescData *const scan, BlockNumber pos) {
 	const ScanId id = scan->scanId;
-//	bool found;
 	long curTime, elapsed;
 	ScanData *const entry = scan->pbmSharedScanData;
 	BlockNumber blocks;
@@ -512,9 +490,9 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	}
 #endif // TRACE_PBM && TRACE_PBM_BUFFERS && TRACE_PBM_BUFFERS_NEW
 
-// ### make sure the buffer is not already in a block!
-// TODO should be an ASSERTION here!
-	RemoveBufFromBlock(buf);
+	// Buffer must not already be in a block group if it is new!
+	Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_prev);
+	Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_next);
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS) && defined(TRACE_PBM_BUFFERS_NEW)
 	elog(WARNING, "PbmNewBuffer added new buffer:" //"\n"
@@ -526,9 +504,8 @@ void PbmNewBuffer(BufferDesc * const buf) {
 
 	group = AddBufToBlockGroup(buf);
 
-	// stop here if there is no group
-// ### we should instead create the group!
-	if (group == NULL) return;
+	// There must be a group -- either it already existed or we created it.
+	Assert(group != NULL);
 	Assert(group->buffers_head == buf->buf_id);
 
 #ifdef SANITY_PBM_BUFFERS
@@ -557,13 +534,21 @@ void PbmNewBuffer(BufferDesc * const buf) {
 #endif // tracing
 #endif // SANITY_PBM_BUFFERS
 
+/*
+ * ### Consider doing this unconditionally.
+ * Pros: might get better estimates with more frequent updates
+ * Const: for seq scans: we're refreshing several times in a row uselessly, more overhead.
+ */
+	// Push the bucket to the PQ if it isn't already there
 	if (NULL == group->pq_bucket) {
 		RefreshBlockGroup(group);
 	}
 }
 
 
-// ### eventually want to get rid of this
+/*
+ * Notify the PBM when we *remove* a buffer to keep data structure up to date.
+ */
 inline void PbmOnEvictBuffer(struct BufferDesc *const buf) {
 #if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS) && defined(TRACE_PBM_BUFFERS_EVICT)
 	static int num_evicted = 0;
@@ -582,6 +567,7 @@ inline void PbmOnEvictBuffer(struct BufferDesc *const buf) {
 	sanity_check_verify_block_group_buffers(buf);
 #endif // SANITY_PBM_BUFFERS
 
+// TODO locking --- !
 // ### need to lock the block group? (worry about it later, this needs to change anyways...)
 // ### lock the PBM (shared) (?)
 	RemoveBufFromBlock(buf);
@@ -815,8 +801,7 @@ BlockGroupData * search_block_group(const BufferDesc *const buf, bool* foundPtr)
 	if (false == *foundPtr) {
 		return NULL;
 	} else {
-		uint32 i = bgroup % BLOCK_GROUP_SEG_SIZE;
-		return &bg_entry->groups[i];
+		return &bg_entry->groups[bgroup % BLOCK_GROUP_SEG_SIZE];
 	}
 }
 
@@ -916,7 +901,7 @@ long ScanTimeToNextConsumption(const BlockGroupScanList *const bg_scan, bool* fo
 	SharedScanStats stats;
 
 	LOCK_GUARD_V2(PbmScansLock, LW_SHARED) {
-// ### consider a local map caching the scans
+// ### consider a local map caching the scans... or have BlockGroupScanList store a ptr instead of ID!
 		s_data = search_scan(id, HASH_FIND, foundPtr);
 	}
 
@@ -944,7 +929,7 @@ long PageNextConsumption(BlockGroupData *const stats, bool *requestedPtr) {
 	bool found = false;
 	slist_iter iter;
 
-// ### lock the entry in some way?
+// TODO locking --- lock the entry in some way?
 
 	*requestedPtr = false;
 
@@ -1040,7 +1025,7 @@ BlockGroupData * AddBufToBlockGroup(BufferDesc *const buf) {
 	group = search_or_create_block_group(buf);
 	Assert(group != NULL);
 
-// ### lock the block group?
+// TODO locking -- lock the block group?
 
 	// Link the buffer into the block group chain of buffers
 	group_head = group->buffers_head;
@@ -1066,6 +1051,10 @@ long get_timeslice(void) {
 	return ns_to_timeslice(get_time_ns());
 }
 
+/*
+ * Remove a buffer from its block group, and if the block group is now empty
+ * remove it from the PQ as well.
+ */
 static inline
 void RemoveBufFromBlock(BufferDesc *const buf) {
 	int next, prev;
@@ -1080,8 +1069,8 @@ void RemoveBufFromBlock(BufferDesc *const buf) {
 
 	next = buf->pbm_bgroup_next;
 	prev = buf->pbm_bgroup_prev;
-	// unlink first if needed
 
+	// unlink first if needed
 	if (next != FREENEXT_END_OF_LIST) {
 		GetBufferDescriptor(next)->pbm_bgroup_prev = prev;
 	}
@@ -1092,7 +1081,6 @@ void RemoveBufFromBlock(BufferDesc *const buf) {
 // ### some way to optimize this?? maybe using pointers instead of indexes?
 		bool found;
 		BlockGroupData * group = search_block_group(buf, &found);
-// ### lock the group! (need to do this anyways!)
 		Assert(found);
 		group->buffers_head = next;
 
@@ -1193,7 +1181,7 @@ void PQ_RefreshRequestedBuckets(void) {
 }
 
 
-/// Shift buckets in the PBM PQ as necesary IF the lock can be acquired immediately.
+/// Shift buckets in the PBM PQ as necessary IF the lock can be acquired immediately.
 /// If someone else is actively using the queue for anything, then do nothing.
 void PBM_TryRefreshRequestedBuckets(void) {
 	long ts = get_timeslice();

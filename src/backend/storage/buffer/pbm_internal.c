@@ -138,7 +138,6 @@ static unsigned int PQ_time_to_bucket(const PbmPQ *const pq, const long ts) {
 	const size_t bucket_num = group_first_bucket_idx + (ts - group_start_timeslice) / bucket_width;
 
 	// Return a sentinel when it is out of range.
-	// ### we could make this the caller's responsibility instead
 	if (bucket_num >= PQ_NumBuckets) {
 		return PQ_BucketOutOfRange;
 	}

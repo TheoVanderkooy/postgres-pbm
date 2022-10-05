@@ -13,7 +13,7 @@
 /*
  * What eviction implementation to use:
  *  0: existing clock algorithm w/ "strategies" (default if USE_PBM is disabled)
- *  1: first implementation with only 1 block at a time
+ *  1: first implementation with only 1 block at a time (might not work anymore!)
  *  2: method that puts still-valid blocks on the free list and lets the normal
  *     mechanism try multiple times to get from the free list
  */

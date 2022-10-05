@@ -61,7 +61,7 @@ static const int64_t PQ_TimeSlice = 100 * NS_PER_MS;
 /// Helper to make sure locks get freed
 /// NOTE: do NOT `return` or `break` from inside the lock guard (break inside nested loop is OK), the lock won't be released.
 /// `continue` from the lock guard is OK, will go to the end.
-/// `_lock_acquired_immediately` is the return value of the LWLockAcquire call
+/// `var` holds the return value of the LWLockAcquire call
 #define LOCK_GUARD_WITH_RES(var, lock, mode) \
   for ( \
     bool (_c ## var) = true, pg_attribute_unused() (var) = LWLockAcquire((lock), (mode)); \
@@ -69,7 +69,6 @@ static const int64_t PQ_TimeSlice = 100 * NS_PER_MS;
     LWLockRelease((lock)), (_c ## var) = false)
 #define LOCK_GUARD_V2(lock, mode) \
   LOCK_GUARD_WITH_RES(_ignore_, lock, mode)
-#define EXIT_LOCK_SCOPE continue
 
 /// Group blocks by ID to reduce the amount of metadata required
 #define BLOCK_GROUP(block) ((block) >> BLOCK_GROUP_SHIFT)
@@ -145,9 +144,7 @@ typedef struct BlockGroupScanList {
 	ScanId		scan_id;
 	BlockNumber	blocks_behind;
 
-// TODO consider another list here from the ScanData to reduce lookups needed?
-// TODO consider a pointer to the scan data to reduce hash lookups
-// TODO ^ actually, can just replace the scan_id entirely with the pointer..... why do we need a map at all??
+// TODO replace scan_id with ptr to hash entry...
 
 	// Next item in the list
 	slist_node slist;
