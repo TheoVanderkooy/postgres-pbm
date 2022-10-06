@@ -16,7 +16,7 @@
 #define NS_PER_SEC 	(1000 * NS_PER_MS) 	// 10^9 ns per second
 
 // ### consider different "AccessTimeNotRequested", and also whether this should be signed or not
-static const long AccessTimeNotRequested = 0;
+static const unsigned long AccessTimeNotRequested = (unsigned long)(-1l);
 static const unsigned int PQ_BucketOutOfRange = (unsigned int)(-1);
 
 ///-------------------------------------------------------------------------
@@ -38,7 +38,7 @@ static const long BlockGroupMapMaxSize = (1 << 16);
 static const int PQ_NumBucketGroups = 10;
 static const int PQ_NumBucketsPerGroup = 5;
 static const int PQ_NumBuckets = PQ_NumBucketGroups * PQ_NumBucketsPerGroup;
-static const int64_t PQ_TimeSlice = 100 * NS_PER_MS;
+static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 
 /*
  * Whether tp use spinlocks or LWLocks for PBM PQ buckets.
@@ -104,7 +104,7 @@ static const int64_t PQ_TimeSlice = 100 * NS_PER_MS;
 #define BLOCK_GROUP_SEGMENT(group) ((group) >> LOG_BLOCK_GROUP_SEG_SIZE)
 
 /// Convert a timestamp in ns to the corresponding timeslice in the PQ
-static inline long ns_to_timeslice(long t) {
+static inline unsigned long ns_to_timeslice(unsigned long t) {
 	return t / PQ_TimeSlice;
 }
 
@@ -335,8 +335,8 @@ extern struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * but_state);
 ///-------------------------------------------------------------------------
 /// Helpers
 ///-------------------------------------------------------------------------
-extern long get_time_ns(void);
-extern long get_timeslice(void);
+extern unsigned long get_time_ns(void);
+extern unsigned long get_timeslice(void);
 
 
 #endif //POSTGRESQL_PBM_INTERNAL_H

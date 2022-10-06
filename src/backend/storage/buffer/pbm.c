@@ -52,8 +52,8 @@ static void list_all_buffers(void);
 static void sanity_check_verify_block_group_buffers(const BufferDesc * buf);
 
 // managing buffer priority
-static inline long ScanTimeToNextConsumption(const BlockGroupScanList * bg_scan);
-static long PageNextConsumption(BlockGroupData * bgdata, bool * requestedPtr);
+static inline unsigned long ScanTimeToNextConsumption(const BlockGroupScanList * bg_scan);
+static unsigned long PageNextConsumption(BlockGroupData *const bgdata, bool * requestedPtr);
 
 
 /// Inline private helpers
@@ -416,7 +416,7 @@ void UnregisterSeqScan(struct HeapScanDescData *scan) {
  */
 void ReportSeqScanPosition(HeapScanDescData *const scan, BlockNumber pos) {
 	const ScanId id = scan->scanId;
-	long curTime, elapsed;
+	unsigned long curTime, elapsed;
 	ScanHashEntry *const entry = scan->pbmSharedScanData;
 	BlockNumber blocks;
 	BlockNumber prevGroupPos, curGroupPos;
@@ -719,8 +719,8 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 			.rnode = buf->tag.rnode,
 			.forkNum = buf->tag.forkNum,
 	};
-	long next_access_time = AccessTimeNotRequested;
-	long now = get_time_ns();
+	unsigned long next_access_time = AccessTimeNotRequested;
+	unsigned long now = get_time_ns();
 
 	BlockGroupData *const block_scans = search_block_group(buf, &found);
 	if (true == found) {
@@ -959,7 +959,7 @@ void debug_log_buffers_map(void) {
 /*
  * Estimate the next access time of a block group based on the scan progress.
  */
-long ScanTimeToNextConsumption(const BlockGroupScanList *const bg_scan) {
+unsigned long ScanTimeToNextConsumption(const BlockGroupScanList *const bg_scan) {
 	ScanHashEntry * s_data = bg_scan->scan_entry;
 	const BlockNumber blocks_behind = GROUP_TO_FIRST_BLOCK(bg_scan->blocks_behind);
 	BlockNumber blocks_remaining;
@@ -981,13 +981,11 @@ long ScanTimeToNextConsumption(const BlockGroupScanList *const bg_scan) {
 	}
 
 	res = (long)((float)blocks_remaining / stats.est_speed);
-
-	// don't return `AccessTimeNotRequested`
-	return (AccessTimeNotRequested == res ? 1 : res);
+	return res;
 }
 
-long PageNextConsumption(BlockGroupData *const bgdata, bool *requestedPtr) {
-	long min_next_access = -1;
+unsigned long PageNextConsumption(BlockGroupData *const bgdata, bool *requestedPtr) {
+	unsigned long min_next_access = AccessTimeNotRequested;
 	slist_iter iter;
 
 	Assert(bgdata != NULL);
@@ -1008,7 +1006,7 @@ long PageNextConsumption(BlockGroupData *const bgdata, bool *requestedPtr) {
 	slist_foreach(iter, &bgdata->scans_list) {
 		BlockGroupScanList * it = slist_container(BlockGroupScanList, slist, iter.cur);
 
-		const long time_to_next_access = ScanTimeToNextConsumption(it);
+		const unsigned long time_to_next_access = ScanTimeToNextConsumption(it);
 
 		if (time_to_next_access != AccessTimeNotRequested
 				&& time_to_next_access < min_next_access) {
@@ -1023,6 +1021,7 @@ long PageNextConsumption(BlockGroupData *const bgdata, bool *requestedPtr) {
 	if (false == *requestedPtr) {
 		return AccessTimeNotRequested;
 	} else {
+		Assert(min_next_access != AccessTimeNotRequested);
 		return get_time_ns() + min_next_access;
 	}
 }
@@ -1116,14 +1115,14 @@ BlockGroupData * AddBufToBlockGroup(BufferDesc *const buf) {
 	return group;
 }
 
-long get_time_ns(void) {
+unsigned long get_time_ns(void) {
 	struct timespec now;
 	clock_gettime(PBM_CLOCK, &now);
 
 	return NS_PER_SEC * (now.tv_sec - pbm->start_time_sec) + now.tv_nsec;
 }
 
-long get_timeslice(void) {
+unsigned long get_timeslice(void) {
 	return ns_to_timeslice(get_time_ns());
 }
 

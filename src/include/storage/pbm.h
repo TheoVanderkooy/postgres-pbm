@@ -43,7 +43,7 @@ typedef size_t ScanId;
 
 // Store scan statistics locally when they don't need to be read by other processes
 struct PBM_LocalScanStats{
-	long last_report_time;
+	unsigned long last_report_time;
 	BlockNumber	last_pos;
 };
 
