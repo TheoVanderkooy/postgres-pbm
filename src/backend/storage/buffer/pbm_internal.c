@@ -464,7 +464,7 @@ void pq_bucket_unlock(PbmPQBucket * bucket) {
 
 
 static inline uint32 pq_bucket_get_null_lock_idx(BlockGroupData * data) {
-	uint32 k = (uint32) ((size_t)(data) / sizeof(BlockGroupData));
+	uint32 k = (uint32) ( (size_t)(data) / (8*sizeof(BlockGroupData)) );
 	// ### consider simpler hash function
 	return hash_bytes_uint32(k) % PQ_NUM_NULL_BUCKETS;
 }

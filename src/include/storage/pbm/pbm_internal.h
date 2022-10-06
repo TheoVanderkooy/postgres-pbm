@@ -15,6 +15,7 @@
 #define NS_PER_MS 	(1000 * 1000)		// 10^6 ns per millisecond
 #define NS_PER_SEC 	(1000 * NS_PER_MS) 	// 10^9 ns per second
 
+// ### consider different "AccessTimeNotRequested", and also whether this should be signed or not
 static const long AccessTimeNotRequested = 0;
 static const unsigned int PQ_BucketOutOfRange = (unsigned int)(-1);
 
@@ -45,19 +46,37 @@ static const int64_t PQ_TimeSlice = 100 * NS_PER_MS;
  */
 #define PBM_PQ_BUCKETS_USE_SPINLOCK
 
+
+/*
+ * What method of locking should be used for block groups.
+ * 0: a single LWLock for each block group
+ * 1: a single spinlock for each block group
+ * 2: a separate spin lock for the scans list and buffers list
+ * consider: a separate fixed set of locks instead of one per group
+ * 	- less memory, and there are only so many locks we might by trying to use at once anyways!
+ * 	- however gives a chance of "collision" when multiple groups are trying to be accessed with the same lock
+ */
+#define PBM_BG_LOCK_MODE_LWLOCK 0
+#define PBM_BG_LOCK_MODE_SINGLE_SPIN 1
+#define PBM_BG_LOCK_MODE_DOUBLE_SPIN 2
+//#define PBM_BG_LOCK_MODE PBM_BG_LOCK_MODE_LWLOCK
+//#define PBM_BG_LOCK_MODE PBM_BG_LOCK_MODE_SINGLE_SPIN
+#define PBM_BG_LOCK_MODE PBM_BG_LOCK_MODE_DOUBLE_SPIN
+
+
 /// Debugging flags
-#define TRACE_PBM
+//#define TRACE_PBM
 //#define TRACE_PBM_REPORT_PROGRESS
 //#define TRACE_PBM_PRINT_SCANMAP
 //#define TRACE_PBM_PRINT_BLOCKMAP
 //#define TRACE_PBM_BUFFERS
 //#define TRACE_PBM_BUFFERS_NEW
 //#define TRACE_PBM_BUFFERS_EVICT
-#define TRACE_PBM_PQ_REFRESH
-#define TRACE_PBM_EVICT
+//#define TRACE_PBM_PQ_REFRESH
+//#define TRACE_PBM_EVICT
 
 //#define SANITY_PBM_BUFFERS
-#define SANITY_PBM_BLOCK_GROUPS
+//#define SANITY_PBM_BLOCK_GROUPS
 
 
 ///-------------------------------------------------------------------------
@@ -73,8 +92,7 @@ static const int64_t PQ_TimeSlice = 100 * NS_PER_MS;
     bool (_c ## var) = true, pg_attribute_unused() (var) = LWLockAcquire((lock), (mode)); \
   	(_c ## var); \
     LWLockRelease((lock)), (_c ## var) = false)
-#define LOCK_GUARD_V2(lock, mode) \
-  LOCK_GUARD_WITH_RES(_ignore_, lock, mode)
+#define LOCK_GUARD_V2(lock, mode) LOCK_GUARD_WITH_RES(_ignore_, lock, mode)
 
 /// Group blocks by ID to reduce the amount of metadata required
 #define BLOCK_GROUP(block) ((block) >> BLOCK_GROUP_SHIFT)
@@ -147,8 +165,9 @@ typedef struct PBM_ScanHashEntry {
 // Info about a scan for the block group. (linked list)
 typedef struct BlockGroupScanList {
 	// Info about the current scan
-	ScanId		scan_id;
-	BlockNumber	blocks_behind;
+	ScanId			scan_id;
+	ScanHashEntry *	scan_entry;
+	BlockNumber		blocks_behind;
 
 // TODO replace scan_id with ptr to hash entry...
 
@@ -158,7 +177,17 @@ typedef struct BlockGroupScanList {
 
 // Record data for this block group.
 typedef struct BlockGroupData {
-// ### some kind of lock?
+	// Locks for the below data structures
+#if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK
+	LWLock lock;
+#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_SINGLE_SPIN
+	slock_t slock;
+#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
+	slock_t scan_lock;
+	slock_t buf_lock;
+#else
+#error "unknown block group lock mode"
+#endif // PBM_BG_LOCK_MODE
 
 	// Set of scans which care about this block group
 	slist_head scans_list;
@@ -166,7 +195,6 @@ typedef struct BlockGroupData {
 	// Set of (### unpinned?) buffers holding data in this block group
 	int buffers_head;
 
-// TODO locking: if block group is locked maybe this doesn't need to be volatile.
 	// Linked-list in PQ buckets
 	struct PbmPQBucket *volatile pq_bucket;
 	dlist_node blist;
