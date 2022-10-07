@@ -7,7 +7,6 @@
 
 #include "miscadmin.h"
 #include "storage/shmem.h"
-#include "storage/lwlock.h"
 
 #include "storage/buf_internals.h"
 #include "common/hashfn.h"
@@ -19,7 +18,7 @@
 /// Forward declarations
 ///-------------------------------------------------------------------------
 
-static unsigned int PQ_time_to_bucket(const PbmPQ * pq, long t);
+static unsigned int PQ_time_to_bucket(const PbmPQ * pq, unsigned long ts);
 
 ///-------------------------------------------------------------------------
 /// Inline private helper functions
@@ -28,8 +27,9 @@ static unsigned int PQ_time_to_bucket(const PbmPQ * pq, long t);
 static inline void pq_bucket_lock(PbmPQBucket * bucket);
 static inline void pq_bucket_unlock(PbmPQBucket * bucket);
 
-static inline void pq_bucket_null_lock(BlockGroupData * data);
-static inline void pq_bucket_null_unlock(BlockGroupData * data);
+static inline uint32 pq_bucket_get_null_lock_idx(BlockGroupData * data);
+static inline void pq_bucket_null_lock(uint32 lock_idx);
+static inline void pq_bucket_null_unlock(uint32 lock_idx);
 
 static inline void pq_bucket_lock_two(PbmPQBucket * b1, PbmPQBucket * b2);
 static inline void pq_bucket_unlock_two(PbmPQBucket * b1, PbmPQBucket * b2);
@@ -43,10 +43,10 @@ static inline long bucket_group_width(unsigned int group) {
 	return (1l << group);
 }
 
-/// With of buckets in the given bucket group in nanoseconds
-static inline long bucket_group_time_width(unsigned int group) {
-	return bucket_group_width(group) * PQ_TimeSlice;
-}
+///// With of buckets in the given bucket group in nanoseconds
+//static inline unsigned long bucket_group_time_width(unsigned int group) {
+//	return bucket_group_width(group) * PQ_TimeSlice;
+//}
 
 /// floor(log_2(x)) for long values x
 static inline unsigned int floor_llogb(unsigned long x) {
@@ -114,9 +114,9 @@ Size PbmPqShmemSize(void) {
 
 /// determine the bucket index for the given time
 /// `ts` is time *slice*, not in ns
-static unsigned int PQ_time_to_bucket(const PbmPQ *const pq, const long ts) {
+static unsigned int PQ_time_to_bucket(const PbmPQ *const pq, const unsigned long ts) {
 	// Use "time slice" instead of NS for calculations
-	const long first_bucket_timeslice = pq->last_shifted_time_slice;
+	const unsigned long first_bucket_timeslice = pq->last_shifted_time_slice;
 
 	// Special case of things that should already have happened
 	if (ts <= first_bucket_timeslice) {
@@ -124,30 +124,33 @@ static unsigned int PQ_time_to_bucket(const PbmPQ *const pq, const long ts) {
 		return 0;
 	}
 
-	// Calculate offset from the start of the time range of interest
-	const unsigned long delta_ts = ts - first_bucket_timeslice;
+	{
+		// Calculate offset from the start of the time range of interest
+		const unsigned long delta_ts = ts - first_bucket_timeslice;
 
-	// Calculate the bucket *group* this bucket belongs to
-	const unsigned int b_group = floor_llogb(1l + delta_ts / PQ_NumBucketsPerGroup);
+		// Calculate the bucket *group* this bucket belongs to
+		const unsigned int b_group = floor_llogb(1l + delta_ts / PQ_NumBucketsPerGroup);
 
-	// Calculate start time of first bucket in the group
-	const unsigned long group_start_timeslice = first_bucket_timeslice + ((1l << b_group) - 1) * PQ_NumBucketsPerGroup;
+		// Calculate start time of first bucket in the group
+		const unsigned long group_start_timeslice =
+				first_bucket_timeslice + ((1l << b_group) - 1) * PQ_NumBucketsPerGroup;
 
-	// Calculate index of first bucket in the group
-	const unsigned long group_first_bucket_idx = b_group * PQ_NumBucketsPerGroup;
+		// Calculate index of first bucket in the group
+		const unsigned long group_first_bucket_idx = b_group * PQ_NumBucketsPerGroup;
 
-	// Calculate width of a bucket within this group:
-	const unsigned long bucket_width = bucket_group_width(b_group);
+		// Calculate width of a bucket within this group:
+		const unsigned long bucket_width = bucket_group_width(b_group);
 
-	// (t - group_start_time) / bucket_width gives the bucket index *within the group*, then add the bucket index of the first one in the group to get the global bucket index
-	const size_t bucket_num = group_first_bucket_idx + (ts - group_start_timeslice) / bucket_width;
+		// (t - group_start_time) / bucket_width gives the bucket index *within the group*, then add the bucket index of the first one in the group to get the global bucket index
+		const size_t bucket_num = group_first_bucket_idx + (ts - group_start_timeslice) / bucket_width;
 
-	// Return a sentinel when it is out of range.
-	if (bucket_num >= PQ_NumBuckets) {
-		return PQ_BucketOutOfRange;
+		// Return a sentinel when it is out of range.
+		if (bucket_num >= PQ_NumBuckets) {
+			return PQ_BucketOutOfRange;
+		}
+
+		return bucket_num;
 	}
-
-	return bucket_num;
 }
 
 
@@ -158,10 +161,10 @@ static unsigned int PQ_time_to_bucket(const PbmPQ *const pq, const long ts) {
 /// Shifts the buckets in the PQ if necessary.
 /// Assumes the PQ is *already* locked!
 /// `ts` is current time *slice*
-bool PQ_ShiftBucketsWithLock(const long ts) {
+bool PQ_ShiftBucketsWithLock(unsigned long ts) {
 	PbmPQ *const pq = pbm->BlockQueue;
-	const long last_shift_ts = pq->last_shifted_time_slice;
-	const long new_shift_ts = last_shift_ts + 1;
+	const unsigned long last_shift_ts = pq->last_shifted_time_slice;
+	const unsigned long new_shift_ts = last_shift_ts + 1;
 	PbmPQBucket *spare;
 
 	// Once we have the lock, re-check whether shifting is needed
@@ -222,11 +225,12 @@ bool PQ_CheckEmpty(void) {
  * Requires that the block group has buffers and belong in the PQ (otherwise,
  * just call remove instead).
  */
-void PQ_RefreshBlockGroup(BlockGroupData *const block_group, const long t, bool requested) {
+void PQ_RefreshBlockGroup(BlockGroupData *block_group, unsigned long t, bool requested) {
 	PbmPQ *const pq = pbm->BlockQueue;
 	unsigned int i;
 	PbmPQBucket * bucket;
 	PbmPQBucket * removed_from;
+	uint32 nlock_idx = PQ_NUM_NULL_BUCKETS;
 
 	LOCK_GUARD_V2(PbmPqBucketsLock, LW_SHARED) {
 		// Get the appropriate bucket index
@@ -242,7 +246,6 @@ void PQ_RefreshBlockGroup(BlockGroupData *const block_group, const long t, bool 
 		} else {
 			bucket = pq->buckets[i];
 		}
-
 
 		/*
 		 * Move it to the new bucket. This requires a loop.
@@ -265,20 +268,33 @@ void PQ_RefreshBlockGroup(BlockGroupData *const block_group, const long t, bool 
 				 */
 
 				// Acquire NULL lock when dealing with a new bucket
-				pq_bucket_null_lock(block_group);
+				if (nlock_idx >= PQ_NUM_NULL_BUCKETS) {
+					nlock_idx = pq_bucket_get_null_lock_idx(block_group);
+				}
+				pq_bucket_null_lock(nlock_idx);
 
-				// Someone removed it before we got the lock, try again
-				if (removed_from != block_group->pq_bucket) {
-					pq_bucket_null_unlock(block_group);
+				// Someone moved it before we got the lock, try again
+				if (NULL != block_group->pq_bucket) {
+					pq_bucket_null_unlock(nlock_idx);
 					continue;
 				}
 
-				// Insert into new bucket
-				pq_bucket_lock(bucket);
-				pq_bucket_push_back_locked(bucket, block_group);
+				/* Check that the bucket still has buffers before moving it into
+				 * a bucket if it previously wasn't in a bucket.
+				 */
+				bg_lock_buffers(block_group, LW_SHARED);
+				if (FREENEXT_END_OF_LIST == block_group->buffers_head) {
+					// NO BUFFERS in the block group, leave it in the "null" bucket!
+					// Note: in this case we don't try again, it is in the right spot.
+				} else {
+					// Insert into new bucket
+					pq_bucket_lock(bucket);
+					pq_bucket_push_back_locked(bucket, block_group);
+				}
 
 				// Release the locks
-				pq_bucket_null_unlock(block_group);
+				bg_unlock_buffers(block_group);
+				pq_bucket_null_unlock(nlock_idx);
 				pq_bucket_unlock(bucket);
 			} else {
 				/* Currently in a bucket, need to lock both.
@@ -368,7 +384,7 @@ void pq_bucket_prepend_range(PbmPQBucket *bucket, PbmPQBucket *other) {
  * Remove the block group from its bucket, assuming the bucket itself is already locked.
  *
  * Does NOT change the pq_bucket pointer here! This must either be set to a new
- * bucket, or NULL explicitly.
+ * bucket, or NULL explicitly by the caller.
  */
 static inline
 void pq_bucket_remove_locked(BlockGroupData *const block_group) {
@@ -380,45 +396,89 @@ void pq_bucket_remove_locked(BlockGroupData *const block_group) {
 
 /// Remove the specified block group from the PBM PQ
 void PQ_RemoveBlockGroup(BlockGroupData *const block_group) {
+	PbmPQBucket * removed_from = block_group->pq_bucket;
+	uint32 nlock_idx;
+
+
+	/* LOCKING:
+	 *  - We do NOT need the shared buckets lock here - we don't care if buckets
+	 *    get moved around since we are not inserting.
+	 *  - However, it COULD be moved by refresh buckets if it is in bucket[0]
+	 *    even with no buffers, so we need to check! (unless we are OK with a
+	 *    few empty block groups staying in the PQ, which is probably NBD...)
+	 *  - Note: we could just take the shared lock instead for safety, but I don't
+	 *    think it is needed
+	 */
 
 	// Nothing to do if not in a bucket
-	if (NULL == block_group->pq_bucket) {
+	if (NULL == removed_from) {
 		return;
 	}
 
-// ### locking: we might be able to only to lock the bucket, not the whole list (take shared lock anyways for safety)
-	LOCK_GUARD_V2(PbmPqBucketsLock, LW_SHARED) {
-		PbmPQBucket * removed_from = block_group->pq_bucket;
+	/*
+	 * Lock the NULL bucket first. Need to lock this to prevent someone from
+	 * inserting it into something else while we are removing it.
+	 */
+	nlock_idx = pq_bucket_get_null_lock_idx(block_group);
+	pq_bucket_null_lock(nlock_idx);
+	if (NULL == block_group->pq_bucket) {
+		// Check again if it was deleted while we acquired the lock
+		pq_bucket_null_unlock(nlock_idx);
+		return;
+	}
 
-//		// Lock the bucket to be removed from
-//		for (;;) {
-//			removed_from = block_group->pq_bucket;
-//			pq_bucket_lock(removed_from);
-//
-//			// Need to make sure it didn't change
-//			if (removed_from == block_group->pq_bucket) break;
-//
-//			// Otherwise retry
-//			pq_bucket_unlock(removed_from);
-//		}
+/* ### we could also just assume that moved -> someone added something to it.
+ * Edge case: gets moved by refresh between removing the buffer and here, but
+ * then the next time the block group is non-empty it will get fixed. Not a big
+ * deal if a few empty block groups stays in the PQ.
+ */
 
-// TODO locking: I'm not sure if this is safe -- make sure we have the block_group locked first!
+	// Lock the bucket to be removed from -- retry if it changes for safety!
+	for (;;) {
+		removed_from = block_group->pq_bucket;
+
+		// Somehow got deleted concurrently, we can stop... This should be impossible though!
+		if (NULL == removed_from) {
+			pq_bucket_null_unlock(nlock_idx);
+
+			elog(WARNING, "Block group got removed from bucket while we had null bucket locked...");
+			return;
+		}
+
 		pq_bucket_lock(removed_from);
 
-		if (removed_from != block_group->pq_bucket) {
-			// TODO someone moved it while we got the lock... assume we don't need to do anything?
+		// Need to make sure it didn't change
+		if (removed_from == block_group->pq_bucket) break;
 
-			// I guess don't do anything?
+		// Otherwise retry
+		pq_bucket_unlock(removed_from);
 
-			pq_bucket_unlock(removed_from);
-			elog(WARNING, "Block group moved to a different bucket while we were waiting to remove it!");
-		} else {
-			pq_bucket_remove_locked(block_group);
-			block_group->pq_bucket = NULL;
-
-			pq_bucket_unlock(removed_from);
-		}
+		elog(WARNING, "Block group moved to a different bucket while trying to remove it!");
 	}
+
+	/*
+	 * We have both current bucket and "null" bucket locked. Make sure nobody
+	 * added a buffer while we were getting locks! If so we don't need to
+	 * remove anymore, so stop.
+	 *
+	 * Not sure if necessary, but lock the block group buffers list while we
+	 * remove to make this atomic w.r.t. other add/remove ops...
+	 *
+	 * ### revisit if this is necessary!
+	 */
+	bg_lock_buffers(block_group, LW_SHARED);
+	if (FREENEXT_END_OF_LIST == block_group->buffers_head) {
+		/* Remove from the bucket */
+		pq_bucket_remove_locked(block_group);
+		block_group->pq_bucket = NULL;
+	} else {
+		/* If there is a buffer now, do nothing. */
+	}
+
+	// Unlock
+	bg_unlock_buffers(block_group);
+	pq_bucket_null_unlock(nlock_idx);
+	pq_bucket_unlock(removed_from);
 }
 
 
@@ -469,8 +529,7 @@ static inline uint32 pq_bucket_get_null_lock_idx(BlockGroupData * data) {
 	return hash_bytes_uint32(k) % PQ_NUM_NULL_BUCKETS;
 }
 
-static inline void pq_bucket_null_lock(BlockGroupData * data) {
-	uint32 lock_idx = pq_bucket_get_null_lock_idx(data);
+static inline void pq_bucket_null_lock(uint32 lock_idx) {
 #ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
 	SpinLockAcquire(&pbm->BlockQueue->null_bucket_locks[lock_idx]);
 #else
@@ -478,8 +537,7 @@ static inline void pq_bucket_null_lock(BlockGroupData * data) {
 #endif // PBM_PQ_BUCKETS_USE_SPINLOCK
 }
 
-static inline void pq_bucket_null_unlock(BlockGroupData * data) {
-	uint32 lock_idx = pq_bucket_get_null_lock_idx(data);
+static inline void pq_bucket_null_unlock(uint32 lock_idx) {
 #ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
 	SpinLockRelease(&pbm->BlockQueue->null_bucket_locks[lock_idx]);
 #else

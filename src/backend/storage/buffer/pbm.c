@@ -10,7 +10,6 @@
 #include "miscadmin.h"
 #include "lib/stringinfo.h"
 #include "storage/shmem.h"
-#include "storage/lwlock.h"
 
 // included last to avoid IDE complaining about unused imports...
 #include "storage/buf_internals.h"
@@ -41,19 +40,25 @@ static bool DeleteScanFromGroup(ScanId id, BlockGroupData * groupData);
 static BlockGroupData * AddBufToBlockGroup(BufferDesc * buf);
 
 // debugging
+#ifdef TRACE_PBM_PRINT_SCANMAP
 static void debug_append_scan_data(StringInfoData* str, ScanHashEntry* entry);
 static void debug_log_scan_map(void);
+#endif
 //static void debug_append_buffer_data(StringInfoData * str, BlockGroupHashEntry * entry);
 //static void debug_log_buffers_map(void);
+#ifdef TRACE_PBM_BUFFERS
 static void debug_buffer_access(BufferDesc* buf, char* msg);
+#endif
+#ifdef SANITY_PBM_BUFFERS
 static void list_all_buffers(void);
 
 // sanity checks
 static void sanity_check_verify_block_group_buffers(const BufferDesc * buf);
+#endif
 
 // managing buffer priority
 static inline unsigned long ScanTimeToNextConsumption(const BlockGroupScanList * bg_scan);
-static unsigned long PageNextConsumption(BlockGroupData *const bgdata, bool * requestedPtr);
+static unsigned long PageNextConsumption(BlockGroupData * bgdata, bool * requestedPtr);
 
 
 /// Inline private helpers
@@ -68,11 +73,6 @@ static inline void PQ_RefreshRequestedBuckets(void);
 static inline void remove_scan_from_block_range(BlockGroupHashKey * bs_key, ScanId id, uint32 lo, uint32 hi);
 
 
-/// Block group locking
-static inline void bg_lock_scans(BlockGroupData * bg, LWLockMode mode);
-static inline void bg_unlock_scans(BlockGroupData * bg);
-static inline void bg_lock_buffers(BlockGroupData * bg, LWLockMode mode);
-static inline void bg_unlock_buffers(BlockGroupData * bg);
 
 
 ///-------------------------------------------------------------------------
@@ -225,7 +225,6 @@ void RegisterSeqScan(HeapScanDesc scan) {
 		// For each segment, create entry in the buffer map if it doesn't exist already
 		bseg_prev = NULL;
 		bseg_first = NULL;
-		bgnum = 0;
 		for (BlockNumber seg = 0; seg < nblock_segs; ++seg) {
 			bgkey.seg = seg;
 
@@ -590,9 +589,6 @@ inline void PbmOnEvictBuffer(struct BufferDesc *const buf) {
 	sanity_check_verify_block_group_buffers(buf);
 #endif // SANITY_PBM_BUFFERS
 
-// TODO locking --- !
-// ### need to lock the block group? (worry about it later, this needs to change anyways...)
-// ### lock the PBM (shared) (?)
 	RemoveBufFromBlock(buf);
 }
 
@@ -621,6 +617,7 @@ BlockGroupScanList * try_get_BlockGroupScanList(void) {
 	return ret;
 }
 
+#ifdef SANITY_PBM_BUFFERS
 void sanity_check_verify_block_group_buffers(const BufferDesc * const buf) {
 	const RelFileNode rnode = buf->tag.rnode;
 	const ForkNumber  fork = buf->tag.forkNum;
@@ -709,7 +706,9 @@ void list_all_buffers(void) {
 		}
 	}
 }
+#endif // SANITY_PBM_BUFFERS
 
+#ifdef TRACE_PBM_BUFFERS
 void debug_buffer_access(BufferDesc* buf, char* msg) {
 	bool found, requested;
 	char* msg2;
@@ -743,48 +742,7 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 		 next_access_time
 	);
 }
-
-
-static inline void bg_lock_scans(BlockGroupData * bg, LWLockMode mode) {
-#if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK
-	LWLockAcquire(&bg->lock, mode);
-#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_SINGLE_SPIN
-	SpinLockAcquire(&bg->slock);
-#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
-	SpinLockAcquire(&bg->scan_lock);
-#endif // PBM_BG_LOCK_MODE
-}
-
-static inline void bg_unlock_scans(BlockGroupData * bg) {
-#if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK
-	LWLockRelease(&bg->lock);
-#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_SINGLE_SPIN
-	SpinLockRelease(&bg->slock);
-#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
-	SpinLockRelease(&bg->scan_lock);
-#endif // PBM_BG_LOCK_MODE
-}
-
-static inline void bg_lock_buffers(BlockGroupData * bg, LWLockMode mode) {
-#if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK
-	LWLockAcquire(&bg->lock, mode);
-#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_SINGLE_SPIN
-	SpinLockAcquire(&bg->slock);
-#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
-	SpinLockAcquire(&bg->buf_lock);
-#endif // PBM_BG_LOCK_MODE
-}
-
-static inline void bg_unlock_buffers(BlockGroupData * bg) {
-#if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK
-	LWLockRelease(&bg->lock);
-#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_SINGLE_SPIN
-	SpinLockRelease(&bg->slock);
-#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
-	SpinLockRelease(&bg->buf_lock);
-#endif // PBM_BG_LOCK_MODE
-}
-
+#endif // TRACE_PBM_BUFFERS
 
 
 /*
@@ -871,6 +829,7 @@ BlockGroupData * search_block_group(const BufferDesc *const buf, bool* foundPtr)
 	}
 }
 
+#ifdef TRACE_PBM_PRINT_SCANMAP
 // Print debugging information for a single entry in the scans hash map.
 void debug_append_scan_data(StringInfoData* str, ScanHashEntry* entry) {
 	SharedScanStats stats = entry->data.stats;
@@ -905,6 +864,7 @@ void debug_log_scan_map(void) {
 	ereport(INFO, (errmsg_internal("PBM scan map:"), errdetail_internal("%s", str.data)));
 	pfree(str.data);
 }
+#endif
 
 #if 0
 // ### this code is out of data, but potentially could be adapted later if needed
@@ -1100,7 +1060,8 @@ BlockGroupData * AddBufToBlockGroup(BufferDesc *const buf) {
 	group = search_or_create_block_group(buf);
 	Assert(group != NULL);
 
-// TODO locking -- lock the block group?
+	// Lock block group for insert
+	bg_lock_buffers(group, LW_EXCLUSIVE);
 
 	// Link the buffer into the block group chain of buffers
 	group_head = group->buffers_head;
@@ -1110,6 +1071,8 @@ BlockGroupData * AddBufToBlockGroup(BufferDesc *const buf) {
 	if (group_head != FREENEXT_END_OF_LIST) {
 		GetBufferDescriptor(group_head)->pbm_bgroup_prev = buf->buf_id;
 	}
+
+	bg_unlock_buffers(group);
 
 	// If this is the first buffer in the block group, caller will add it to the PQ
 	return group;
@@ -1129,21 +1092,32 @@ unsigned long get_timeslice(void) {
 /*
  * Remove a buffer from its block group, and if the block group is now empty
  * remove it from the PQ as well.
+ *
+ * Needs: `buf` should be a valid shared buffer, and therefore must already bu
+ * in a block somewhere.
  */
 static inline
 void RemoveBufFromBlock(BufferDesc *const buf) {
 	int next, prev;
-// ### locking needed? (lock first when calling?)
-// TODO locking --- need to always lock the block group (exclusive) to remove from it
+	bool found;
+	BlockGroupData * group;
+	bool need_to_remove;
 
-	// Nothing to do if it isn't in the list
-	if (FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_next) {
-		Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_prev);
-		return;
-	}
+	// This should never be called for a buffer which isn't in the list
+	Assert(buf->pbm_bgroup_next != FREENEXT_NOT_IN_LIST);
+	Assert(buf->pbm_bgroup_prev != FREENEXT_NOT_IN_LIST);
+
+	// Need to find and lock the block group before doing anything
+	group = search_block_group(buf, &found);
+	Assert(found);
+	bg_lock_buffers(group, LW_EXCLUSIVE);
 
 	next = buf->pbm_bgroup_next;
 	prev = buf->pbm_bgroup_prev;
+
+	// Unlink from neighbours
+	buf->pbm_bgroup_prev = FREENEXT_NOT_IN_LIST;
+	buf->pbm_bgroup_next = FREENEXT_NOT_IN_LIST;
 
 	// unlink first if needed
 	if (next != FREENEXT_END_OF_LIST) {
@@ -1153,20 +1127,18 @@ void RemoveBufFromBlock(BufferDesc *const buf) {
 		GetBufferDescriptor(prev)->pbm_bgroup_next = next;
 	} else {
 		// This is the first one in the list, remove from the group!
-// ### some way to optimize this?? maybe using pointers instead of indexes?
-		bool found;
-		BlockGroupData * group = search_block_group(buf, &found);
-		Assert(found);
 		group->buffers_head = next;
-
-		// If the whole list is empty now, remove the block from the PQ bucket as well
-		if (next == FREENEXT_END_OF_LIST) {
-			PQ_RemoveBlockGroup(group);
-		}
 	}
 
-	buf->pbm_bgroup_prev = FREENEXT_NOT_IN_LIST;
-	buf->pbm_bgroup_next = FREENEXT_NOT_IN_LIST;
+	// check if the group is empty while we still have the lock
+	need_to_remove = (group->buffers_head == FREENEXT_END_OF_LIST);
+
+	bg_unlock_buffers(group);
+
+	// If the whole list is empty now, remove the block from the PQ bucket as well
+	if (need_to_remove) {
+		PQ_RemoveBlockGroup(group);
+	}
 }
 
 /*
@@ -1213,7 +1185,7 @@ static inline
 void RefreshBlockGroup(BlockGroupData *const data) {
 	bool requested;
 	bool has_buffers = (data->buffers_head >= 0);
-	long t;
+	unsigned long t;
 
 	// Check if this group should be in the PQ.
 	// If so, move it to the appropriate bucket. If not, remove it from its bucket if applicable.
@@ -1246,8 +1218,8 @@ void InitBlockGroupData(BlockGroupData * data) {
 // TODO decide where we should run this
 static inline
 void PQ_RefreshRequestedBuckets(void) {
-	long ts = get_timeslice();
-	long last_shifted_ts = pbm->BlockQueue->last_shifted_time_slice;
+	unsigned long ts = get_timeslice();
+	unsigned long last_shifted_ts = pbm->BlockQueue->last_shifted_time_slice;
 	bool up_to_date = (last_shifted_ts + 1 > ts);
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_PQ_REFRESH)
@@ -1268,8 +1240,8 @@ void PQ_RefreshRequestedBuckets(void) {
 /// Shift buckets in the PBM PQ as necessary IF the lock can be acquired immediately.
 /// If someone else is actively using the queue for anything, then do nothing.
 void PBM_TryRefreshRequestedBuckets(void) {
-	long ts = get_timeslice();
-	long last_shifted_ts = pbm->BlockQueue->last_shifted_time_slice;
+	unsigned long ts = get_timeslice();
+	unsigned long last_shifted_ts = pbm->BlockQueue->last_shifted_time_slice;
 	bool up_to_date = (last_shifted_ts + 1 > ts);
 	bool acquired;
 

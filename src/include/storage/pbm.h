@@ -34,7 +34,7 @@
 struct HeapScanDescData;
 struct BufferDesc;
 struct BlockGroupData;
-struct PBM_ScanData;
+//struct PBM_ScanData;
 struct PBM_ScanHashEntry;
 
 

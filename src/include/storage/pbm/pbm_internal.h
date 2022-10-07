@@ -193,7 +193,7 @@ typedef struct BlockGroupData {
 	slist_head scans_list;
 
 	// Set of (### unpinned?) buffers holding data in this block group
-	int buffers_head;
+	volatile int buffers_head;
 
 	// Linked-list in PQ buckets
 	struct PbmPQBucket *volatile pq_bucket;
@@ -266,7 +266,7 @@ typedef struct PbmPQ {
 	LWLock null_bucket_locks[PQ_NUM_NULL_BUCKETS];
 #endif // PBM_PQ_BUCKETS_USE_SPINLOCK
 
-	_Atomic(long) last_shifted_time_slice;
+	_Atomic(unsigned long) last_shifted_time_slice;
 } PbmPQ;
 
 
@@ -324,9 +324,9 @@ extern Size PbmPqShmemSize(void);
 ///-------------------------------------------------------------------------
 /// PBM PQ manipulation
 ///-------------------------------------------------------------------------
-extern void PQ_RefreshBlockGroup(BlockGroupData * block_group, long t, bool requested);
+extern void PQ_RefreshBlockGroup(BlockGroupData * block_group, unsigned long t, bool requested);
 extern void PQ_RemoveBlockGroup(BlockGroupData * block_group);
-extern bool PQ_ShiftBucketsWithLock(long ts);
+extern bool PQ_ShiftBucketsWithLock(unsigned long ts);
 extern bool PQ_CheckEmpty(void);
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE
 extern struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * but_state);
@@ -337,6 +337,49 @@ extern struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * but_state);
 ///-------------------------------------------------------------------------
 extern unsigned long get_time_ns(void);
 extern unsigned long get_timeslice(void);
+
+
+/// Block group locking
+
+static inline void bg_lock_scans(BlockGroupData * bg, pg_attribute_unused() LWLockMode mode) {
+#if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK
+	LWLockAcquire(&bg->lock, mode);
+#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_SINGLE_SPIN
+	SpinLockAcquire(&bg->slock);
+#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
+	SpinLockAcquire(&bg->scan_lock);
+#endif // PBM_BG_LOCK_MODE
+}
+
+static inline void bg_unlock_scans(BlockGroupData * bg) {
+#if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK
+	LWLockRelease(&bg->lock);
+#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_SINGLE_SPIN
+	SpinLockRelease(&bg->slock);
+#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
+	SpinLockRelease(&bg->scan_lock);
+#endif // PBM_BG_LOCK_MODE
+}
+
+static inline void bg_lock_buffers(BlockGroupData * bg, pg_attribute_unused() LWLockMode mode) {
+#if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK
+	LWLockAcquire(&bg->lock, mode);
+#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_SINGLE_SPIN
+	SpinLockAcquire(&bg->slock);
+#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
+	SpinLockAcquire(&bg->buf_lock);
+#endif // PBM_BG_LOCK_MODE
+}
+
+static inline void bg_unlock_buffers(BlockGroupData * bg) {
+#if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK
+	LWLockRelease(&bg->lock);
+#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_SINGLE_SPIN
+	SpinLockRelease(&bg->slock);
+#elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
+	SpinLockRelease(&bg->buf_lock);
+#endif // PBM_BG_LOCK_MODE
+}
 
 
 #endif //POSTGRESQL_PBM_INTERNAL_H
