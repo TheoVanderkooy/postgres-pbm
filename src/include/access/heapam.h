@@ -80,7 +80,7 @@ typedef struct HeapScanDescData
 	// PBM fields: scan ID and statistics
 	ScanId scanId;
 	struct PBM_ScanHashEntry * pbmSharedScanData;
-	struct PBM_LocalScanStats pbmLocalScanStats;
+	struct PBM_LocalSeqScanStats pbmLocalScanStats;
 }			HeapScanDescData;
 typedef struct HeapScanDescData *HeapScanDesc;
 

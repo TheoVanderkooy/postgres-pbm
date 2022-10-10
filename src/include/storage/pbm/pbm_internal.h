@@ -1,3 +1,7 @@
+/*-------------------------------------------------------------------------
+ * Internals of the Predictive Buffer Manager
+ *-------------------------------------------------------------------------
+ */
 #ifndef POSTGRESQL_PBM_INTERNAL_H
 #define POSTGRESQL_PBM_INTERNAL_H
 
@@ -8,32 +12,45 @@
 #include "storage/spin.h"
 #include "storage/lwlock.h"
 
-///-------------------------------------------------------------------------
-/// Constants
-///-------------------------------------------------------------------------
 
-#define NS_PER_MS 	(1000 * 1000)		// 10^6 ns per millisecond
+/*-------------------------------------------------------------------------
+ * Constants
+ *-------------------------------------------------------------------------
+ */
+
+#define NS_PER_US	1000				// 10^3 ns per microsecond
+#define NS_PER_MS 	(1000 * NS_PER_US)	// 10^6 ns per millisecond
 #define NS_PER_SEC 	(1000 * NS_PER_MS) 	// 10^9 ns per second
 
-// ### consider different "AccessTimeNotRequested", and also whether this should be signed or not
 static const unsigned long AccessTimeNotRequested = (unsigned long)(-1l);
 static const unsigned int PQ_BucketOutOfRange = (unsigned int)(-1);
 
-///-------------------------------------------------------------------------
-/// PBM Configuration
-///-------------------------------------------------------------------------
 
-/// How much to shift the block # by to find its group
-#define BLOCK_GROUP_SHIFT 5 // 10
+/*-------------------------------------------------------------------------
+ * PBM Configuration
+ *-------------------------------------------------------------------------
+ */
 
-/// Size of the hash maps
+/* Block number is shifted by this amount to determine the group. */
+#define BLOCK_GROUP_SHIFT 5
+
+/* Log of the number of block groups in 1 segment in the hash table. */
+#define LOG_BLOCK_GROUP_SEG_SIZE 8
+
+/* Hash map sizes */
 static const long ScanMapMaxSize = 1024;
 static const long BlockGroupMapMaxSize = (1 << 16);
 
-/// Clock to use
-#define PBM_CLOCK CLOCK_MONOTONIC // CLOCK_MONOTONIC_COARSE
+/*
+ * What clock to use
+ *
+ * CLOCK_MONOTONIC_COARSE seems to have 4ms resolution, which *might* be enough
+ * but unless it becomes a bottleneck the normal clock is probably good enough.
+ * (though resolution ta least ~100us would be nice as a middle-ground)
+ */
+#define PBM_CLOCK CLOCK_MONOTONIC
 
-/// PQ configuration
+/* PQ configuration */
 #define PQ_NUM_NULL_BUCKETS 128
 static const int PQ_NumBucketGroups = 10;
 static const int PQ_NumBucketsPerGroup = 5;
@@ -64,29 +81,29 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 #define PBM_BG_LOCK_MODE PBM_BG_LOCK_MODE_DOUBLE_SPIN
 
 
-/// Debugging flags
+/* Debugging flags */
 //#define TRACE_PBM
 //#define TRACE_PBM_REPORT_PROGRESS
 //#define TRACE_PBM_PRINT_SCANMAP
-//#define TRACE_PBM_PRINT_BLOCKMAP
 //#define TRACE_PBM_BUFFERS
 //#define TRACE_PBM_BUFFERS_NEW
 //#define TRACE_PBM_BUFFERS_EVICT
 //#define TRACE_PBM_PQ_REFRESH
-//#define TRACE_PBM_EVICT
 
 //#define SANITY_PBM_BUFFERS
 //#define SANITY_PBM_BLOCK_GROUPS
 
 
-///-------------------------------------------------------------------------
-/// Helper macros & inline functions
-///-------------------------------------------------------------------------
+/*-------------------------------------------------------------------------
+ * Helper macros
+ *-------------------------------------------------------------------------
+ */
 
-/// Helper to make sure locks get freed
-/// NOTE: do NOT `return` or `break` from inside the lock guard (break inside nested loop is OK), the lock won't be released.
-/// `continue` from the lock guard is OK, will go to the end.
-/// `var` holds the return value of the LWLockAcquire call
+/* Helper to make sure locks get freed
+ * NOTE: do NOT `return` or `break` from inside the lock guard (break inside nested loop is OK), the lock won't be released.
+ * `continue` from the lock guard is OK, will go to the end.
+ * `var` holds the return value of the LWLockAcquire call
+ */
 #define LOCK_GUARD_WITH_RES(var, lock, mode) \
   for ( \
     bool (_c ## var) = true, pg_attribute_unused() (var) = LWLockAcquire((lock), (mode)); \
@@ -94,97 +111,96 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
     LWLockRelease((lock)), (_c ## var) = false)
 #define LOCK_GUARD_V2(lock, mode) LOCK_GUARD_WITH_RES(_ignore_, lock, mode)
 
-/// Group blocks by ID to reduce the amount of metadata required
+/* Group blocks by ID to reduce the amount of metadata required */
 #define BLOCK_GROUP(block) ((block) >> BLOCK_GROUP_SHIFT)
 #define GROUP_TO_FIRST_BLOCK(group) ((group) << BLOCK_GROUP_SHIFT)
 
-/// Block group hash table segment:
-#define LOG_BLOCK_GROUP_SEG_SIZE 8
+/* Block group hash table segment: */
 #define BLOCK_GROUP_SEG_SIZE (1 << LOG_BLOCK_GROUP_SEG_SIZE)
 #define BLOCK_GROUP_SEGMENT(group) ((group) >> LOG_BLOCK_GROUP_SEG_SIZE)
 
-/// Convert a timestamp in ns to the corresponding timeslice in the PQ
-static inline unsigned long ns_to_timeslice(unsigned long t) {
-	return t / PQ_TimeSlice;
-}
 
-
-///-------------------------------------------------------------------------
-/// Forward declarations
-///-------------------------------------------------------------------------
+/*-------------------------------------------------------------------------
+ * Forward declarations
+ *-------------------------------------------------------------------------
+ */
 
 struct BlockGroupData;
 struct HTAB;
 
-///-------------------------------------------------------------------------
-/// Type definitions
-///-------------------------------------------------------------------------
 
-// Table identifier. Stored in the scan map
+/*-------------------------------------------------------------------------
+ * Type definitions
+ *-------------------------------------------------------------------------
+ */
+
+/* Table identifier. Stored in the scan map */
 typedef struct TableData {
-	RelFileNode	rnode; // physical relation
-	ForkNumber	forkNum; // fork in the relation
+	RelFileNode	rnode;		// physical relation
+	ForkNumber	forkNum;	// fork in the relation
 } TableData;
 
-/// Structs for storing information about scans in the hash map
 
-// This struct stores scan stats that are only updated in the single process
-// (in the main header file, because it is embedded in the scan operator)
-typedef struct PBM_LocalScanStats LocalScanStats;
+/*
+ * Structs for storing information about scans in the hash map.
+ */
 
-// Scan stats that need to be read by other threads when estimating scan speed
+/* Store sequential scan stats that are only updated in the single process */
+typedef struct PBM_LocalSeqScanStats LocalSeqScanStats;
+
+/* Sequential scan stats that need to be read by other threads when estimating scan speed */
 typedef struct PBM_SharedScanStats {
 	BlockNumber	blocks_scanned;
 	float		est_speed;
 } SharedScanStats;
 
-// Hash map value: scan info & statistics
-// Note: records *blocks* NOT block *groups*
+/* Hash map value: scan info & statistics
+ * Note: records *blocks* NOT block *groups*
+ */
 typedef struct PBM_ScanData {
 	// Scan info (does not change after being set)
-	TableData 	tbl; // the table being scanned
-	BlockNumber startBlock; // where the scan started
-	BlockNumber	nblocks; // # of blocks (not block *groups*) in the table
-
-// ### add range information (later when looking at BRIN indexes)
+	TableData 	tbl;		// the table being scanned
+	BlockNumber startBlock;	// where the scan started
+	BlockNumber	nblocks;	// # of blocks (not block *groups*) in the table
 
 	// Statistics written by one thread, but read by all
-// ### needs to be atomic? or volatile good enough?
-	_Atomic(SharedScanStats) stats;
+	volatile _Atomic(SharedScanStats) stats;
 } ScanData;
 
-// Entry (KVP) in the scans hash map
+/* Entry (KVP) in the scans hash map */
 typedef struct PBM_ScanHashEntry {
 	ScanId		id;		// Hash key
 	ScanData	data;	// Value
 } ScanHashEntry;
 
 
-/// Structs for information about block groups
+/*
+ * Structs for information about block groups
+ */
 
-// Info about a scan for the block group. (linked list)
-typedef struct BlockGroupScanList {
+/* Info about a scan for the block group. (linked list) */
+typedef struct BlockGroupScanListElem {
 	// Info about the current scan
 	ScanId			scan_id;
 	ScanHashEntry *	scan_entry;
 	BlockNumber		blocks_behind;
 
-// TODO replace scan_id with ptr to hash entry...
+// ### remove scan_id once it is clear we don't need it...
 
 	// Next item in the list
-	slist_node slist;
-} BlockGroupScanList;
+	slist_node		slist;
+} BlockGroupScanListElem;
 
-// Record data for this block group.
+/* Record data for this block group. */
 typedef struct BlockGroupData {
 	// Locks for the below data structures
 #if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK
-	LWLock lock;
+	LWLock	lock;
 #elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_SINGLE_SPIN
-	slock_t slock;
+	slock_t	slock;
 #elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
-	slock_t scan_lock;
-	slock_t buf_lock;
+	slock_t	scan_lock;
+	slock_t	buf_lock;
 #else
 #error "unknown block group lock mode"
 #endif // PBM_BG_LOCK_MODE
@@ -192,7 +208,7 @@ typedef struct BlockGroupData {
 	// Set of scans which care about this block group
 	slist_head scans_list;
 
-	// Set of (### unpinned?) buffers holding data in this block group
+	// Set of buffers holding data in this block group
 	volatile int buffers_head;
 
 	// Linked-list in PQ buckets
@@ -200,28 +216,32 @@ typedef struct BlockGroupData {
 	dlist_node blist;
 } BlockGroupData;
 
-// Key in Block Group Data Map
+/* Key in Block Group Data Map */
 typedef struct BlockGroupHashKey {
 	RelFileNode	rnode;		// physical relation
 	ForkNumber	forkNum;	// fork in the relation
 	uint32		seg;		// "block group segment" in the hash table
 } BlockGroupHashKey;
 
-// Entry in Block Group Data Map
+/* Entry in Block Group Data Map */
 typedef struct BlockGroupHashEntry {
-	// hash key
+	// Hash key
 	BlockGroupHashKey	key;
 
-	// previous and next segment
+	// Previous and next segment
 	struct BlockGroupHashEntry * seg_next;
 	struct BlockGroupHashEntry * seg_prev;
 
-	// list of groups in the segment
+	// List of groups in the segment
 	BlockGroupData		groups[BLOCK_GROUP_SEG_SIZE];
 } BlockGroupHashEntry;
 
 
-/// The priority queue structure data structures for tracking blocks to evict
+/*
+ * The priority queue structure data structures for tracking blocks to evict
+ */
+
+/* PQ bucket */
 typedef struct PbmPQBucket {
 	// Lock for this bucket
 #ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
@@ -234,7 +254,7 @@ typedef struct PbmPQBucket {
 	dlist_head bucket_dlist;
 } PbmPQBucket;
 
-// The actual PQ structure
+/* The actual PQ structure */
 typedef struct PbmPQ {
 	/*
 	 * LOCKING:
@@ -253,7 +273,6 @@ typedef struct PbmPQ {
 	PbmPQBucket ** buckets;
 
 // ### can maybe get rid of "not_requested_other", only used for single-eviction mode (which I'm not sure it even works well)
-// ### keep track of "not requested" and "very far future" separately?
 	PbmPQBucket * not_requested_bucket;
 	PbmPQBucket * not_requested_other;
 	PbmPQBucket nr1;
@@ -266,22 +285,24 @@ typedef struct PbmPQ {
 	LWLock null_bucket_locks[PQ_NUM_NULL_BUCKETS];
 #endif // PBM_PQ_BUCKETS_USE_SPINLOCK
 
-	_Atomic(unsigned long) last_shifted_time_slice;
+	volatile _Atomic(unsigned long) last_shifted_time_slice;
 } PbmPQ;
 
 
-/// Main PBM data structure
+/*
+ * Main PBM data structure
+ */
 typedef struct PbmShared {
 	/* These fields never change after initialization, so no locking needed */
 
-	/// Time-related stuff
+	/// Record initialization time as offset
 	time_t start_time_sec;
 
 	/* These fields have their own lock here */
 
-	/// Free list of BlockGroupScanList elements to be re-used
-	slock_t scan_free_list_lock;
-	slist_head bg_scan_free_list;
+	/// Free list of BlockGroupScanListElem elements to be re-used
+	slock_t		scan_free_list_lock;
+	slist_head	bg_scan_free_list;
 
 	/* These fields protected by PbmScansLock: */
 
@@ -291,7 +312,6 @@ typedef struct PbmShared {
 	ScanId next_id;
 	/// Global estimate of speed used for *new* scans
 	float initial_est_speed;
-// ### could make this atomic and move outside the scans lock in UnregisterSeqScan.
 
 
 	/* These fields protected by PbmBlocksLock: */
@@ -308,22 +328,27 @@ typedef struct PbmShared {
 } PbmShared;
 
 
-///-------------------------------------------------------------------------
-/// Global variables
-///-------------------------------------------------------------------------
+/*-------------------------------------------------------------------------
+ * Global variables
+ *-------------------------------------------------------------------------
+ */
 
-/// Global pointer to the single PBM
+/* Global pointer to the single PBM */
 extern PbmShared * pbm;
 
-///-------------------------------------------------------------------------
-/// PBM PQ Initialization
-///-------------------------------------------------------------------------
+
+/*-------------------------------------------------------------------------
+ * PBM PQ Initialization
+ *-------------------------------------------------------------------------
+ */
 extern PbmPQ * InitPbmPQ(void);
 extern Size PbmPqShmemSize(void);
 
-///-------------------------------------------------------------------------
-/// PBM PQ manipulation
-///-------------------------------------------------------------------------
+
+/*-------------------------------------------------------------------------
+ * PBM PQ manipulation
+ *-------------------------------------------------------------------------
+ */
 extern void PQ_RefreshBlockGroup(BlockGroupData * block_group, unsigned long t, bool requested);
 extern void PQ_RemoveBlockGroup(BlockGroupData * block_group);
 extern bool PQ_ShiftBucketsWithLock(unsigned long ts);
@@ -332,14 +357,21 @@ extern bool PQ_CheckEmpty(void);
 extern struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * but_state);
 #endif
 
-///-------------------------------------------------------------------------
-/// Helpers
-///-------------------------------------------------------------------------
-extern unsigned long get_time_ns(void);
-extern unsigned long get_timeslice(void);
+
+/*-------------------------------------------------------------------------
+ * Helpers
+ *-------------------------------------------------------------------------
+ */
+
+/* Convert a timestamp in ns to the corresponding timeslice in the PQ */
+static inline unsigned long ns_to_timeslice(unsigned long t) {
+	return t / PQ_TimeSlice;
+}
 
 
-/// Block group locking
+/*
+ * Block group locking
+ */
 
 static inline void bg_lock_scans(BlockGroupData * bg, pg_attribute_unused() LWLockMode mode) {
 #if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK

@@ -8,7 +8,8 @@
 #include "storage/block.h"
 
 
-/// CONFIGURATION
+/* ===== CONFIGURATION ===== */
+
 // (move this to pg_config_manual.h later, for now it is here because changing it forces *everything* to recompile)
 /*
  * What eviction implementation to use:
@@ -27,42 +28,49 @@
 #endif
 
 
-//#define PBM_TRACE_FREE_LIST
+/* ===== FORWARD DECLARATIONS ===== */
 
-
-/// Forward declarations
 struct HeapScanDescData;
 struct BufferDesc;
 struct BlockGroupData;
-//struct PBM_ScanData;
 struct PBM_ScanHashEntry;
 
 
-/// Type declarations used elsewhere
+/* ===== TYPES DEFINITIONS ===== */
+
 typedef size_t ScanId;
 
-// Store scan statistics locally when they don't need to be read by other processes
-struct PBM_LocalScanStats{
+/* Scan statistics that don't need to be shared */
+struct PBM_LocalSeqScanStats{
 	unsigned long last_report_time;
 	BlockNumber	last_pos;
 };
 
 
-/// Initialization
+/* ===== INITIALIZATION ===== */
+
 extern void InitPBM(void);
 extern Size PbmShmemSize(void);
 
-/// Public API called by *sequential* scan operators
+
+/* ===== SEQUENTIAL SCAN METHODS ===== */
+
 extern void RegisterSeqScan(struct HeapScanDescData * scan);
 extern void UnregisterSeqScan(struct HeapScanDescData * scan);
 extern void ReportSeqScanPosition(struct HeapScanDescData *scan, BlockNumber pos);
 
-/// Forward certain operations from the normal buffer manager to PBM.
+
+/* ===== BRIN SCAN METHODS ===== */
+
+// TODO
+
+
+/* ===== BUFFER TRACKING ===== */
+
 extern void PbmNewBuffer(struct BufferDesc * buf);
-//extern void PbmBufferNotPinned(struct BufferDesc * buf);
 extern void PbmOnEvictBuffer(struct BufferDesc * buf);
 
-/// Eviction-related methods & data structures
+/* ===== EVICTION METHODS ===== */
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE
 extern struct BufferDesc* PBM_EvictPage(uint32 * buf_state);
 #elif PBM_EVICT_MODE == PBM_EVICT_MODE_MULTI
@@ -77,17 +85,10 @@ static inline bool PBM_EvictingFailed(PBM_EvictState * state) {
 }
 #endif
 
-/// Debugging sanity checks
+/* ===== DEBUGGING (to be removed) ===== */
+
 extern void PBM_DEBUG_sanity_check_buffers(void);
 extern void PBM_DEBUG_print_pbm_state(void);
 
-/*
- * TODO: Register*Scan for:
- *  - BRIN index scans
- *  - Bitmap scans
- *  - BTree index scans (& others?) (exclude hash index?)
- *  ^ These will need to specify ranges maybe
- *  ^ note for non-heap scans: consider passing "scan key"
- */
 
 #endif //POSTGRESQL_PBM_H
