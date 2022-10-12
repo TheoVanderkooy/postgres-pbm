@@ -43,7 +43,8 @@ typedef size_t ScanId;
 /* Scan statistics that don't need to be shared */
 struct PBM_LocalSeqScanStats{
 	unsigned long last_report_time;
-	BlockNumber	last_pos;
+// ### is this already in the scan descriptor?? use that instead?
+	BlockNumber	last_pos;	/* This is in terms of # of *blocks*, not block groups */
 };
 
 

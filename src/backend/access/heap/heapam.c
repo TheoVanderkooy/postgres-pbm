@@ -269,6 +269,7 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 	if (!RelationUsesLocalBuffers(scan->rs_base.rs_rd) &&
 		scan->rs_nblocks > NBuffers / 4)
 	{
+		// TODO theo --- consider disabling strategy here
 		allow_strat = (scan->rs_base.rs_flags & SO_ALLOW_STRAT) != 0;
 		allow_sync = (scan->rs_base.rs_flags & SO_ALLOW_SYNC) != 0;
 	}
@@ -280,7 +281,7 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 		/* During a rescan, keep the previous strategy object. */
 		if (scan->rs_strategy == NULL)
 			scan->rs_strategy = GetAccessStrategy(BAS_BULKREAD);
-	} // TODO theo may need a new strategy here...
+	}
 	else
 	{
 		if (scan->rs_strategy != NULL)
@@ -342,9 +343,19 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 	if (scan->rs_base.rs_flags & SO_TYPE_SEQSCAN)
 		pgstat_count_heap_scan(scan->rs_base.rs_rd);
 #ifdef USE_PBM
-	// Register the scan with the PBM
+	/* For PBM: we need the startblock initialized before we can register the
+	 * scan with the PBM */
+	if (scan->rs_base.rs_parallel != NULL) {
+		table_block_parallelscan_startblock_init(scan->rs_base.rs_rd,
+												 scan->rs_parallelworkerdata,
+												 bpscan);
+// ### PBM parallel scan: does this get registered once or once-per-worker? do we care?
+	}
+
+	/* Register the scan with the PBM */
 	RegisterSeqScan(scan);
-#endif // USE_PBM
+	// TODO theo maybe move this. want to do it after `heap_setscanlimits` if we call that...
+#endif /* USE_PBM */
 }
 
 /*
@@ -367,6 +378,16 @@ heap_setscanlimits(TableScanDesc sscan, BlockNumber startBlk, BlockNumber numBlk
 
 	scan->rs_startblock = startBlk;
 	scan->rs_numblocks = numBlks;
+
+#ifdef USE_PBM
+	/* Want to know if this happens... is it just for TID scans and building indices? */
+	if (scan->pbmSharedScanData != NULL) {
+		elog(WARNING, "PBM setting scan limits for a registered scan! "
+					  "id=%lu, start=%u, num=%u",
+			scan->scanId, startBlk, numBlks
+		);
+	}
+#endif /* USE_PBM */
 }
 
 /*
@@ -802,8 +823,10 @@ heapgettup(HeapScanDesc scan,
 		}
 
 #ifdef USE_PBM
-		// TODO theo is this the right place for it? Only report on new page?
-		ReportSeqScanPosition(scan, page);
+		if (!finished) {
+			Assert(page != InvalidBlockNumber);
+			ReportSeqScanPosition(scan, page);
+		}
 #endif // USE_PBM
 		/*
 		 * return NULL if we've exhausted all the pages
@@ -1114,7 +1137,10 @@ heapgettup_pagemode(HeapScanDesc scan,
 				ss_report_location(scan->rs_base.rs_rd, page);
 		}
 #ifdef USE_PBM
-		ReportSeqScanPosition(scan, page);
+		if (!finished) {
+			Assert(page != InvalidBlockNumber);
+			ReportSeqScanPosition(scan, page);
+		}
 #endif // USE_PBM
 		/*
 		 * return NULL if we've exhausted all the pages

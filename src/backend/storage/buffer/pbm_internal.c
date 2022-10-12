@@ -241,6 +241,9 @@ void PQ_RemoveBlockGroup(BlockGroupData *const block_group) {
 	 *    few empty block groups staying in the PQ, which is probably NBD...)
 	 *  - Note: we could just take the shared lock instead for safety, but I don't
 	 *    think it is needed
+	 *
+	 * ### consider taking the shared lock first! to prevent refreshing buckets...
+	 * ### but evicting could also take long-running spin locks, so whatever...
 	 */
 
 	// Nothing to do if not in a bucket
@@ -671,8 +674,10 @@ void PBM_DEBUG_print_pbm_state(void) {
 	// print PBM PQ
 	LOCK_GUARD_V2(PbmPqBucketsLock, LW_EXCLUSIVE) {
 		for (int i = PQ_NumBuckets - 1; i >= 0; --i) {
+			// skip empty buckets!
+			if (dlist_is_empty(&pbm->BlockQueue->buckets[i]->bucket_dlist)) continue;
 			appendStringInfo(&str, "\n\t %3d:         ", i);
-			DEBUG_print_pq_bucket(&str, pbm->BlockQueue->not_requested_other);
+			DEBUG_print_pq_bucket(&str, pbm->BlockQueue->buckets[i]);
 		}
 	}
 

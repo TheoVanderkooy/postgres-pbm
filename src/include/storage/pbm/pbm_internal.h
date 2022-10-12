@@ -82,7 +82,7 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 
 
 /* Debugging flags */
-//#define TRACE_PBM
+#define TRACE_PBM
 //#define TRACE_PBM_REPORT_PROGRESS
 //#define TRACE_PBM_PRINT_SCANMAP
 //#define TRACE_PBM_BUFFERS
