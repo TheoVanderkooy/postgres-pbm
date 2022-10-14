@@ -24,6 +24,7 @@
 #include "nodes/tidbitmap.h"
 #include "partitioning/partdefs.h"
 #include "storage/condition_variable.h"
+#include "storage/pbm/pbm_minimal.h"
 #include "utils/hsearch.h"
 #include "utils/queryenvironment.h"
 #include "utils/reltrigger.h"
@@ -1598,6 +1599,9 @@ typedef struct ParallelBitmapHeapState
 	int			prefetch_target;
 	SharedBitmapState state;
 	ConditionVariable cv;
+
+	// TODO theo --- maybe PBM fields?
+
 	char		phs_snapshot_data[FLEXIBLE_ARRAY_MEMBER];
 } ParallelBitmapHeapState;
 
@@ -1647,6 +1651,11 @@ typedef struct BitmapHeapScanState
 	TBMSharedIterator *shared_tbmiterator;
 	TBMSharedIterator *shared_prefetch_iterator;
 	ParallelBitmapHeapState *pstate;
+
+	/* PBM fields: scan ID and statistics */
+	ScanId scanId;
+	struct PBM_ScanHashEntry * pbmSharedScanData;
+	// TODO theo need local stats?
 } BitmapHeapScanState;
 
 /* ----------------

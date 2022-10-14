@@ -10,12 +10,16 @@
 
 /* Other files */
 #include "miscadmin.h"
+#include "nodes/execnodes.h"
 #include "lib/stringinfo.h"
+#include "storage/bufmgr.h"
 #include "storage/shmem.h"
 
 // included last to avoid IDE complaining about unused imports...
 #include "storage/buf_internals.h"
 #include "access/heapam.h"
+#include "catalog/index.h"
+#include "lib/simplehash.h"
 
 #include <time.h>
 
@@ -505,6 +509,176 @@ void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) 
 
 
 // ### maybe want to track whether scan is forwards or backwards... (not sure if relevant)
+}
+
+
+/*-------------------------------------------------------------------------
+ * Public API: BRIN methods
+ *-------------------------------------------------------------------------
+ */
+
+/*
+ * Setup data structures for tracking a bitmap scan.
+ */
+extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
+	bool found;
+	ScanId id;
+	ScanHashEntry * s_entry;
+	TableData tbl;
+	BlockGroupHashKey bgkey;
+	BlockGroupHashEntry * bseg_first;
+	BlockNumber nblocks, nblock_groups, nblock_segs;
+	BlockNumber last_block, last_block_group, last_block_seg;
+	Relation rel = scan->ss.ss_currentRelation;
+
+	const float init_est_speed = pbm->initial_est_speed;
+
+	// Need to know # of blocks.
+	nblocks = RelationGetNumberOfBlocks(scan->ss.ss_currentRelation);
+
+	/* Compute ranges */
+	last_block 			= (nblocks == 0 ? 0 : nblocks - 1);
+	last_block_group	= BLOCK_GROUP(last_block);
+	last_block_seg		= BLOCK_GROUP_SEGMENT(last_block_group);
+	nblock_groups 		= (nblocks == 0 ? 0 : last_block_group + 1);
+	nblock_segs 		= (nblocks == 0 ? 0 : last_block_seg + 1);
+
+	/*
+	 * TESTING
+	 */
+	elog(INFO, "PBM_RegisterBitmapScan!");
+
+	{
+		RelFileNode rnode1 = scan->ss.ss_currentRelation->rd_node;
+		RelFileNode rnode2 = scan->ss.ss_currentScanDesc->rs_rd->rd_node;
+
+
+//	heapOid = IndexGetRelation(RelationGetRelid(idxRel), false);
+//	heapRel = table_open(heapOid, AccessShareLock);
+//	table_close(heapRel, AccessShareLock);
+
+
+		elog(INFO, "PBM_RegisterBitmapScan: nblocks=%d, "
+				   "rnode1={spc=%u, db=%u, rel=%u}, "
+				   "rnode2={spc=%u, db=%u, rel=%u}",
+			 nblocks,
+			 rnode1.spcNode, rnode1.dbNode, rnode1.relNode,
+			 rnode2.spcNode, rnode2.dbNode, rnode2.relNode
+		);
+	}
+	/*
+	 * END TESTING
+	 */
+
+
+
+	/* Keys for hash tables */
+	tbl = (TableData){
+			.rnode = rel->rd_node,
+			.forkNum = MAIN_FORKNUM, // Bitmap scans only use main fork (at least, `BitmapPrefetch` is hardcoded with MAIN_FORKNUM...)
+	};
+
+
+	/* Insert the scan metadata & generate scan ID */
+	LOCK_GUARD_V2(PbmScansLock, LW_EXCLUSIVE) {
+		// Generate scan ID
+		id = pbm->next_id;
+		pbm->next_id += 1;
+
+		// Create s_entry for the scan in the hash map
+		s_entry = search_scan(id, HASH_ENTER, &found);
+		Assert(!found); // should be inserted...
+	}
+
+	/*
+	 * Initialize the entry. It is OK to do this outside the lock, because we
+	 * haven't associated the scan with any block groups yet (so no one will by
+	 * trying to access it yet.
+	 */
+	s_entry->data = (ScanData) {
+			// These fields never change
+			.tbl = tbl,
+			.startBlock = 0, // bitmap scan always starts at 0
+			.nblocks = nblocks,
+			// These stats will be updated later
+			.stats = (SharedScanStats) {
+				.est_speed = init_est_speed,
+				.blocks_scanned = 0,
+			},
+	};
+
+	/* Remember the PBM data in the scan */
+	scan->scanId = id;
+	scan->pbmSharedScanData = s_entry;
+
+	/* Make sure every block group is present in the map! */
+	bseg_first = RegisterInitBlockGroupEntries(&bgkey, nblock_segs);
+
+	// refresh the PQ first if needed
+	PQ_RefreshRequestedBuckets();
+
+	// TODO add scan for the block group segments... Need to figure out exactly which block groups actually need it though!
+}
+
+/*
+ * Clean up after a bitmap scan finishes.
+ */
+extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* msg) {
+	const ScanId id = scan->scanId;
+	ScanData scanData;
+	BlockGroupHashKey bgkey = (BlockGroupHashKey) {
+			.rnode = scan->ss.ss_currentRelation->rd_node,
+			.forkNum = MAIN_FORKNUM, // Bitmap scans only use main fork
+			.seg = 0,
+	};
+
+	/*
+	 * TESTING
+	 */
+	// TODO remove `msg` parameter once we decide where this should get called
+	elog(INFO, "PBM_UnregisterBitmapScan! %s   do_anything=%s",
+		 msg, (scan->pbmSharedScanData != NULL ? "true" : "false"));
+	/*
+	 * END TESTING
+	 */
+
+
+	if (NULL == scan->pbmSharedScanData) {
+		// No shared scan, do nothing
+		// ### could assert there is no scan? maybe expensive
+		return;
+	}
+
+	scanData = scan->pbmSharedScanData->data;
+
+	// Shift PQ buckets if needed
+	PQ_RefreshRequestedBuckets();
+
+	// Remove from the remaining block groups
+	LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
+		const uint32 upper = (scanData.nblocks > 0 ? BLOCK_GROUP(scanData.nblocks-1) + 1 : 0);
+		const uint32 start = 0; // TODO pick start from stats
+		const uint32 end = upper; // TODO remember what the end should be on Register??
+
+		// TODO improve this
+		remove_scan_from_block_range(&bgkey, id, start, end);
+	}
+
+	// Remove from the scan map
+	UnregisterDeleteScan(id, scanData.stats);
+
+	// After deleting the scan, unlink from the scan state so it doesn't try to end the scan again
+	scan->pbmSharedScanData = NULL;
+}
+
+/*
+ * Update progress of a bitmap scan.
+ */
+extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState * scan /*TODO other args?*/) {
+	elog(INFO, "PBM_ReportBitmapScanPosition!   do_anything=%s",
+		 (scan->pbmSharedScanData != NULL ? "true" : "false"));
+
+	// TODO!
 }
 
 

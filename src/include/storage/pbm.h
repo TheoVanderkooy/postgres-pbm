@@ -5,6 +5,8 @@
 #ifndef POSTGRESQL_PBM_H
 #define POSTGRESQL_PBM_H
 
+#include "storage/pbm/pbm_minimal.h"
+
 #include "storage/block.h"
 
 
@@ -28,17 +30,15 @@
 #endif
 
 
-/* ===== FORWARD DECLARATIONS ===== */
+/* ===== FORWARD DECLARATIONS (sorted) ===== */
 
-struct HeapScanDescData;
-struct BufferDesc;
+struct BitmapHeapScanState;
 struct BlockGroupData;
-struct PBM_ScanHashEntry;
+struct BufferDesc;
+struct HeapScanDescData;
 
 
 /* ===== TYPES DEFINITIONS ===== */
-
-typedef size_t ScanId;
 
 /* Scan statistics that don't need to be shared */
 struct PBM_LocalSeqScanStats{
@@ -63,14 +63,9 @@ extern void PBM_ReportSeqScanPosition(struct HeapScanDescData *scan, BlockNumber
 
 /* ===== BITMAP SCAN METHODS ===== */
 
-//extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan);
-//extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* msg);
-//extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState * scan /*TODO other args?*/);
-
-
-/* ===== BRIN SCAN METHODS ===== */
-
-// TODO
+extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan);
+extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* msg/*(to be removed)*/);
+extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState * scan /*TODO other args?*/);
 
 
 /* ===== BUFFER TRACKING ===== */

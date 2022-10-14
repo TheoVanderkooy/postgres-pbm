@@ -46,6 +46,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/pbm.h"
 #include "storage/predicate.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -127,6 +128,10 @@ BitmapHeapNext(BitmapHeapScanState *node)
 				node->prefetch_target = -1;
 			}
 #endif							/* USE_PREFETCH */
+#ifdef USE_PBM
+			/* Register the bitmap scan with the predictive buffer manager */
+			PBM_RegisterBitmapScan(node);
+#endif /* USE_PBM */
 		}
 		else
 		{
@@ -142,7 +147,19 @@ BitmapHeapNext(BitmapHeapScanState *node)
 					elog(ERROR, "unrecognized result from subplan");
 
 				node->tbm = tbm;
-
+#ifdef USE_PBM
+				PBM_RegisterBitmapScan(node);
+				// TODO theo parallel bitmap scans
+				/*
+				 * we would like to just "register" it. However need to be careful:
+				 *  - it either uses shared or private iterator, which are incompatibly
+				 *  - could pass in the iterator? OR a flag/separate method?
+				 *
+				 * Here we need to register before `BitmapDoneInitializingSharedState` which actually starts the query...
+				 *
+				 * Then the question is: how/when do we update state? only from the leader?
+				 */
+#endif /* USE_PBM */
 				/*
 				 * Prepare to iterate over the TBM. This will return the
 				 * dsa_pointer of the iterator state which will be used by
@@ -245,6 +262,11 @@ BitmapHeapNext(BitmapHeapScanState *node)
 
 			/* Adjust the prefetch target */
 			BitmapAdjustPrefetchTarget(node);
+
+#ifdef USE_PBM
+			/* Update the PBM when we get a new page */
+			PBM_ReportBitmapScanPosition(node /* TODO probably need to pass in something... */);
+#endif /* USE_PBM */
 		}
 		else
 		{
@@ -335,6 +357,14 @@ BitmapHeapNext(BitmapHeapScanState *node)
 	/*
 	 * if we get here it means we are at the end of the scan..
 	 */
+
+#ifdef USE_PBM
+	// TODO theo --- don't think this is the right place for this -- may not always be reached.
+	// TODO theo --- also, if we always call either "end" or "rescan" this is unnecessary... but also doesn't hurt to keep it!
+	/* Cleanup PBM state of this scan */
+	PBM_UnregisterBitmapScan(node, "end of BitmapHeapNext");
+#endif /* USE_PBM */
+
 	return ExecClearTuple(slot);
 }
 
@@ -632,6 +662,10 @@ ExecReScanBitmapHeapScan(BitmapHeapScanState *node)
 	node->pvmbuffer = InvalidBuffer;
 
 	ExecScanReScan(&node->ss);
+// TODO theo -- should probably unregister if applicable!
+#ifdef USE_PBM
+	PBM_UnregisterBitmapScan(node, "rescan");
+#endif /* USE_PBM */
 
 	/*
 	 * if chgParam of subnode is not null then plan will be re-scanned by
@@ -649,7 +683,10 @@ void
 ExecEndBitmapHeapScan(BitmapHeapScanState *node)
 {
 	TableScanDesc scanDesc;
-
+// TODO theo --- not sure if this is the right place to call "unregister"?
+#ifdef USE_PBM
+	PBM_UnregisterBitmapScan(node, "in ExecEndBitmapHeapScan");
+#endif /* USE_PBM */
 	/*
 	 * extract information from the node
 	 */
@@ -741,6 +778,8 @@ ExecInitBitmapHeapScan(BitmapHeapScan *node, EState *estate, int eflags)
 	scanstate->shared_tbmiterator = NULL;
 	scanstate->shared_prefetch_iterator = NULL;
 	scanstate->pstate = NULL;
+	/* PBM fields */
+	scanstate->pbmSharedScanData = NULL;
 
 	/*
 	 * We can potentially skip fetching heap pages if we do not need any
