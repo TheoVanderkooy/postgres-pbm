@@ -2325,7 +2325,7 @@ heapam_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate)
 #ifdef USE_PBM
 		// TODO theo --- maybe report progress here, not sure if we care about sample scans
 		// TODO put this outside the if block?
-		ReportSeqScanPosition(hscan, blockno);
+		PBM_ReportSeqScanPosition(hscan, blockno);
 #endif // USE_PBM
 	}
 

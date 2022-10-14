@@ -56,9 +56,16 @@ extern Size PbmShmemSize(void);
 
 /* ===== SEQUENTIAL SCAN METHODS ===== */
 
-extern void RegisterSeqScan(struct HeapScanDescData * scan);
-extern void UnregisterSeqScan(struct HeapScanDescData * scan);
-extern void ReportSeqScanPosition(struct HeapScanDescData *scan, BlockNumber pos);
+extern void PBM_RegisterSeqScan(struct HeapScanDescData * scan);
+extern void PBM_UnregisterSeqScan(struct HeapScanDescData * scan);
+extern void PBM_ReportSeqScanPosition(struct HeapScanDescData *scan, BlockNumber pos);
+
+
+/* ===== BITMAP SCAN METHODS ===== */
+
+//extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan);
+//extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* msg);
+//extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState * scan /*TODO other args?*/);
 
 
 /* ===== BRIN SCAN METHODS ===== */
@@ -70,6 +77,7 @@ extern void ReportSeqScanPosition(struct HeapScanDescData *scan, BlockNumber pos
 
 extern void PbmNewBuffer(struct BufferDesc * buf);
 extern void PbmOnEvictBuffer(struct BufferDesc * buf);
+
 
 /* ===== EVICTION METHODS ===== */
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE
@@ -85,6 +93,7 @@ static inline bool PBM_EvictingFailed(PBM_EvictState * state) {
 	return state->next_bucket_idx < -1;
 }
 #endif
+
 
 /* ===== DEBUGGING (to be removed) ===== */
 

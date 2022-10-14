@@ -353,7 +353,7 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 	}
 
 	/* Register the scan with the PBM */
-	RegisterSeqScan(scan);
+	PBM_RegisterSeqScan(scan);
 	// TODO theo maybe move this. want to do it after `heap_setscanlimits` if we call that...
 #endif /* USE_PBM */
 }
@@ -383,7 +383,7 @@ heap_setscanlimits(TableScanDesc sscan, BlockNumber startBlk, BlockNumber numBlk
 	/* Want to know if this happens... is it just for TID scans and building indices? */
 	if (scan->pbmSharedScanData != NULL) {
 		elog(WARNING, "PBM setting scan limits for a registered scan! "
-					  "id=%lu, start=%u, num=%u",
+					  "id=%lu, start=%u, num=%d",
 			scan->scanId, startBlk, numBlks
 		);
 	}
@@ -825,7 +825,7 @@ heapgettup(HeapScanDesc scan,
 #ifdef USE_PBM
 		if (!finished) {
 			Assert(page != InvalidBlockNumber);
-			ReportSeqScanPosition(scan, page);
+			PBM_ReportSeqScanPosition(scan, page);
 		}
 #endif // USE_PBM
 		/*
@@ -1139,7 +1139,7 @@ heapgettup_pagemode(HeapScanDesc scan,
 #ifdef USE_PBM
 		if (!finished) {
 			Assert(page != InvalidBlockNumber);
-			ReportSeqScanPosition(scan, page);
+			PBM_ReportSeqScanPosition(scan, page);
 		}
 #endif // USE_PBM
 		/*
@@ -1358,7 +1358,7 @@ heap_endscan(TableScanDesc sscan)
 		ReleaseBuffer(scan->rs_cbuf);
 #ifdef USE_PBM
 	// PBM: unregister scan
-	UnregisterSeqScan(scan);
+	PBM_UnregisterSeqScan(scan);
 #endif // USE_PBM
 	/*
 	 * decrement relation reference count and free scan descriptor storage
