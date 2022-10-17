@@ -9,9 +9,9 @@
 #include "storage/pbm/pbm_internal.h"
 
 /* Other files */
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
-#include "lib/stringinfo.h"
 #include "storage/bufmgr.h"
 #include "storage/shmem.h"
 
@@ -552,12 +552,6 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 		RelFileNode rnode1 = scan->ss.ss_currentRelation->rd_node;
 		RelFileNode rnode2 = scan->ss.ss_currentScanDesc->rs_rd->rd_node;
 
-
-//	heapOid = IndexGetRelation(RelationGetRelid(idxRel), false);
-//	heapRel = table_open(heapOid, AccessShareLock);
-//	table_close(heapRel, AccessShareLock);
-
-
 		elog(INFO, "PBM_RegisterBitmapScan: nblocks=%d, "
 				   "rnode1={spc=%u, db=%u, rel=%u}, "
 				   "rnode2={spc=%u, db=%u, rel=%u}",
@@ -607,6 +601,7 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 			},
 	};
 
+// TODO maybe move this after we find the list of block groups...
 	/* Remember the PBM data in the scan */
 	scan->scanId = id;
 	scan->pbmSharedScanData = s_entry;
@@ -614,7 +609,7 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 	/* Make sure every block group is present in the map! */
 	bseg_first = RegisterInitBlockGroupEntries(&bgkey, nblock_segs);
 
-	// refresh the PQ first if needed
+	/* refresh the PQ first if needed */
 	PQ_RefreshRequestedBuckets();
 
 	// TODO add scan for the block group segments... Need to figure out exactly which block groups actually need it though!
@@ -930,14 +925,26 @@ void InitScanStatsEntry(BlockGroupScanListElem *temp, ScanId id, ScanHashEntry *
 	const BlockNumber startblock = sdata->data.startBlock;
 	const BlockNumber nblocks = sdata->data.nblocks;
 	// convert group # -> block #
-	const BlockNumber block_num = GROUP_TO_FIRST_BLOCK(bgnum);
+	const BlockNumber first_block_in_group = GROUP_TO_FIRST_BLOCK(bgnum);
 	BlockNumber blocks_behind;
 
 	// calculate where the block group is in the scan relative to start block
-	if (block_num >= startblock) {
-		blocks_behind = block_num - startblock;
+	if (first_block_in_group >= startblock) {
+		// Normal case: no circular scans or we have not wrapped around yet
+		blocks_behind = first_block_in_group - startblock;
 	} else {
-		blocks_behind = block_num + nblocks - startblock;
+		// Circular scans: eventually we loop back to the start "before" the start block, have to adjust
+		blocks_behind = first_block_in_group + nblocks - startblock;
+
+		/*
+		 * Special case: if this is the group of the start block but startblock
+		 * is NOT the first in the group, then this group is both at the start
+		 * and the end. For out purposes treat it as the end, since we will
+		 * access it at the start immediately and it is either in cache or not,
+		 * very unlikely that tracking that information would matter.
+		 *
+		 * (this is automatically handled by this case)
+		 */
 	}
 
 	// fill in data of the new list element
