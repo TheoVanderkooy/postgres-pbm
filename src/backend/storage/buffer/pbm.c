@@ -49,7 +49,7 @@ static inline unsigned long get_timeslice(void);
 
 
 // initialization for internal structs
-static inline void InitScanStatsEntry(BlockGroupScanListElem * temp, ScanId id, ScanHashEntry * sdata, BlockNumber bgnum);
+static inline void InitSeqScanStatsEntry(BlockGroupScanListElem * temp, ScanId id, ScanHashEntry * sdata, BlockNumber bgnum);
 static inline void InitBlockGroupData(BlockGroupData * data);
 
 
@@ -275,14 +275,6 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 			},
 	};
 
-	/* Scan remembers the ID, shared stats, and local stats */
-	scan->scanId = id;
-	scan->pbmSharedScanData = s_entry;
-	scan->pbmLocalScanStats = (LocalSeqScanStats) {
-		.last_report_time = get_time_ns(),
-		.last_pos = startblock,
-	};
-
 	/* Make sure every block group is present in the map! */
 	bseg_first = RegisterInitBlockGroupEntries(&bgkey, nblock_segs);
 
@@ -313,23 +305,25 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 			BlockGroupData *const data = &bseg_cur->groups[i];
 			BlockGroupScanListElem * scan_entry = NULL;
 
-			// Get a scan entry, either from free-list or allocate new ones
-			scan_entry = try_get_bg_scan_elem();
-			if (scan_entry != NULL) {
-				// Nothing to do if we got something off the free list
-			} else if (new_stats != NULL) {
-				// if no free list, but we already allocated, use that
+			/* Get an element for the block group scan list */
+			if (NULL != new_stats) {
+				/* We've already allocated for these block groups, ise the allocated stuff... */
 				scan_entry = new_stats;
 				new_stats += 1;
 			} else {
-				// otherwise we need to allocate enough for everything else first
-				new_stats = ShmemAlloc((nblock_groups - bgnum) * sizeof(BlockGroupScanListElem));
-				scan_entry = new_stats;
-				new_stats += 1;
+				/* Try to allocate from the free list */
+				scan_entry = try_get_bg_scan_elem();
+
+				/* If nothing free, allocate enough for everything else */
+				if (NULL == scan_entry) {
+					new_stats = ShmemAlloc((nblock_groups - bgnum) * sizeof(BlockGroupScanListElem));
+					scan_entry = new_stats;
+					new_stats += 1;
+				}
 			}
 
 			// Initialize the list element & push to the list
-			InitScanStatsEntry(scan_entry, id, s_entry, bgnum);
+			InitSeqScanStatsEntry(scan_entry, id, s_entry, bgnum);
 
 			// Push the scan entry to the block group list
 			bg_lock_scans(data, LW_EXCLUSIVE);
@@ -340,6 +334,14 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 			RefreshBlockGroup(data);
 		}
 	}
+
+	/* Scan remembers the ID, shared stats, and local stats */
+	scan->scanId = id;
+	scan->pbmSharedScanData = s_entry;
+	scan->pbmLocalScanStats = (LocalSeqScanStats) {
+			.last_report_time = get_time_ns(),
+			.last_pos = startblock,
+	};
 
 
 	// debugging
