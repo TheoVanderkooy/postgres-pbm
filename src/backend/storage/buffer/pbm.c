@@ -39,13 +39,16 @@ PbmShared* pbm;
 
 
 // Shared logic of the public API methods (register/unregister/report position)
-static inline BlockGroupHashEntry * RegisterInitBlockGroupEntries(BlockGroupHashKey * bgkey, BlockNumber nblock_segs);
+static inline BlockGroupHashEntry * RegisterInitBlockGroupEntries(BlockGroupHashKey * bgkey, BlockNumber nblocks);
 static inline void UnregisterDeleteScan(ScanId id, SharedScanStats stats);
 struct scan_elem_allocation_state {
 	BlockGroupScanListElem * new_stats;
 	BlockNumber left_to_allocate;
 };
 static inline BlockGroupScanListElem * alloc_scan_list_elem(struct scan_elem_allocation_state * alloc_state);
+
+static inline BlockNumber num_block_groups(BlockNumber nblocks);
+static inline BlockNumber num_block_group_segments(BlockNumber nblocks);
 
 
 // get current time
@@ -97,6 +100,12 @@ static inline void PQ_RefreshRequestedBuckets(void);
 #ifdef TRACE_PBM_PRINT_SCANMAP
 static void debug_append_scan_data(StringInfoData* str, ScanHashEntry* entry);
 static void debug_log_scan_map(void);
+#endif
+
+#ifdef TRACE_PBM_PRINT_BLOCKGROUPMAP
+static inline void debug_append_bg_data(StringInfoData *str, BlockGroupData *data, BlockNumber bgroup);
+static void debug_append_bgseg_data(StringInfoData* str, BlockGroupHashEntry* entry);
+static void debug_log_blockgroup_map(void);
 #endif
 
 static void debug_buffer_access(BufferDesc* buf, char* msg);
@@ -204,7 +213,7 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 	BlockGroupHashKey bgkey;
 	BlockGroupHashEntry * bseg_first;
 	BlockNumber startblock;
-	BlockNumber nblocks, nblock_groups, nblock_segs;
+	BlockNumber nblocks, nblock_groups;
 	BlockNumber last_block, last_block_group, last_block_seg;
 	struct scan_elem_allocation_state alloc_state;
 	int bgnum;
@@ -233,11 +242,7 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 	Assert(startblock != InvalidBlockNumber);
 
 	/* Compute ranges */
-	last_block 			= (nblocks == 0 ? 0 : nblocks - 1);
-	last_block_group	= BLOCK_GROUP(last_block);
-	last_block_seg		= BLOCK_GROUP_SEGMENT(last_block_group);
-	nblock_groups 		= (nblocks == 0 ? 0 : last_block_group + 1);
-	nblock_segs 		= (nblocks == 0 ? 0 : last_block_seg + 1);
+	nblock_groups = num_block_groups(nblocks);
 
 	/* Keys for hash tables */
 	tbl = (TableData){
@@ -281,7 +286,7 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 	};
 
 	/* Make sure every block group is present in the map! */
-	bseg_first = RegisterInitBlockGroupEntries(&bgkey, nblock_segs);
+	bseg_first = RegisterInitBlockGroupEntries(&bgkey, nblocks);
 
 	/*
 	 * LOCKING: once we have created the entries, we no longer need to read or
@@ -524,21 +529,14 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 	TableData tbl;
 	BlockGroupHashKey bgkey;
 	BlockGroupHashEntry * bseg_first;
-	BlockNumber nblocks, nblock_groups, nblock_segs;
-	BlockNumber last_block, last_block_group, last_block_seg;
+	BlockGroupHashEntry * bseg_cur;
+	BlockNumber cnt;
 	Relation rel = scan->ss.ss_currentRelation;
 
 	const float init_est_speed = pbm->initial_est_speed;
 
 	// Need to know # of blocks.
-	nblocks = RelationGetNumberOfBlocks(scan->ss.ss_currentRelation);
-
-	/* Compute ranges */
-	last_block 			= (nblocks == 0 ? 0 : nblocks - 1);
-	last_block_group	= BLOCK_GROUP(last_block);
-	last_block_seg		= BLOCK_GROUP_SEGMENT(last_block_group);
-	nblock_groups 		= (nblocks == 0 ? 0 : last_block_group + 1);
-	nblock_segs 		= (nblocks == 0 ? 0 : last_block_seg + 1);
+	const BlockNumber nblocks = RelationGetNumberOfBlocks(scan->ss.ss_currentRelation);
 
 	/*
 	 * TESTING
@@ -565,8 +563,14 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 
 	/* Keys for hash tables */
 	tbl = (TableData){
-			.rnode = rel->rd_node,
-			.forkNum = MAIN_FORKNUM, // Bitmap scans only use main fork (at least, `BitmapPrefetch` is hardcoded with MAIN_FORKNUM...)
+		.rnode = rel->rd_node,
+		.forkNum = MAIN_FORKNUM, // Bitmap scans only use main fork (at least, `BitmapPrefetch` is hardcoded with MAIN_FORKNUM...)
+	};
+
+	bgkey = (BlockGroupHashKey) {
+		.rnode = rel->rd_node,
+		.forkNum = MAIN_FORKNUM, // Bitmap scans only use main fork (at least, `BitmapPrefetch` is hardcoded with MAIN_FORKNUM...)
+		.seg = 0,
 	};
 
 
@@ -604,7 +608,7 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 	scan->pbmSharedScanData = s_entry;
 
 	/* Make sure every block group is present in the map! */
-	bseg_first = RegisterInitBlockGroupEntries(&bgkey, nblock_segs);
+	bseg_first = RegisterInitBlockGroupEntries(&bgkey, nblocks);
 
 	/* Refresh the PQ first if needed */
 	PQ_RefreshRequestedBuckets();
@@ -661,6 +665,17 @@ extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* ms
 
 	// After deleting the scan, unlink from the scan state so it doesn't try to end the scan again
 	scan->pbmSharedScanData = NULL;
+
+
+#ifdef TRACE_PBM
+#ifdef TRACE_PBM_PRINT_SCANMAP
+	debug_log_scan_map();
+#endif // TRACE_PBM_PRINT_SCANMAP
+
+#ifdef TRACE_PBM_PRINT_BLOCKGROUPMAP
+	debug_log_blockgroup_map();
+#endif // TRACE_PBM_PRINT_BLOCKGROUPMAP
+#endif /* TRACE_PBM */
 }
 
 /*
@@ -826,11 +841,12 @@ void PBM_TryRefreshRequestedBuckets(void) {
 /*
  * The main logic for Register*Scan to create block group entries if necessary.
  */
-BlockGroupHashEntry * RegisterInitBlockGroupEntries(BlockGroupHashKey * bgkey, BlockNumber nblock_segs) {
+BlockGroupHashEntry * RegisterInitBlockGroupEntries(BlockGroupHashKey *const bgkey, const BlockNumber nblocks) {
 	bool found;
 	BlockGroupHashEntry * bseg_first = NULL;
 	BlockGroupHashEntry * bseg_prev = NULL;
 	BlockGroupHashEntry * bseg_cur;
+	const BlockNumber nblock_segs = num_block_group_segments(nblocks);
 
 	/* Make sure every block group is present in the map! */
 	LOCK_GUARD_V2(PbmBlocksLock, LW_EXCLUSIVE) {
@@ -934,6 +950,23 @@ BlockGroupScanListElem * alloc_scan_list_elem(struct scan_elem_allocation_state 
 	Assert(alloc_state->left_to_allocate > 0);
 	alloc_state->left_to_allocate -= 1;
 	return ret;
+}
+
+BlockNumber num_block_groups(BlockNumber nblocks) {
+	BlockNumber last_block 			= (nblocks == 0 ? 0 : nblocks - 1);
+	BlockNumber last_block_group	= BLOCK_GROUP(last_block);
+	BlockNumber nblock_groups 		= (nblocks == 0 ? 0 : last_block_group + 1);
+
+	return nblock_groups;
+}
+
+BlockNumber num_block_group_segments(BlockNumber nblocks) {
+	BlockNumber last_block = (nblocks == 0 ? 0 : nblocks - 1);
+	BlockNumber last_block_group = BLOCK_GROUP(last_block);
+	BlockNumber last_block_seg = BLOCK_GROUP_SEGMENT(last_block_group);
+	BlockNumber nblock_segs = (nblocks == 0 ? 0 : last_block_seg + 1);
+
+	return nblock_segs;
 }
 
 /* Current time in nanoseconds */
@@ -1596,3 +1629,68 @@ void debug_log_scan_map(void) {
 }
 #endif
 
+#ifdef TRACE_PBM_PRINT_BLOCKGROUPMAP
+// Append debugging information for one block group
+void debug_append_bg_data(StringInfoData *str, BlockGroupData *data, BlockNumber bgroup) {
+	BlockNumber seg = BLOCK_GROUP_SEGMENT(bgroup);
+	slist_iter it;
+
+	appendStringInfo(str, "\n\t\tseg=%u, bg=%3u, addr=%p scans=",
+		seg, bgroup, data
+	);
+
+	bg_lock_scans(data, LW_SHARED);
+
+	slist_foreach(it, &data->scans_list) {
+		BlockGroupScanListElem * elem = slist_container(BlockGroupScanListElem, slist, it.cur);
+
+		appendStringInfo(str, " {id=%3lu, behind=%5u}",
+			elem->scan_id, elem->blocks_behind
+		);
+	}
+
+	bg_unlock_scans(data);
+}
+
+// Print debugging information for a relation in the block group map
+void debug_append_bgseg_data(StringInfoData* str, BlockGroupHashEntry* entry) {
+	appendStringInfo(str, "\n\ttbl={spc=%u, db=%u, rel=%u, fork=%u}",
+		entry->key.rnode.spcNode, entry->key.rnode.dbNode, entry->key.rnode.relNode, entry->key.forkNum
+	);
+
+	// Print something for each segment
+	for ( ; NULL != entry; entry = entry->seg_next) {
+		BlockGroupData * data = &entry->groups[0];
+		debug_append_bg_data(str, data, entry->key.seg * BLOCK_GROUP_SEG_SIZE);
+		debug_append_bg_data(str, data + 1, entry->key.seg * BLOCK_GROUP_SEG_SIZE + 1);
+		debug_append_bg_data(str, data + 16, entry->key.seg * BLOCK_GROUP_SEG_SIZE + 16);
+		debug_append_bg_data(str, data + 128, entry->key.seg * BLOCK_GROUP_SEG_SIZE + 128);
+	}
+}
+
+// Print the whole block group map for debugging
+void debug_log_blockgroup_map(void) {
+	StringInfoData str;
+	initStringInfo(&str);
+
+	LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
+		HASH_SEQ_STATUS status;
+		BlockGroupHashEntry * entry;
+
+		hash_seq_init(&status, pbm->BlockGroupMap);
+
+		for (;;) {
+			entry = hash_seq_search(&status);
+			if (NULL == entry) break;
+
+			// do each table in order
+			if (entry->key.seg != 0) continue;
+
+			debug_append_bgseg_data(&str, entry);
+		}
+	}
+
+	ereport(INFO, (errmsg_internal("PBM block group map:"), errdetail_internal("%s", str.data)));
+	pfree(str.data);
+}
+#endif
