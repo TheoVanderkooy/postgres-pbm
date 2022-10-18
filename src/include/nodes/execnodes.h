@@ -1655,7 +1655,7 @@ typedef struct BitmapHeapScanState
 	/* PBM fields: scan ID and statistics */
 	ScanId scanId;
 	struct PBM_ScanHashEntry * pbmSharedScanData;
-	// TODO theo need local stats?
+	struct PBM_LocalBitmapScanState pbmLocalScanData;
 } BitmapHeapScanState;
 
 /* ----------------

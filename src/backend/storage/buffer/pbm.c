@@ -40,6 +40,7 @@ PbmShared* pbm;
 
 // Shared logic of the public API methods (register/unregister/report position)
 static inline BlockGroupHashEntry * RegisterInitBlockGroupEntries(BlockGroupHashKey * bgkey, BlockNumber nblocks);
+static inline ScanHashEntry * RegisterCreateScanEntry(TableData * tbl, BlockNumber startblock, BlockNumber nblocks);
 static inline void UnregisterDeleteScan(ScanId id, SharedScanStats stats);
 struct scan_elem_allocation_state {
 	BlockGroupScanListElem * new_stats;
@@ -56,9 +57,17 @@ static inline unsigned long get_time_ns(void);
 static inline unsigned long get_timeslice(void);
 
 
+// block group + count vector methods used by bitmap scans
+static inline bgcnt_vec bcvec_init(void);
+static inline void bcvec_free(bgcnt_vec * vec);
+static 		  void bcvec_push_back(bgcnt_vec * vec, BlockNumber bg);
+static inline void bcvec_inc_last(bgcnt_vec * vec);
+
+
 // initialization for internal structs
 static inline void InitSeqScanStatsEntry(BlockGroupScanListElem * temp, ScanId id, ScanHashEntry * sdata, BlockNumber bgnum);
 static inline void InitBlockGroupData(BlockGroupData * data);
+static inline void InitBitmapScanBlockGroupCountVec(struct BitmapHeapScanState * scan, bgcnt_vec * v);
 
 
 // memory management for BlockGroupScanListElem
@@ -206,7 +215,6 @@ Size PbmShmemSize(void) {
  * Setup data structures for a new sequential scan.
  */
 void PBM_RegisterSeqScan(HeapScanDesc scan) {
-	bool found;
 	ScanId id;
 	ScanHashEntry * s_entry;
 	TableData tbl;
@@ -214,10 +222,8 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 	BlockGroupHashEntry * bseg_first;
 	BlockNumber startblock;
 	BlockNumber nblocks, nblock_groups;
-	BlockNumber last_block, last_block_group, last_block_seg;
 	struct scan_elem_allocation_state alloc_state;
 	int bgnum;
-	const float init_est_speed = pbm->initial_est_speed;
 
 	/*
 	 * Get stats from the scan.
@@ -256,34 +262,9 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 		.seg = 0,
 	};
 
-
-	/* Insert the scan metadata & generate scan ID */
-	LOCK_GUARD_V2(PbmScansLock, LW_EXCLUSIVE) {
-		// Generate scan ID
-		id = pbm->next_id;
-		pbm->next_id += 1;
-
-		// Create s_entry for the scan in the hash map
-		s_entry = search_scan(id, HASH_ENTER, &found);
-		Assert(!found); // should be inserted...
-	}
-
-	/*
-	 * Initialize the entry. It is OK to do this outside the lock, because we
-	 * haven't associated the scan with any block groups yet (so no one will by
-	 * trying to access it yet.
-	 */
-	s_entry->data = (ScanData) {
-			// These fields never change
-			.tbl = tbl,
-			.startBlock = startblock,
-			.nblocks = nblocks,
-			// These stats will be updated later
-			.stats = (SharedScanStats) {
-				.est_speed = init_est_speed,
-				.blocks_scanned = 0,
-			},
-	};
+	/* Create a new entry for the scan */
+	s_entry = RegisterCreateScanEntry(&tbl, startblock, nblocks);
+	id = s_entry->id;
 
 	/* Make sure every block group is present in the map! */
 	bseg_first = RegisterInitBlockGroupEntries(&bgkey, nblocks);
@@ -300,7 +281,7 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 	 * PQ if applicable
 	 */
 
-	// refresh the PQ first if needed
+	/* Refresh the PQ first if needed */
 	PQ_RefreshRequestedBuckets();
 
 	Assert(nblock_groups == 0 || NULL != bseg_first);
@@ -322,15 +303,15 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 			/* Get an element for the block group scan list */
 			scan_entry = alloc_scan_list_elem(&alloc_state);
 
-			// Initialize the list element & push to the list
+			/* Initialize the list element & push to the list */
 			InitSeqScanStatsEntry(scan_entry, id, s_entry, bgnum);
 
-			// Push the scan entry to the block group list
+			/* Push the scan entry to the block group list */
 			bg_lock_scans(data, LW_EXCLUSIVE);
 			slist_push_head(&data->scans_list, &scan_entry->slist);
 			bg_unlock_scans(data);
 
-			// Refresh the block group in the PQ if applicable
+			/* Refresh the block group in the PQ if applicable */
 			RefreshBlockGroup(data);
 		}
 	}
@@ -523,7 +504,6 @@ void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) 
  * Setup data structures for tracking a bitmap scan.
  */
 extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
-	bool found;
 	ScanId id;
 	ScanHashEntry * s_entry;
 	TableData tbl;
@@ -532,34 +512,11 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 	BlockGroupHashEntry * bseg_cur;
 	BlockNumber cnt;
 	Relation rel = scan->ss.ss_currentRelation;
+	bgcnt_vec v;
+	struct scan_elem_allocation_state alloc_state;
 
-	const float init_est_speed = pbm->initial_est_speed;
-
-	// Need to know # of blocks.
+	/* Need to know # of blocks. */
 	const BlockNumber nblocks = RelationGetNumberOfBlocks(scan->ss.ss_currentRelation);
-
-	/*
-	 * TESTING
-	 */
-	elog(INFO, "PBM_RegisterBitmapScan!");
-
-	{
-		RelFileNode rnode1 = scan->ss.ss_currentRelation->rd_node;
-		RelFileNode rnode2 = scan->ss.ss_currentScanDesc->rs_rd->rd_node;
-
-		elog(INFO, "PBM_RegisterBitmapScan: nblocks=%d, "
-				   "rnode1={spc=%u, db=%u, rel=%u}, "
-				   "rnode2={spc=%u, db=%u, rel=%u}",
-			 nblocks,
-			 rnode1.spcNode, rnode1.dbNode, rnode1.relNode,
-			 rnode2.spcNode, rnode2.dbNode, rnode2.relNode
-		);
-	}
-	/*
-	 * END TESTING
-	 */
-
-
 
 	/* Keys for hash tables */
 	tbl = (TableData){
@@ -573,39 +530,9 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 		.seg = 0,
 	};
 
-
-	/* Insert the scan metadata & generate scan ID */
-	LOCK_GUARD_V2(PbmScansLock, LW_EXCLUSIVE) {
-		// Generate scan ID
-		id = pbm->next_id;
-		pbm->next_id += 1;
-
-		// Create s_entry for the scan in the hash map
-		s_entry = search_scan(id, HASH_ENTER, &found);
-		Assert(!found); // should be inserted...
-	}
-
-	/*
-	 * Initialize the entry. It is OK to do this outside the lock, because we
-	 * haven't associated the scan with any block groups yet (so no one will by
-	 * trying to access it yet.
-	 */
-	s_entry->data = (ScanData) {
-			// These fields never change
-			.tbl = tbl,
-			.startBlock = 0, // bitmap scan always starts at 0
-			.nblocks = nblocks,
-			// These stats will be updated later
-			.stats = (SharedScanStats) {
-				.est_speed = init_est_speed,
-				.blocks_scanned = 0,
-			},
-	};
-
-// TODO maybe move this after we find the list of block groups...
-	/* Remember the PBM data in the scan */
-	scan->scanId = id;
-	scan->pbmSharedScanData = s_entry;
+	/* Create a new entry for the scan */
+	s_entry = RegisterCreateScanEntry(&tbl, 0, nblocks);
+	id = s_entry->id;
 
 	/* Make sure every block group is present in the map! */
 	bseg_first = RegisterInitBlockGroupEntries(&bgkey, nblocks);
@@ -613,7 +540,82 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 	/* Refresh the PQ first if needed */
 	PQ_RefreshRequestedBuckets();
 
-	// TODO add scan for the block group segments... Need to figure out exactly which block groups actually need it though!
+	/* Determine the block groups that will be scanned from the bitmap */
+	InitBitmapScanBlockGroupCountVec(scan, &v);
+
+	/*
+	 * Add the scan for each block group which will be referenced.
+	 */
+	bseg_cur = bseg_first;
+	cnt = 0;
+	alloc_state = (struct scan_elem_allocation_state) {
+		.new_stats = NULL,
+		.left_to_allocate = v.len,
+	};
+	for (int i = 0; i < v.len; ++i) {
+		BlockNumber cur_group = v.items[i].block_group;
+		BlockNumber cur_group_seg = BLOCK_GROUP_SEGMENT(cur_group);
+		BlockGroupData * data;
+		BlockGroupScanListElem * scan_entry = NULL;
+
+		/* Traverse forwards to the segment for the next block group */
+		while (bseg_cur->key.seg < cur_group_seg) {
+			bseg_cur = bseg_cur->seg_next;
+		}
+
+		/* The actual block group */
+		data = &bseg_cur->groups[cur_group % BLOCK_GROUP_SEG_SIZE];
+
+		/* Get an element for the block group scan list */
+		scan_entry = alloc_scan_list_elem(&alloc_state);
+
+		/*
+		 * Initialize the scan stats entry. `blocks_behind` is the cumulative
+		 * total of the counts in `v` so far.
+		 */
+		*scan_entry = (BlockGroupScanListElem) {
+			.scan_id = id,
+			.scan_entry = s_entry,
+			.blocks_behind = cnt,
+		};
+
+		/* Push the scan entry to the block group list */
+		bg_lock_scans(data, LW_EXCLUSIVE);
+		slist_push_head(&data->scans_list, &scan_entry->slist);
+		bg_unlock_scans(data);
+
+		/* Refresh the block group in the PQ if applicable */
+		RefreshBlockGroup(data);
+
+		/* Track cumulative total */
+		cnt += v.items[i].blk_cnt;
+	}
+
+	/* Remember the PBM data in the scan */
+	scan->scanId = id;
+	scan->pbmSharedScanData = s_entry;
+	scan->pbmLocalScanData = (struct PBM_LocalBitmapScanState){
+			.last_pos = 0,
+			.last_report_time = get_time_ns(),
+			.block_groups = v,
+	};
+
+#ifdef TRACE_PBM
+	elog(INFO, "PBM_RegisterBitmapScan(%lu)", id);
+	for (int i = 0; i < v.len; ++i) {
+		elog(INFO, "PBM_RegisterBitmapScan(%lu) bitmap block_group=%u, cnt=%u",
+			 id, v.items[i].block_group, v.items[i].blk_cnt
+		);
+	}
+
+#ifdef TRACE_PBM_PRINT_SCANMAP
+	debug_log_scan_map();
+#endif // TRACE_PBM_PRINT_SCANMAP
+
+#ifdef TRACE_PBM_PRINT_BLOCKGROUPMAP
+	debug_log_blockgroup_map();
+#endif // TRACE_PBM_PRINT_BLOCKGROUPMAP
+#endif /* TRACE_PBM */
 }
 
 /*
@@ -907,6 +909,46 @@ BlockGroupHashEntry * RegisterInitBlockGroupEntries(BlockGroupHashKey *const bgk
 }
 
 /*
+ * The main logic for Register*Scan to create the new scan metadata entry.
+ */
+ScanHashEntry * RegisterCreateScanEntry(TableData *const tbl, const BlockNumber startblock, const BlockNumber nblocks) {
+	ScanId id;
+	ScanHashEntry * s_entry;
+	bool found;
+	const float init_est_speed = pbm->initial_est_speed;
+
+	/* Insert the scan metadata & generate scan ID */
+	LOCK_GUARD_V2(PbmScansLock, LW_EXCLUSIVE) {
+		// Generate scan ID
+		id = pbm->next_id;
+		pbm->next_id += 1;
+
+		// Create s_entry for the scan in the hash map
+		s_entry = search_scan(id, HASH_ENTER, &found);
+		Assert(!found); // should be inserted...
+	}
+
+	/*
+	 * Initialize the entry. It is OK to do this outside the lock, because we
+	 * haven't associated the scan with any block groups yet (so no one will by
+	 * trying to access it yet.
+	 */
+	s_entry->data = (ScanData) {
+			// These fields never change
+			.tbl = (*tbl),
+			.startBlock = startblock,
+			.nblocks = nblocks,
+			// These stats will be updated later
+			.stats = (SharedScanStats) {
+					.est_speed = init_est_speed,
+					.blocks_scanned = 0,
+			},
+	};
+
+	return s_entry;
+}
+
+/*
  * Remove a scan from the scan map on Unregister*
  */
 void UnregisterDeleteScan(const ScanId id, const SharedScanStats stats) {
@@ -982,8 +1024,55 @@ unsigned long get_timeslice(void) {
 	return ns_to_timeslice(get_time_ns());
 }
 
-/* Initialize an entry in the list of scans for a block group */
-void InitScanStatsEntry(BlockGroupScanListElem *temp, ScanId id, ScanHashEntry *sdata, BlockNumber bgnum) {
+/* Create an empty bcvec */
+bgcnt_vec bcvec_init(void) {
+	int cap = 4;
+	return (bgcnt_vec) {
+			.len = 0,
+			.cap = cap,
+			.items = palloc(sizeof(struct bg_ct_pair) * cap),
+	};
+}
+
+void bcvec_free(bgcnt_vec * vec) {
+	pfree(vec->items);
+}
+
+/* Puch the given block group to the end of the bcvec with count 1 */
+void bcvec_push_back(bgcnt_vec * vec, BlockNumber bg) {
+
+	// Grow if needed
+	if (vec->len >= vec->cap) {
+		int new_cap = vec->cap * 2;
+
+		struct bg_ct_pair * new_items = palloc(sizeof(struct bg_ct_pair) * new_cap);
+
+		for (int i = 0; i < vec->len; ++i) {
+			new_items[i] = vec->items[i];
+		}
+
+		pfree(vec->items);
+
+		vec->cap = new_cap;
+		vec->items = new_items;
+	}
+
+	// Insert the new item
+	vec->items[vec->len] = (struct bg_ct_pair) {
+			.block_group = bg,
+			.blk_cnt = 1,
+	};
+
+	vec->len += 1;
+}
+
+/* Increment the count of the last item by 1 */
+void bcvec_inc_last(bgcnt_vec * vec) {
+	vec->items[vec->len - 1].blk_cnt += 1;
+}
+
+/* Initialize an entry in the list of scans for a block group, for a sequential scan. */
+void InitSeqScanStatsEntry(BlockGroupScanListElem *temp, ScanId id, ScanHashEntry *sdata, BlockNumber bgnum) {
 	const BlockNumber startblock = sdata->data.startBlock;
 	const BlockNumber nblocks = sdata->data.nblocks;
 	// convert group # -> block #
@@ -1032,6 +1121,62 @@ void InitBlockGroupData(BlockGroupData * data) {
 	SpinLockInit(&data->scan_lock);
 	SpinLockInit(&data->buf_lock);
 #endif // PBM_BG_LOCK_MODE
+}
+
+/*
+ * Find the block groups (& number of blocks in each group) that will be seen
+ * by a bitmap scan.
+ */
+void InitBitmapScanBlockGroupCountVec(struct BitmapHeapScanState *scan, bgcnt_vec *v) {
+	TIDBitmap * tbm = scan->tbm;
+	TBMIterator * it_private;
+	dsa_pointer it_shared_dsa;
+	dsa_area * dsa = scan->ss.ps.state->es_query_dsa;
+	TBMSharedIterator * it_shared;
+	TBMIterateResult * res = NULL;
+	BlockNumber prev_bg = InvalidBlockNumber;
+	bool parallel = (NULL != scan->pstate);
+	BlockNumber bg;
+
+	*v = bcvec_init();
+
+	/* Depending on whether the scan is parallel, start iterating the bitmap
+	 * either privately or shared. */
+	if (!parallel) {
+		// ### consider an "iterate_lossy" method which only outputs block #s, ignoring the tuple offsets
+		it_private = tbm_begin_iterate(tbm);
+	} else {
+		it_shared_dsa = tbm_prepare_shared_iterate(tbm);
+		it_shared = tbm_attach_shared_iterate(dsa, it_shared_dsa);
+	}
+
+	for (;;) {
+		/* Next block */
+		if (!parallel) {
+			res = tbm_iterate(it_private);
+		} else {
+			res = tbm_shared_iterate(it_shared);
+		}
+
+		/* Stop when the iterator ends */
+		if (NULL == res) break;
+
+		/* Check block group of next block */
+		bg = BLOCK_GROUP(res->blockno);
+
+		if (bg != prev_bg) {
+			bcvec_push_back(v, bg);
+			prev_bg = bg;
+		} else {
+			bcvec_inc_last(v);
+		}
+	}
+
+	if (!parallel) {
+		tbm_end_iterate(it_private);
+	} else {
+		tbm_end_shared_iterate(it_shared);
+	}
 }
 
 /* Pop something of the scan stats free list. Returns NULL if it is empty */
