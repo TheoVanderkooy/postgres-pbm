@@ -47,9 +47,9 @@ struct scan_elem_allocation_state {
 	BlockNumber left_to_allocate;
 };
 static inline BlockGroupScanListElem * alloc_scan_list_elem(struct scan_elem_allocation_state * alloc_state);
-
 static inline BlockNumber num_block_groups(BlockNumber nblocks);
 static inline BlockNumber num_block_group_segments(BlockNumber nblocks);
+static inline void update_scan_speed_estimate(unsigned long elapsed, uint32 blocks, ScanHashEntry * entry);
 
 
 // get current time
@@ -404,12 +404,9 @@ void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) 
 	BlockNumber blocks;
 	const BlockNumber prevGroupPos	= BLOCK_GROUP(scan->pbmLocalScanStats.last_pos);
 	const BlockNumber curGroupPos	= BLOCK_GROUP(pos);
-	float speed;
 	BlockGroupHashKey bs_key;
-	SharedScanStats stats;
 
 	Assert(entry != NULL);
-	stats = entry->data.stats;
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_REPORT_PROGRESS)
 	/* If we want to trace *every* call */
@@ -449,14 +446,10 @@ void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) 
 		// looped around back to the start block
 		blocks = pos + entry->data.nblocks - scan->pbmLocalScanStats.last_pos;
 	}
-	speed = (float)(blocks) / (float)(elapsed);
-// ### estimating speed: should do better than this. e.g. exponentially weighted average, or moving average.
 	scan->pbmLocalScanStats.last_report_time = curTime;
 	scan->pbmLocalScanStats.last_pos = pos;
-	// update shared stats with a single assignment
-	stats.blocks_scanned += blocks;
-	stats.est_speed = speed;
-	entry->data.stats = stats;
+
+	update_scan_speed_estimate(elapsed, blocks, entry);
 
 
 	PQ_RefreshRequestedBuckets();
@@ -595,9 +588,10 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 	scan->scanId = id;
 	scan->pbmSharedScanData = s_entry;
 	scan->pbmLocalScanData = (struct PBM_LocalBitmapScanState){
-			.last_pos = 0,
-			.last_report_time = get_time_ns(),
-			.block_groups = v,
+		.last_pos = 0,
+		.last_report_time = get_time_ns(),
+		.block_groups = v,
+		.vec_idx = 0,
 	};
 
 #ifdef TRACE_PBM
@@ -634,8 +628,8 @@ extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* ms
 	 * TESTING
 	 */
 	// TODO remove `msg` parameter once we decide where this should get called
-	elog(INFO, "PBM_UnregisterBitmapScan! %s   do_anything=%s",
-		 msg, (scan->pbmSharedScanData != NULL ? "true" : "false"));
+	elog(INFO, "PBM_UnregisterBitmapScan(%lu)! %s   do_anything=%s",
+		 id, msg, (scan->pbmSharedScanData != NULL ? "true" : "false"));
 	/*
 	 * END TESTING
 	 */
@@ -655,11 +649,24 @@ extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* ms
 	// Remove from the remaining block groups
 	LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
 		const uint32 upper = (scanData.nblocks > 0 ? BLOCK_GROUP(scanData.nblocks-1) + 1 : 0);
-		const uint32 start = 0; // TODO pick start from stats
+		const uint32 start = BLOCK_GROUP(scan->pbmLocalScanData.last_pos); // TODO pick start from stats
 		const uint32 end = upper; // TODO remember what the end should be on Register??
 
+// DEBUGGING
+#if defined(TRACE_PBM)
+		elog(INFO, "PBM_UnregisterBitmapScan(%lu)! start=%u end=%u",
+			 id, start, end);
+#endif
 		// TODO improve this
 		remove_scan_from_block_range(&bgkey, id, start, end);
+
+		/*
+		 * TODO:
+		 *  - find the first block: from the array or based on whatever is stored in the stats
+		 *  - traverse blocks similar to how registering goes
+		 *  - delete from them!
+		 *  - Refresh the group!
+		 */
 	}
 
 	// Remove from the scan map
@@ -683,17 +690,96 @@ extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* ms
 /*
  * Update progress of a bitmap scan.
  */
-extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *scan, BlockNumber pos) {
-	elog(INFO, "PBM_ReportBitmapScanPosition!   do_anything=%s",
-		 (scan->pbmSharedScanData != NULL ? "true" : "false"));
+extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *const scan, const BlockNumber pos) {
+	const ScanId id = scan->scanId;
+	unsigned long curTime, elapsed;
+	ScanHashEntry *const scan_entry = scan->pbmSharedScanData;
+	bgcnt_vec *const v = &scan->pbmLocalScanData.block_groups;
+	int i = scan->pbmLocalScanData.vec_idx;
+	const BlockNumber bg = BLOCK_GROUP(pos);
+	BlockNumber cnt = 0;
+	BlockGroupHashKey bs_key;
+	BlockGroupHashEntry * bg_entry;
+	bool found;
 
-	/*
-	 * TODO:
-	 *  - when report, want to list the block group which was finished. Even parallel iterator could do this
-	 *  - ... actually, if only the primary reports it can report current position and clean up after the others,
-	 *  	since primary starting one block means someone else has already taken everything earlier (even if not
-	 *  	done with it yet, will at least have it pinned)
-	 */
+#if defined(TRACE_PBM)
+	elog(INFO, "PBM_ReportBitmapScanPosition(%lu): pos=%u bg=%u   is_registered=%s",
+		 id, pos, bg, (scan->pbmSharedScanData != NULL ? "true" : "false"));
+#endif
+
+	/* Nothing to do if the scan is not registered. I *think* this will happen
+	 * with the non-leader parallel workers for a parallel bitmap scan */
+	if (NULL == scan->pbmSharedScanData) {
+		return;
+	}
+
+	/* Nothing to do if this isn't a new block group. */
+	if (bg == BLOCK_GROUP(scan->pbmLocalScanData.last_pos)) {
+		return;
+	}
+
+	/* This is the first time reporting progress, and we haven't actually done
+	 * anything yet so SKIP */
+	if (v->len == 0 || bg == v->items[0].block_group) {
+		Assert(0 == i);
+		return;
+	}
+
+	/* Sanity checks */
+	Assert(pos != InvalidBlockNumber);
+	Assert(bg > v->items[i].block_group);
+	Assert(scan_entry != NULL);
+
+	bs_key = (BlockGroupHashKey) {
+		.rnode = scan_entry->data.tbl.rnode,
+		.forkNum = scan_entry->data.tbl.forkNum,
+		.seg = BLOCK_GROUP_SEGMENT(v->items[i].block_group), // First group to unregister
+	};
+
+	/* Find the first relevant segment */
+	LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
+		bg_entry = hash_search(pbm->BlockGroupMap, &bs_key, HASH_FIND, &found);
+	}
+	Assert(found);
+
+	PQ_RefreshRequestedBuckets();
+
+// ### probably want to extract a method here to share with Unregister...
+	/* Remove scan from the relevant block groups */
+	for ( ; bg > v->items[i].block_group; ++i) {
+		const BlockNumber blk = v->items[i].block_group;
+		const BlockNumber seg = BLOCK_GROUP_SEGMENT(blk);
+		BlockGroupData * data;
+		bool deleted;
+
+		Assert(i < v->len);
+
+		/* Advance segment iterator to the next needed segment if applicable */
+		while (bg_entry->key.seg < seg) {
+			bg_entry = bg_entry->seg_next;
+			Assert(bg_entry != NULL);
+		}
+
+		/* Delete scan from the group and refresh the group if applicable */
+		data = &bg_entry->groups[blk % BLOCK_GROUP_SEG_SIZE];
+		deleted = block_group_delete_scan(id, data);
+		if (deleted) {
+			RefreshBlockGroup(data);
+		}
+
+		/* Track # of blocks scanned since last report */
+		cnt += v->items[i].blk_cnt;
+	}
+
+	/* Update processing speed estimates. */
+	curTime = get_time_ns();
+	elapsed = curTime - scan->pbmLocalScanData.last_report_time;
+	update_scan_speed_estimate(elapsed, i - scan->pbmLocalScanData.vec_idx, scan_entry);
+
+	/* Update data stored locally in the scan. */
+	scan->pbmLocalScanData.vec_idx = i;
+	scan->pbmLocalScanData.last_report_time = curTime;
+	scan->pbmLocalScanData.last_pos = pos;
 }
 
 
@@ -1009,6 +1095,18 @@ BlockNumber num_block_group_segments(BlockNumber nblocks) {
 	BlockNumber nblock_segs = (nblocks == 0 ? 0 : last_block_seg + 1);
 
 	return nblock_segs;
+}
+
+static inline void update_scan_speed_estimate(unsigned long elapsed, uint32 blocks, ScanHashEntry * entry) {
+	float speed = (float)(blocks) / (float)(elapsed);
+	SharedScanStats stats = entry->data.stats;
+
+// ### estimating speed: should do better than this. e.g. exponentially weighted average, or moving average.
+
+	/* update shared stats with a single assignment */
+	stats.blocks_scanned += blocks;
+	stats.est_speed = speed;
+	entry->data.stats = stats;
 }
 
 /* Current time in nanoseconds */
@@ -1494,6 +1592,8 @@ bool block_group_delete_scan(ScanId id, BlockGroupData *groupData) {
  *
  * This requires at least SHARED lock on PbmBlocksLock, and locks the individual
  * block groups as required.
+ *
+ * ### Improvement: factor out the search so we don't need the shared lock while we do everything else.
  */
 void remove_scan_from_block_range(BlockGroupHashKey *bs_key, const ScanId id, const uint32 lo, const uint32 hi) {
 	uint32 bgnum;

@@ -29,7 +29,7 @@ struct PBM_LocalBitmapScanState {
 	unsigned long last_report_time;
 	uint32 last_pos;   /* This is in terms of *blocks*, not block groups */
 	bgcnt_vec block_groups;	/* Record interested block groups wtih # of blocks in each */
-	// TODO probably need an index of the next position in the block_groups thing for report
+	int vec_idx; /* Track current position in `block_groups` as we report progress */
 };
 
 
