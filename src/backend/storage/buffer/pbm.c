@@ -39,8 +39,13 @@ PbmShared* pbm;
 
 
 // Shared logic of the public API methods (register/unregister/report position)
-static BlockGroupHashEntry * RegisterInitBlockGroupEntries(BlockGroupHashKey * bgkey, BlockNumber nblock_segs);
-static void UnregisterDeleteScan(ScanId id, SharedScanStats stats);
+static inline BlockGroupHashEntry * RegisterInitBlockGroupEntries(BlockGroupHashKey * bgkey, BlockNumber nblock_segs);
+static inline void UnregisterDeleteScan(ScanId id, SharedScanStats stats);
+struct scan_elem_allocation_state {
+	BlockGroupScanListElem * new_stats;
+	BlockNumber left_to_allocate;
+};
+static inline BlockGroupScanListElem * alloc_scan_list_elem(struct scan_elem_allocation_state * alloc_state);
 
 
 // get current time
@@ -201,7 +206,7 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 	BlockNumber startblock;
 	BlockNumber nblocks, nblock_groups, nblock_segs;
 	BlockNumber last_block, last_block_group, last_block_seg;
-	BlockGroupScanListElem * new_stats = NULL;
+	struct scan_elem_allocation_state alloc_state;
 	int bgnum;
 	const float init_est_speed = pbm->initial_est_speed;
 
@@ -296,6 +301,10 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 	Assert(nblock_groups == 0 || NULL != bseg_first);
 	Assert(nblock_groups == 0 || NULL == bseg_first->seg_prev);
 	bgnum = 0;
+	alloc_state = (struct scan_elem_allocation_state){
+			.new_stats = NULL,
+			.left_to_allocate = nblock_groups,
+	};
 	// Loop over block group segments
 	for (BlockGroupHashEntry * bseg_cur = bseg_first; bgnum < nblock_groups; bseg_cur = bseg_cur->seg_next) {
 		Assert(bseg_cur != NULL);
@@ -306,21 +315,7 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 			BlockGroupScanListElem * scan_entry = NULL;
 
 			/* Get an element for the block group scan list */
-			if (NULL != new_stats) {
-				/* We've already allocated for these block groups, ise the allocated stuff... */
-				scan_entry = new_stats;
-				new_stats += 1;
-			} else {
-				/* Try to allocate from the free list */
-				scan_entry = try_get_bg_scan_elem();
-
-				/* If nothing free, allocate enough for everything else */
-				if (NULL == scan_entry) {
-					new_stats = ShmemAlloc((nblock_groups - bgnum) * sizeof(BlockGroupScanListElem));
-					scan_entry = new_stats;
-					new_stats += 1;
-				}
-			}
+			scan_entry = alloc_scan_list_elem(&alloc_state);
 
 			// Initialize the list element & push to the list
 			InitSeqScanStatsEntry(scan_entry, id, s_entry, bgnum);
@@ -611,7 +606,7 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 	/* Make sure every block group is present in the map! */
 	bseg_first = RegisterInitBlockGroupEntries(&bgkey, nblock_segs);
 
-	/* refresh the PQ first if needed */
+	/* Refresh the PQ first if needed */
 	PQ_RefreshRequestedBuckets();
 
 	// TODO add scan for the block group segments... Need to figure out exactly which block groups actually need it though!
@@ -671,11 +666,17 @@ extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* ms
 /*
  * Update progress of a bitmap scan.
  */
-extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState * scan /*TODO other args?*/) {
+extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *scan, BlockNumber pos) {
 	elog(INFO, "PBM_ReportBitmapScanPosition!   do_anything=%s",
 		 (scan->pbmSharedScanData != NULL ? "true" : "false"));
 
-	// TODO!
+	/*
+	 * TODO:
+	 *  - when report, want to list the block group which was finished. Even parallel iterator could do this
+	 *  - ... actually, if only the primary reports it can report current position and clean up after the others,
+	 *  	since primary starting one block means someone else has already taken everything earlier (even if not
+	 *  	done with it yet, will at least have it pinned)
+	 */
 }
 
 
@@ -907,6 +908,32 @@ void UnregisterDeleteScan(const ScanId id, const SharedScanStats stats) {
 		new_est = pbm->initial_est_speed * alpha + stats.est_speed * (1.f - alpha);
 		pbm->initial_est_speed = new_est;
 	}
+}
+
+/* Helper for allocating block group scan elements when registering scans */
+BlockGroupScanListElem * alloc_scan_list_elem(struct scan_elem_allocation_state * alloc_state) {
+	BlockGroupScanListElem * ret = NULL;
+
+	/* Get an element for the block group scan list */
+	if (NULL != alloc_state->new_stats) {
+		/* We've already allocated for these block groups, use the allocated stuff... */
+		ret = alloc_state->new_stats;
+		alloc_state->new_stats += 1;
+	} else {
+		/* Try to allocate from the free list */
+		ret = try_get_bg_scan_elem();
+
+		/* If nothing free, allocate enough for everything else */
+		if (NULL == ret) {
+			alloc_state->new_stats = ShmemAlloc(alloc_state->left_to_allocate * sizeof(BlockGroupScanListElem));
+			ret = alloc_state->new_stats;
+			alloc_state->new_stats += 1;
+		}
+	}
+
+	Assert(alloc_state->left_to_allocate > 0);
+	alloc_state->left_to_allocate -= 1;
+	return ret;
 }
 
 /* Current time in nanoseconds */

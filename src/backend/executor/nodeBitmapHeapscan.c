@@ -265,7 +265,7 @@ BitmapHeapNext(BitmapHeapScanState *node)
 
 #ifdef USE_PBM
 			/* Update the PBM when we get a new page */
-			PBM_ReportBitmapScanPosition(node /* TODO probably need to pass in something... */);
+			PBM_ReportBitmapScanPosition(node, tbmres->blockno);
 #endif /* USE_PBM */
 		}
 		else

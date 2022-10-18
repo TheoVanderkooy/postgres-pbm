@@ -41,7 +41,7 @@ struct HeapScanDescData;
 /* ===== TYPES DEFINITIONS ===== */
 
 /* Scan statistics that don't need to be shared */
-struct PBM_LocalSeqScanStats{
+struct PBM_LocalSeqScanStats {
 	unsigned long last_report_time;
 // ### is this already in the scan descriptor?? use that instead?
 	BlockNumber	last_pos;	/* This is in terms of # of *blocks*, not block groups */
@@ -65,7 +65,7 @@ extern void PBM_ReportSeqScanPosition(struct HeapScanDescData *scan, BlockNumber
 
 extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan);
 extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* msg/*(to be removed)*/);
-extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState * scan /*TODO other args?*/);
+extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *scan, BlockNumber pos);
 
 
 /* ===== BUFFER TRACKING ===== */
