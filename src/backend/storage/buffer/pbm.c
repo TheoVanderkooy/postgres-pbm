@@ -675,6 +675,8 @@ extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* ms
 	// After deleting the scan, unlink from the scan state so it doesn't try to end the scan again
 	scan->pbmSharedScanData = NULL;
 
+	// TODO do we want to do this on rescan?
+	bcvec_free(&scan->pbmLocalScanData.block_groups);
 
 #ifdef TRACE_PBM
 #ifdef TRACE_PBM_PRINT_SCANMAP
@@ -696,6 +698,7 @@ extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *const scan,
 	ScanHashEntry *const scan_entry = scan->pbmSharedScanData;
 	bgcnt_vec *const v = &scan->pbmLocalScanData.block_groups;
 	int i = scan->pbmLocalScanData.vec_idx;
+	int j = i;
 	const BlockNumber bg = BLOCK_GROUP(pos);
 	BlockNumber cnt = 0;
 	BlockGroupHashKey bs_key;
@@ -742,6 +745,20 @@ extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *const scan,
 	}
 	Assert(found);
 
+	/* Update processing speed estimates. */
+	curTime = get_time_ns();
+	elapsed = curTime - scan->pbmLocalScanData.last_report_time;
+	while (bg > v->items[j].block_group) {
+		j += 1;
+	}
+	update_scan_speed_estimate(elapsed, j - scan->pbmLocalScanData.vec_idx, scan_entry);
+
+	/* Update data stored locally in the scan. */
+	scan->pbmLocalScanData.vec_idx = j;
+	scan->pbmLocalScanData.last_report_time = curTime;
+	scan->pbmLocalScanData.last_pos = pos;
+
+
 	PQ_RefreshRequestedBuckets();
 
 // ### probably want to extract a method here to share with Unregister...
@@ -770,16 +787,6 @@ extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *const scan,
 		/* Track # of blocks scanned since last report */
 		cnt += v->items[i].blk_cnt;
 	}
-
-	/* Update processing speed estimates. */
-	curTime = get_time_ns();
-	elapsed = curTime - scan->pbmLocalScanData.last_report_time;
-	update_scan_speed_estimate(elapsed, i - scan->pbmLocalScanData.vec_idx, scan_entry);
-
-	/* Update data stored locally in the scan. */
-	scan->pbmLocalScanData.vec_idx = i;
-	scan->pbmLocalScanData.last_report_time = curTime;
-	scan->pbmLocalScanData.last_pos = pos;
 }
 
 
