@@ -360,6 +360,11 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 		.forkNum = MAIN_FORKNUM, // Sequential scans only use main fork
 		.seg = 0,
 	};
+	/* upper is the last possible block group for the scan, +1 since upper
+ 	 * bound is exclusive */
+	const uint32 upper = (scanData.nblocks > 0 ? BLOCK_GROUP(scanData.nblocks-1) + 1 : 0);
+	const uint32 start = BLOCK_GROUP(scan->pbmLocalScanStats.last_pos);
+	const uint32 end   = (0 == scanData.startBlock ? upper : scanData.startBlock);
 
 	/* Nothing to do if not registered in the first place */
 	if (NULL == scan->pbmSharedScanData) {
@@ -380,26 +385,18 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 	PQ_RefreshRequestedBuckets();
 
 	// For each block in the scan: remove it from the list of scans
-	LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
-		/* upper is the last possible block group for the scan, +1 since upper
-		 * bound is exclusive */
-		const uint32 upper = (scanData.nblocks > 0 ? BLOCK_GROUP(scanData.nblocks-1) + 1 : 0);
-		const uint32 start = BLOCK_GROUP(scan->pbmLocalScanStats.last_pos);
-		const uint32 end   = (0 == scanData.startBlock ? upper : scanData.startBlock);
 
-		// Everything before `start` should already be removed when the scan passed that location
-		// Everything from `start` (inclusive) to `end` (exclusive) needs to have the scan removed
-
-		if (0 == scanData.nblocks) {
-			// Nothing to unregister if there are no blocks at all
-		} else 	if (start <= end) {
-			// remove between start and end
-			remove_seq_scan_from_block_range(&bgkey, id, start, end);
-		} else {
-			// remove between start and end, but wrapping around when appropriate
-			remove_seq_scan_from_block_range(&bgkey, id, start, upper);
-			remove_seq_scan_from_block_range(&bgkey, id, 0, end);
-		}
+	// Everything before `start` should already be removed when the scan passed that location
+	// Everything from `start` (inclusive) to `end` (exclusive) needs to have the scan removed
+	if (0 == scanData.nblocks) {
+		// Nothing to unregister if there are no blocks at all
+	} else 	if (start <= end) {
+		// remove between start and end
+		remove_seq_scan_from_block_range(&bgkey, id, start, end);
+	} else {
+		// remove between start and end, but wrapping around when appropriate
+		remove_seq_scan_from_block_range(&bgkey, id, start, upper);
+		remove_seq_scan_from_block_range(&bgkey, id, 0, end);
 	}
 
 	// Remove from the scan map
@@ -474,23 +471,21 @@ void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) 
 
 	// Remove the scan from blocks in range [prevGroupPos, curGroupPos)
 	if (curGroupPos != prevGroupPos) {
-		LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
-			BlockNumber upper = curGroupPos;
+		BlockNumber upper = curGroupPos;
 
-			// special handling if we wrapped around (note: if we update every block group this probably does nothing
-			if (curGroupPos < prevGroupPos) {
-				/* First delete the start part */
-				remove_seq_scan_from_block_range(&bs_key, id, 0, curGroupPos);
+		// special handling if we wrapped around (note: if we update every block group this probably does nothing
+		if (curGroupPos < prevGroupPos) {
+			/* First delete the start part */
+			remove_seq_scan_from_block_range(&bs_key, id, 0, curGroupPos);
 
-				/* find last block:
-				 * (nblocks - 1) is block number of the last block, and range is [lo,hi) so add 1 to include  the last block.
-				 */
-				upper = BLOCK_GROUP(entry->data.nblocks - 1) + 1;
-			}
-
-			// Remove the scan from the blocks
-			remove_seq_scan_from_block_range(&bs_key, id, prevGroupPos, upper);
+			/* find last block:
+			 * (nblocks - 1) is block number of the last block, and range is [lo,hi) so add 1 to include  the last block.
+			 */
+			upper = BLOCK_GROUP(entry->data.nblocks - 1) + 1;
 		}
+
+		// Remove the scan from the blocks
+		remove_seq_scan_from_block_range(&bs_key, id, prevGroupPos, upper);
 	}
 
 // ### consider refreshing (at least some) block groups shortly after the scan starts --- avoid case where initial speed estimate is bad.
@@ -1587,10 +1582,8 @@ bool block_group_delete_scan(ScanId id, BlockGroupData *groupData) {
 /*
  * When the given scan is done, remove it from the remaining range of blocks.
  *
- * This requires at least SHARED lock on PbmBlocksLock, and locks the individual
+ * This acquires SHARED lock on PbmBlocksLock, and locks the individual
  * block groups as required.
- *
- * ### Improvement: factor out the search so we don't need the shared lock while we do everything else.
  */
 void remove_seq_scan_from_block_range(BlockGroupHashKey *bs_key, const ScanId id, const uint32 lo, const uint32 hi) {
 	uint32 bgnum;
@@ -1605,7 +1598,9 @@ void remove_seq_scan_from_block_range(BlockGroupHashKey *bs_key, const ScanId id
 
 	// Search for the starting hash entry
 	bs_key->seg = BLOCK_GROUP_SEGMENT(lo);
-	bs_entry = hash_search(pbm->BlockGroupMap, bs_key, HASH_FIND, &found);
+	LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
+		bs_entry = hash_search(pbm->BlockGroupMap, bs_key, HASH_FIND, &found);
+	}
 
 	/*
 	 * DEBUGGING: this got an error during `create index`
