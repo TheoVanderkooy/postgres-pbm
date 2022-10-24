@@ -23,6 +23,7 @@
 #include "utils/guc.h"
 #include "utils/rel.h"
 #include "utils/snapshot.h"
+#include "storage/pbm.h"
 
 
 #define DEFAULT_TABLE_ACCESS_METHOD	"heap"
@@ -886,7 +887,15 @@ table_beginscan(Relation rel, Snapshot snapshot,
 	uint32		flags = SO_TYPE_SEQSCAN |
 	SO_ALLOW_STRAT | SO_ALLOW_SYNC | SO_ALLOW_PAGEMODE;
 
-	return rel->rd_tableam->scan_begin(rel, snapshot, nkeys, key, NULL, flags);
+	TableScanDesc scan = rel->rd_tableam->scan_begin(rel, snapshot, nkeys, key, NULL, flags);
+
+#ifdef USE_PBM
+	/* Register the scan with the PBM. Table scan is always a heap scan */
+	PBM_RegisterSeqScan((struct HeapScanDescData *)scan);
+	// TODO theo maybe move this. want to do it after `heap_setscanlimits` if we call that...
+#endif /* USE_PBM */
+
+	return scan;
 }
 
 /*
@@ -1001,6 +1010,11 @@ table_rescan(TableScanDesc scan,
 			 struct ScanKeyData *key)
 {
 	scan->rs_rd->rd_tableam->scan_rescan(scan, key, false, false, false, false);
+
+#ifdef USE_PBM
+	/* Re-register the scan */
+	PBM_RegisterSeqScan((struct HeapScanDescData *)scan);
+#endif
 }
 
 /*

@@ -278,6 +278,8 @@ ExecSeqScanInitializeDSM(SeqScanState *node,
 	shm_toc_insert(pcxt->toc, node->ss.ps.plan->plan_node_id, pscan);
 	node->ss.ss_currentScanDesc =
 		table_beginscan_parallel(node->ss.ss_currentRelation, pscan);
+
+	// TODO theo --- parallel sequential scans??
 }
 
 /* ----------------------------------------------------------------

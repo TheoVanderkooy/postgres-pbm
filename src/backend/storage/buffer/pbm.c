@@ -227,6 +227,9 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 	struct scan_elem_allocation_state alloc_state;
 	int bgnum;
 
+	/* Should not already be registered. */
+	Assert(scan->pbmSharedScanData == NULL);
+
 	/*
 	 * Get stats from the scan.
 	 *
@@ -351,12 +354,19 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
  */
 void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 	const ScanId id = scan->scanId;
-	ScanData scanData = scan->pbmSharedScanData->data;
+	ScanData scanData;
 	BlockGroupHashKey bgkey = (BlockGroupHashKey) {
 		.rnode = scan->rs_base.rs_rd->rd_node,
 		.forkNum = MAIN_FORKNUM, // Sequential scans only use main fork
 		.seg = 0,
 	};
+
+	/* Nothing to do if not registered in the first place */
+	if (NULL == scan->pbmSharedScanData) {
+		return;
+	}
+
+	scanData = scan->pbmSharedScanData->data;
 
 #ifdef TRACE_PBM
 	elog(INFO, "PBM_UnregisterSeqScan(%lu)", id);
@@ -394,6 +404,9 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 
 	// Remove from the scan map
 	UnregisterDeleteScan(id, scanData.stats);
+
+	// Make sure we don't try to unregister again
+	scan->pbmSharedScanData = NULL;
 }
 
 /*
@@ -408,7 +421,10 @@ void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) 
 	const BlockNumber curGroupPos	= BLOCK_GROUP(pos);
 	BlockGroupHashKey bs_key;
 
-	Assert(entry != NULL);
+ 	/* Nothing to do if the scan is not registered */
+	if (NULL == entry) {
+		return;
+	}
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_REPORT_PROGRESS)
 	/* If we want to trace *every* call */
@@ -1025,9 +1041,13 @@ void UnregisterDeleteScan(const ScanId id, const SharedScanStats stats) {
 		search_scan(id, HASH_REMOVE, &found);
 		Assert(found);
 
-		// Update global initial speed estimate: geometrically-weighted average
-		new_est = pbm->initial_est_speed * alpha + stats.est_speed * (1.f - alpha);
-		pbm->initial_est_speed = new_est;
+		/* Only update the global speed estimate if the amount scanned is enough
+		 * to have a speed estimate in the first place */
+		if (stats.blocks_scanned > (1 << BLOCK_GROUP_SHIFT)) {
+			// Update global initial speed estimate: geometrically-weighted average
+			new_est = pbm->initial_est_speed * alpha + stats.est_speed * (1.f - alpha);
+			pbm->initial_est_speed = new_est;
+		}
 	}
 }
 

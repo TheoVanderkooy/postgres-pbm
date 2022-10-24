@@ -352,9 +352,10 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 // ### PBM parallel scan: does this get registered once or once-per-worker? do we care?
 	}
 
-	/* Register the scan with the PBM */
-	PBM_RegisterSeqScan(scan);
-	// TODO theo maybe move this. want to do it after `heap_setscanlimits` if we call that...
+	/* Initialize PBM fields to NULL so we know if we do *not* register the scan */
+	scan->pbmSharedScanData = NULL;
+
+	// TODO theo --- consider registering everything with the PBM here, and decide what to do with it later
 #endif /* USE_PBM */
 }
 
@@ -1337,6 +1338,11 @@ heap_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
 	 */
 	if (BufferIsValid(scan->rs_cbuf))
 		ReleaseBuffer(scan->rs_cbuf);
+
+#ifdef USE_PBM
+	/* Unregister old scan if applicable */
+	PBM_UnregisterSeqScan(scan);
+#endif
 
 	/*
 	 * reinitialize scan descriptor
