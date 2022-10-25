@@ -39,7 +39,14 @@ static const unsigned int PQ_BucketOutOfRange = (unsigned int)(-1);
 
 /* Hash map sizes */
 static const long ScanMapMaxSize = 1024;
-static const long BlockGroupMapMaxSize = (1 << 16);
+static const long BlockGroupMapMaxSize = (1 << 12);
+/*
+ * For 128 GiB = 2^37 bytes database:
+ * Block size = 8192 = 2^13 bytes
+ * Block group size = 2^5 blocks (for now)
+ * Group segment size = 2^8 groups (for now)
+ * ==> need 2^11 segments, over-estimate 2^12
+ */
 
 /*
  * What clock to use
@@ -84,8 +91,9 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 /* Debugging flags */
 #define TRACE_PBM
 //#define TRACE_PBM_REPORT_PROGRESS
-#define TRACE_PBM_PRINT_SCANMAP
-#define TRACE_PBM_PRINT_BLOCKGROUPMAP
+//#define TRACE_PBM_BITMAP_PROGRESS
+//#define TRACE_PBM_PRINT_SCANMAP
+//#define TRACE_PBM_PRINT_BLOCKGROUPMAP
 //#define TRACE_PBM_BUFFERS
 //#define TRACE_PBM_BUFFERS_NEW
 //#define TRACE_PBM_BUFFERS_EVICT

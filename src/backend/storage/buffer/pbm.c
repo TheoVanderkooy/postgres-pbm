@@ -197,9 +197,27 @@ Size PbmShmemSize(void) {
 	size = add_size(size, hash_estimate_size(ScanMapMaxSize, sizeof(ScanHashEntry)));
 	size = add_size(size, hash_estimate_size(BlockGroupMapMaxSize, sizeof(BlockGroupHashEntry)));
 
-// ### total size estimate of list of scans on each block group
-//	size = add_size(size, sizeof(BlockGroupScanListElem) * ???)
+	/*
+	 * Assuming one scan per block in the database on average: (probably an underestimate?)
+	 * 128 GiB = 2^37 B
+	 * => 2^24 blocks (blk size = 2^13 B)
+	 * => 2^19 groups (group size = 2^5 blocks for now)
+	 * round to 2^20...
+	 */
+	size = add_size(size, sizeof(BlockGroupScanListElem) * (1 << 20));
+
 	size = add_size(size, PbmPqShmemSize());
+
+#ifdef TRACE_PBM
+	{
+		Size bytes = size % 1024;
+		Size kb = (size / 1024) % 1024;
+		Size mb = (size / 1024) / 1024;
+		elog(INFO, "PBM shared mem estimated size (without extras): %lu bytes = %lu MiB, %luKiB, %lu B"
+			, size, mb, kb, bytes
+		);
+	}
+#endif
 
 
 	// actually estimate the size later... for now assume 100 MiB will be enough
@@ -254,6 +272,11 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 
 	/* Compute ranges */
 	nblock_groups = num_block_groups(nblocks);
+
+	/* Don't bother registering if the table is small enough */
+	if (nblock_groups <= 1) {
+		return;
+	}
 
 	/* Keys for hash tables */
 	tbl = (TableData){
@@ -360,11 +383,8 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 		.forkNum = MAIN_FORKNUM, // Sequential scans only use main fork
 		.seg = 0,
 	};
-	/* upper is the last possible block group for the scan, +1 since upper
- 	 * bound is exclusive */
-	const uint32 upper = (scanData.nblocks > 0 ? BLOCK_GROUP(scanData.nblocks-1) + 1 : 0);
-	const uint32 start = BLOCK_GROUP(scan->pbmLocalScanStats.last_pos);
-	const uint32 end   = (0 == scanData.startBlock ? upper : scanData.startBlock);
+	uint32 upper, start, end;
+
 
 	/* Nothing to do if not registered in the first place */
 	if (NULL == scan->pbmSharedScanData) {
@@ -386,6 +406,11 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 
 	// For each block in the scan: remove it from the list of scans
 
+	/* upper is the last possible block group for the scan, +1 since upper
+	 * bound is exclusive */
+	upper = (scanData.nblocks > 0 ? BLOCK_GROUP(scanData.nblocks-1) + 1 : 0);
+	start = BLOCK_GROUP(scan->pbmLocalScanStats.last_pos);
+	end   = (0 == scanData.startBlock ? upper : scanData.startBlock);
 	// Everything before `start` should already be removed when the scan passed that location
 	// Everything from `start` (inclusive) to `end` (exclusive) needs to have the scan removed
 	if (0 == scanData.nblocks) {
@@ -609,11 +634,14 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 
 #ifdef TRACE_PBM
 	elog(INFO, "PBM_RegisterBitmapScan(%lu)", id);
+
+#ifdef TRACE_PBM_BITMAP_PROGRESS
 	for (int i = 0; i < v.len; ++i) {
 		elog(INFO, "PBM_RegisterBitmapScan(%lu) bitmap block_group=%u, cnt=%u",
 			 id, v.items[i].block_group, v.items[i].blk_cnt
 		);
 	}
+#endif // TRACE_PBM_BITMAP_PROGRESS
 
 #ifdef TRACE_PBM_PRINT_SCANMAP
 	debug_log_scan_map();
@@ -707,10 +735,10 @@ extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *const scan,
 	BlockGroupHashEntry * bg_entry;
 	bool found;
 
-#if defined(TRACE_PBM)
+#if defined(TRACE_PBM) && defined (TRACE_PBM_BITMAP_PROGRESS)
 	elog(INFO, "PBM_ReportBitmapScanPosition(%lu): pos=%u bg=%u   is_registered=%s",
 		 id, pos, bg, (scan->pbmSharedScanData != NULL ? "true" : "false"));
-#endif
+#endif // TRACE_PBM && TRACE_PBM_BITMAP_PROGRESS
 
 	/* Nothing to do if the scan is not registered. I *think* this will happen
 	 * with the non-leader parallel workers for a parallel bitmap scan */
