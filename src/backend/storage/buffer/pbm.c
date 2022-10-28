@@ -213,7 +213,7 @@ Size PbmShmemSize(void) {
 		Size bytes = size % 1024;
 		Size kb = (size / 1024) % 1024;
 		Size mb = (size / 1024) / 1024;
-		elog(INFO, "PBM shared mem estimated size (without extras): %lu bytes = %lu MiB, %luKiB, %lu B"
+		elog(INFO, "PBM shared mem estimated size (without extras): %lu bytes = %lu MiB, %lu KiB, %lu B"
 			, size, mb, kb, bytes
 		);
 	}
@@ -549,6 +549,9 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 	/* Need to know # of blocks. */
 	const BlockNumber nblocks = RelationGetNumberOfBlocks(scan->ss.ss_currentRelation);
 
+	/* Should not already be registered. */
+	Assert(scan->pbmSharedScanData == NULL);
+
 	/* Keys for hash tables */
 	tbl = (TableData){
 		.rnode = rel->rd_node,
@@ -561,18 +564,23 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 		.seg = 0,
 	};
 
+	/* Make sure every block group is present in the map! */
+	bseg_first = RegisterInitBlockGroupEntries(&bgkey, nblocks);
+
+	/* Determine the block groups that will be scanned from the bitmap */
+	InitBitmapScanBlockGroupCountVec(scan, &v);
+
+	/* If nothing will be scanned (bitmap is empty), don't bother to register it */
+	if (v.len == 0) {
+		return;
+	}
+
 	/* Create a new entry for the scan */
 	s_entry = RegisterCreateScanEntry(&tbl, 0, nblocks);
 	id = s_entry->id;
 
-	/* Make sure every block group is present in the map! */
-	bseg_first = RegisterInitBlockGroupEntries(&bgkey, nblocks);
-
 	/* Refresh the PQ first if needed */
 	PQ_RefreshRequestedBuckets();
-
-	/* Determine the block groups that will be scanned from the bitmap */
-	InitBitmapScanBlockGroupCountVec(scan, &v);
 
 	/*
 	 * Add the scan for each block group which will be referenced.
@@ -633,7 +641,14 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 	};
 
 #ifdef TRACE_PBM
-	elog(INFO, "PBM_RegisterBitmapScan(%lu)", id);
+	elog(INFO, "PBM_RegisterBitmapScan(%lu): name=%s, nblocks=%d, "
+			   "vec={len=%d, [{grp=%u, cnt=%u}, ..., {grp=%u, cnt=%u}]}",
+		 id,
+		 scan->ss.ss_currentRelation->rd_rel->relname.data,
+		 nblocks,
+		 v.len, v.items[0].block_group,			v.items[0].blk_cnt,
+		 		v.items[v.len-1].block_group,	v.items[v.len-1].blk_cnt
+	);
 
 #ifdef TRACE_PBM_BITMAP_PROGRESS
 	for (int i = 0; i < v.len; ++i) {
@@ -659,6 +674,7 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* msg) {
 	const ScanId id = scan->scanId;
 	const int vec_idx = scan->pbmLocalScanData.vec_idx;
+	const int vec_len = scan->pbmLocalScanData.block_groups.len;
 	BlockNumber bg;
 	uint32 upper;
 	ScanData scanData;
@@ -687,22 +703,24 @@ extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* ms
 		.seg = BLOCK_GROUP_SEGMENT(bg),
 	};
 
-	// Shift PQ buckets if needed
+	/* Shift PQ buckets if needed */
 	PQ_RefreshRequestedBuckets();
 
+	/* Remove from the rest of the block groups, unless there are none */
+	if (scan->pbmLocalScanData.block_groups.len > 0 && vec_idx < vec_len) {
+		/* Find the first relevant segment */
+		LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
+			bg_entry = hash_search(pbm->BlockGroupMap, &bgkey, HASH_FIND, &found);
+		}
+		Assert(found);
 
-	/* Find the first relevant segment */
-	LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
-		bg_entry = hash_search(pbm->BlockGroupMap, &bgkey, HASH_FIND, &found);
+		/* Delete from there to the end */
+		upper = (scanData.nblocks > 0 ? BLOCK_GROUP(scanData.nblocks - 1) + 1 : 0);
+		remove_bitmap_scan_from_block_range(bg_entry, id, &scan->pbmLocalScanData, upper);
+
+		/* Remove from the scan map */
+		UnregisterDeleteScan(id, scanData.stats);
 	}
-	Assert(found);
-
-	/* Delete from there to the end */
-	upper = (scanData.nblocks > 0 ? BLOCK_GROUP(scanData.nblocks-1) + 1 : 0);
-	remove_bitmap_scan_from_block_range(bg_entry, id, &scan->pbmLocalScanData, upper);
-
-	/* Remove from the scan map */
-	UnregisterDeleteScan(id, scanData.stats);
 
 	/* After deleting the scan, unlink from the scan state so it doesn't try to end the scan again */
 	scan->pbmSharedScanData = NULL;
