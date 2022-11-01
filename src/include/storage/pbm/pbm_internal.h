@@ -423,4 +423,13 @@ static inline void bg_unlock_buffers(BlockGroupData * bg) {
 }
 
 
+
+
+// debugging
+// ### clean this up eventually
+void debug_log_scan_map(void);
+void debug_log_blockgroup_map(void);
+void debug_log_find_blockgroup_buffers(void);
+
+
 #endif //POSTGRESQL_PBM_INTERNAL_H

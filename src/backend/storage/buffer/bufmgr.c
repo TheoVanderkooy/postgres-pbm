@@ -1076,8 +1076,8 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	if (VacuumCostActive)
 		VacuumCostBalance += VacuumCostPageMiss;
 
-// TODO theo --- if we have a new shared buffer, need to notify the PBM
 #ifdef USE_PBM
+	/* Notify the PBM about a new shared buffer */
 	if (!found && !isLocalBuf) {
 		PbmNewBuffer(bufHdr);
 	}
@@ -1208,12 +1208,6 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 		/* Pin the buffer and then release the buffer spinlock */
 		PinBuffer_Locked(buf);
-
-#ifdef USE_PBM
-		// Report eviction to the PBM
-		// TODO theo --- should this be before we release the spinlock?
-		PbmOnEvictBuffer(buf);
-#endif
 
 		/*
 		 * If the buffer was dirty, try to write it out.  There is a race
@@ -1422,6 +1416,14 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		UnpinBuffer(buf, true);
 	}
 
+#ifdef USE_PBM
+	/*
+	 * Report eviction to the PBM, now that we are sure this is the one that is
+	 * chosen as the victim.
+	 */
+	PbmOnEvictBuffer(buf);
+#endif
+
 	/*
 	 * Okay, it's finally safe to rename the buffer.
 	 *
@@ -1501,7 +1503,7 @@ InvalidateBuffer(BufferDesc *buf)
 	buf_state = pg_atomic_read_u32(&buf->state);
 	Assert(buf_state & BM_LOCKED);
 	UnlockBufHdr(buf, buf_state);
-// TODO theo --- may need to remove from PBM here ... only used for drop table though
+
 	/*
 	 * Need to compute the old tag's hashcode and partition lock ID. XXX is it
 	 * worth storing the hashcode in BufferDesc so we need not recompute it
@@ -1549,8 +1551,10 @@ retry:
 		goto retry;
 	}
 
-// TODO theo --- remove from PBM here! (while other lock is held... should be fine)
+#ifdef USE_PBM
+	/* Remove the buffer from PBM when it is invalidated. */
 	PbmOnEvictBuffer(buf);
+#endif /* USE_PBM */
 
 	/*
 	 * Clear out the buffer's tag and flags.  We must do this to ensure that

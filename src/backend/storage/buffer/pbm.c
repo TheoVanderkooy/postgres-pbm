@@ -107,18 +107,6 @@ static inline void PQ_RefreshRequestedBuckets(void);
 
 
 // debugging
-// ### clean this up eventually
-#ifdef TRACE_PBM_PRINT_SCANMAP
-static void debug_append_scan_data(StringInfoData* str, ScanHashEntry* entry);
-static void debug_log_scan_map(void);
-#endif
-
-#ifdef TRACE_PBM_PRINT_BLOCKGROUPMAP
-static inline void debug_append_bg_data(StringInfoData *str, BlockGroupData *data, BlockNumber bgroup);
-static void debug_append_bgseg_data(StringInfoData* str, BlockGroupHashEntry* entry);
-static void debug_log_blockgroup_map(void);
-#endif
-
 static void debug_buffer_access(BufferDesc* buf, char* msg);
 
 #ifdef SANITY_PBM_BUFFERS
@@ -463,10 +451,11 @@ void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) 
 		return;
 	}
 
-#if defined(TRACE_PBM) && !defined(TRACE_PBM_REPORT_PROGRESS)
-	/* Only trace calls which don't return immediately */
-	elog(LOG, "PBM_ReportSeqScanPosition(%lu), pos=%u, group=%u", id, pos, curGroupPos);
-#endif
+// ### clean up debugging code
+//#if defined(TRACE_PBM) && !defined(TRACE_PBM_REPORT_PROGRESS)
+//	/* Only trace calls which don't return immediately */
+//	elog(LOG, "PBM_ReportSeqScanPosition(%lu), pos=%u, group=%u", id, pos, curGroupPos);
+//#endif
 
 	Assert(entry != NULL);
 
@@ -837,6 +826,22 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	debug_buffer_access(buf, "new buffer");
 #endif // TRACE_PBM && TRACE_PBM_BUFFERS && TRACE_PBM_BUFFERS_NEW
 
+// ### clean up debugging code...
+//#if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS)
+//	/*
+//	 * Follow buffer 1 (idx 0) to see what it does...
+//	 */
+//	if (BufferDescriptorGetBuffer(buf) == 1) {
+//		elog(WARNING, "PbmNewBuffer(0) added new buffer:" //"\n"
+//					  "\tnew={id=%d, tbl={spc=%u, db=%u, rel=%u} block=%u (%u) %d/%d}",
+//			 buf->buf_id, buf->tag.rnode.spcNode, buf->tag.rnode.dbNode, buf->tag.rnode.relNode, buf->tag.blockNum,
+//			 BLOCK_GROUP(buf->tag.blockNum), buf->pbm_bgroup_next, buf->pbm_bgroup_prev
+//		);
+//
+////		debug_buffer_access(buf, "debug buffer 1 new");
+//	}
+//#endif // TRACE_PBM && TRACE_PBM_BUFFERS
+
 	// Buffer must not already be in a block group if it is new!
 	Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_prev);
 	Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_next);
@@ -900,12 +905,29 @@ void PbmOnEvictBuffer(struct BufferDesc *const buf) {
 		return;
 	}
 
+// ### clean up debugging code
+//#if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS)
+//
+//	/*
+//	 * Follow buffer 1 (idx 0) to see what it does...
+//	 */
+//	if (BufferDescriptorGetBuffer(buf) == 1) {
+//		elog(WARNING, "PbmOnEvictBuffer(0) evicting buffer %d tbl={spc=%u, db=%u, rel=%u, fork=%d} block#=%u",
+//			 buf->buf_id, buf->tag.rnode.spcNode, buf->tag.rnode.dbNode, buf->tag.rnode.relNode,
+//			 buf->tag.forkNum, buf->tag.blockNum);
+//	}
+//
+//#endif // TRACE_PBM && TRACE_PBM_BUFFERS
+
 #ifdef SANITY_PBM_BUFFERS
 	// Check everything in the block group actually belongs to the same group
 	sanity_check_verify_block_group_buffers(buf);
 #endif // SANITY_PBM_BUFFERS
 
 	RemoveBufFromBlockGroup(buf);
+
+	Assert(buf->pbm_bgroup_next == FREENEXT_NOT_IN_LIST);
+	Assert(buf->pbm_bgroup_prev == FREENEXT_NOT_IN_LIST);
 }
 
 
@@ -1914,8 +1936,8 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 	);
 }
 
-#ifdef TRACE_PBM_PRINT_SCANMAP
 // Print debugging information for a single entry in the scans hash map.
+static
 void debug_append_scan_data(StringInfoData* str, ScanHashEntry* entry) {
 	SharedScanStats stats = entry->data.stats;
 	appendStringInfo(str, "{id=%lu, start=%u, nblocks=%u, speed=%f}",
@@ -1949,10 +1971,9 @@ void debug_log_scan_map(void) {
 	ereport(INFO, (errmsg_internal("PBM scan map:"), errdetail_internal("%s", str.data)));
 	pfree(str.data);
 }
-#endif
 
-#ifdef TRACE_PBM_PRINT_BLOCKGROUPMAP
 // Append debugging information for one block group
+static
 void debug_append_bg_data(StringInfoData *str, BlockGroupData *data, BlockNumber bgroup) {
 	BlockNumber seg = BLOCK_GROUP_SEGMENT(bgroup);
 	slist_iter it;
@@ -1975,6 +1996,7 @@ void debug_append_bg_data(StringInfoData *str, BlockGroupData *data, BlockNumber
 }
 
 // Print debugging information for a relation in the block group map
+static
 void debug_append_bgseg_data(StringInfoData* str, BlockGroupHashEntry* entry) {
 	appendStringInfo(str, "\n\ttbl={spc=%u, db=%u, rel=%u, fork=%u}",
 		entry->key.rnode.spcNode, entry->key.rnode.dbNode, entry->key.rnode.relNode, entry->key.forkNum
@@ -2015,4 +2037,49 @@ void debug_log_blockgroup_map(void) {
 	ereport(INFO, (errmsg_internal("PBM block group map:"), errdetail_internal("%s", str.data)));
 	pfree(str.data);
 }
-#endif
+
+void debug_log_find_blockgroup_buffers(void) {
+	StringInfoData str;
+	initStringInfo(&str);
+
+	LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
+		HASH_SEQ_STATUS status;
+		BlockGroupHashEntry * entry;
+
+		hash_seq_init(&status, pbm->BlockGroupMap);
+
+		// each hash entry
+		for (;;) {
+			entry = hash_seq_search(&status);
+			if (NULL == entry) break;
+
+			// each group in the entry
+			for (int i = 0; i < BLOCK_GROUP_SEG_SIZE; ++i) {
+				BlockGroupData * data = &entry->groups[i];
+				Buffer b;
+
+				// print out block group if it has buffers
+				if (data->buffers_head != FREENEXT_END_OF_LIST) {
+					appendStringInfo(&str, "\n\ttbl={spc=%u, db=%u, rel=%u, fork=%d} "
+										   "blk=%d :  "
+						, entry->key.rnode.spcNode, entry->key.rnode.dbNode, entry->key.rnode.relNode, entry->key.forkNum
+						, entry->key.seg * BLOCK_GROUP_SEG_SIZE + i
+					);
+
+					// append list of buffers for the block group
+					for(b = data->buffers_head; b >= 0; ) {
+						BufferDesc * buf = GetBufferDescriptor(b);
+						appendStringInfo(&str, " %d", b);
+
+						b = buf->pbm_bgroup_next;
+					}
+					appendStringInfo(&str, " %d", b);
+				}
+			}
+		}
+	}
+
+	ereport(INFO, (errmsg_internal("PBM block groups:"), errdetail_internal("%s", str.data)));
+
+	pfree(str.data);
+}

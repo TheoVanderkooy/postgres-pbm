@@ -584,6 +584,7 @@ void PBM_DEBUG_sanity_check_buffers(void) {
 	//	elog(LOG, "STARTING BUFFERS SANITY CHECK --- ran out of buffers");
 
 	// Remember which buffers were seen in some block group
+	bool saw_all_buffers = true;
 	bool * saw_buffer = palloc(NBuffers * sizeof(bool));
 	for (int i = 0; i < NBuffers; ++i) {
 		saw_buffer[i] = false;
@@ -648,12 +649,16 @@ void PBM_DEBUG_sanity_check_buffers(void) {
 
 	// Make sure we saw all the buffers in the PQ somewhere
 	for (int i = 0; i < NBuffers; ++i) {
-		Assert(saw_buffer[i]);
+		if (!saw_buffer[i]) {
+//			elog(WARNING, "BUFFERS SANITY CHECK --- did not see buffer %d", i);
+			saw_all_buffers = false;
+		}
 	}
+	Assert(saw_all_buffers);
 
 	pfree(saw_buffer);
 
-	elog(LOG, "BUFFERS SANITY CHECK --- ran out of buffers, but not assertions failed ????");
+	elog(LOG, "BUFFERS SANITY CHECK --- ran out of buffers, but no assertions failed ????");
 #endif // SANITY_PBM_BLOCK_GROUPS
 }
 
@@ -685,6 +690,10 @@ void PBM_DEBUG_print_pbm_state(void) {
 			(errmsg_internal("PBM PQ state:"),
 					errdetail_internal("%s", str.data)));
 	pfree(str.data);
+
+	debug_log_scan_map();
+	debug_log_blockgroup_map();
+	debug_log_find_blockgroup_buffers();
 }
 
 
