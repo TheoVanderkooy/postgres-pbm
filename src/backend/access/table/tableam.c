@@ -43,7 +43,12 @@
 #define PARALLEL_SEQSCAN_RAMPDOWN_CHUNKS	64
 /* Cap the size of parallel I/O chunks to this number of blocks */
 #define PARALLEL_SEQSCAN_MAX_CHUNK_SIZE		8192
-
+/* Make sure parallel I/O chunks are at least this number of blocks */
+#ifdef USE_PBM
+#define PARALLEL_SEQSCAN_MIN_CHUNK_SIZE		(1 << PBM_BLOCK_GROUP_SHIFT)
+#else
+#define PARALLEL_SEQSCAN_MIN_CHUNK_SIZE		1
+#endif /* USE_PBM */
 /* GUC variables */
 char	   *default_table_access_method = DEFAULT_TABLE_ACCESS_METHOD;
 bool		synchronize_seqscans = true;
@@ -410,6 +415,13 @@ table_block_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
 	SpinLockInit(&bpscan->phs_mutex);
 	bpscan->phs_startblock = InvalidBlockNumber;
 	pg_atomic_init_u64(&bpscan->phs_nallocated, 0);
+#ifdef USE_PBM
+	/* Initialize PBM fields */
+	bpscan->pbmSharedScanData = NULL;
+	bpscan->pbm_nscanned = 0;
+	SpinLockInit(&bpscan->pbm_speed_lk);
+	bpscan->pbm_est_scan_speed = 0.f;
+#endif /* USE_PBM */
 
 	return sizeof(ParallelBlockTableScanDescData);
 }
@@ -450,7 +462,7 @@ table_block_parallelscan_startblock_init(Relation rel,
 	 * and PARALLEL_SEQSCAN_NCHUNKS / 2 chunks.
 	 */
 	pbscanwork->phsw_chunk_size = pg_nextpower2_32(Max(pbscan->phs_nblocks /
-													   PARALLEL_SEQSCAN_NCHUNKS, 1));
+													   PARALLEL_SEQSCAN_NCHUNKS, PARALLEL_SEQSCAN_MIN_CHUNK_SIZE));
 
 	/*
 	 * Ensure we don't go over the maximum chunk size with larger tables. This
@@ -572,7 +584,7 @@ table_block_parallelscan_nextpage(Relation rel,
 		 * iterations of this, we'll end up doing the last few blocks with the
 		 * chunk size set to 1.
 		 */
-		if (pbscanwork->phsw_chunk_size > 1 &&
+		if (pbscanwork->phsw_chunk_size > PARALLEL_SEQSCAN_MIN_CHUNK_SIZE &&
 			pbscanwork->phsw_nallocated > pbscan->phs_nblocks -
 			(pbscanwork->phsw_chunk_size * PARALLEL_SEQSCAN_RAMPDOWN_CHUNKS))
 			pbscanwork->phsw_chunk_size >>= 1;

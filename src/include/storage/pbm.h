@@ -36,6 +36,7 @@ struct BitmapHeapScanState;
 struct BlockGroupData;
 struct BufferDesc;
 struct HeapScanDescData;
+struct ParallelBlockTableScanDescData;
 
 
 /* ===== TYPES DEFINITIONS ===== */
@@ -58,7 +59,11 @@ extern Size PbmShmemSize(void);
 
 extern void PBM_RegisterSeqScan(struct HeapScanDescData * scan);
 extern void PBM_UnregisterSeqScan(struct HeapScanDescData * scan);
-extern void PBM_ReportSeqScanPosition(struct HeapScanDescData *scan, BlockNumber pos);
+extern void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos);
+
+extern void PBM_InitParallelSeqScan(struct HeapScanDescData * scan, BlockNumber pos);
+extern void PBM_ParallelWorker_ReportSeqScanPosition(struct HeapScanDescData *scan, struct ParallelBlockTableScanDescData * pbscan,
+													 BlockNumber cur_page, BlockNumber new_page);
 
 
 /* ===== BITMAP SCAN METHODS ===== */

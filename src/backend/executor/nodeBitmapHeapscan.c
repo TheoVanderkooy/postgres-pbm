@@ -148,17 +148,20 @@ BitmapHeapNext(BitmapHeapScanState *node)
 
 				node->tbm = tbm;
 #ifdef USE_PBM
-				PBM_RegisterBitmapScan(node);
-				// TODO theo parallel bitmap scans
 				/*
-				 * we would like to just "register" it. However need to be careful:
-				 *  - it either uses shared or private iterator, which are incompatibly
-				 *  - could pass in the iterator? OR a flag/separate method?
+				 * PBM: register the bitmap scan.
 				 *
-				 * Here we need to register before `BitmapDoneInitializingSharedState` which actually starts the query...
+				 * This only gets called in the "leader", workers wait in
+				 * `BitmapShouldInitializeSharedState` until the leader calls
+				 * `BitmapDoneInitializingSharedState` so this will be registered
+				 * before they start.
 				 *
-				 * Then the question is: how/when do we update state? only from the leader?
+				 * Only the leader updates progress, relying on the shared iterator
+				 * giving one block out at a time to assume that everything before
+				 * its current position is either done or pinned by another worker
+				 * (and therefore safe to unregister).
 				 */
+				PBM_RegisterBitmapScan(node);
 #endif /* USE_PBM */
 				/*
 				 * Prepare to iterate over the TBM. This will return the
@@ -662,8 +665,9 @@ ExecReScanBitmapHeapScan(BitmapHeapScanState *node)
 	node->pvmbuffer = InvalidBuffer;
 
 	ExecScanReScan(&node->ss);
-// TODO theo -- should probably unregister if applicable!
+
 #ifdef USE_PBM
+	/* PBM: unregister the bitmap scan before rescan */
 	PBM_UnregisterBitmapScan(node, "rescan");
 #endif /* USE_PBM */
 

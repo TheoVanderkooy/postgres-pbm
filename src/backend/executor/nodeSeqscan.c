@@ -227,9 +227,15 @@ ExecReScanSeqScan(SeqScanState *node)
 
 	scan = node->ss.ss_currentScanDesc;
 
-	if (scan != NULL)
+	if (scan != NULL) {
 		table_rescan(scan,		/* scan desc */
 					 NULL);		/* new scan keys */
+
+#ifdef USE_PBM
+		/* Register a new scan for re-scan */
+		PBM_RegisterSeqScan((struct HeapScanDescData *)scan);
+#endif /* USE_PBM */
+	}
 
 	ExecScanReScan((ScanState *) node);
 }
@@ -279,7 +285,9 @@ ExecSeqScanInitializeDSM(SeqScanState *node,
 	node->ss.ss_currentScanDesc =
 		table_beginscan_parallel(node->ss.ss_currentRelation, pscan);
 
-	// TODO theo --- parallel sequential scans??
+#ifdef USE_PBM
+	PBM_RegisterSeqScan((struct HeapScanDescData *)node->ss.ss_currentScanDesc);
+#endif
 }
 
 /* ----------------------------------------------------------------
@@ -296,6 +304,10 @@ ExecSeqScanReInitializeDSM(SeqScanState *node,
 
 	pscan = node->ss.ss_currentScanDesc->rs_parallel;
 	table_parallelscan_reinitialize(node->ss.ss_currentRelation, pscan);
+
+#ifdef USE_PBM
+	PBM_RegisterSeqScan((struct HeapScanDescData *)node->ss.ss_currentScanDesc);
+#endif
 }
 
 /* ----------------------------------------------------------------

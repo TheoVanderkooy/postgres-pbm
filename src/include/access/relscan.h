@@ -81,6 +81,12 @@ typedef struct ParallelBlockTableScanDescData
 	BlockNumber phs_startblock; /* starting block number */
 	pg_atomic_uint64 phs_nallocated;	/* number of blocks allocated to
 										 * workers so far. */
+
+	/* PBM fields: store scan stats separately here since they're updated in multiple workers */
+	struct PBM_ScanHashEntry * 	pbmSharedScanData;
+	_Atomic(uint32) 			pbm_nscanned;		/* Total # scanned so far */
+	slock_t 					pbm_speed_lk;		/* Lock for speed estimate */
+	float 						pbm_est_scan_speed;	/* Combined speed estimate */
 }			ParallelBlockTableScanDescData;
 typedef struct ParallelBlockTableScanDescData *ParallelBlockTableScanDesc;
 
@@ -93,6 +99,13 @@ typedef struct ParallelBlockTableScanWorkerData
 	uint32		phsw_chunk_remaining;	/* # blocks left in this chunk */
 	uint32		phsw_chunk_size;	/* The number of blocks to allocate in
 									 * each I/O chunk for the scan */
+
+	/* PBM: track speed and progress of the workers individually */
+	BlockNumber		pbm_last_reported_pos;
+	BlockNumber		pbm_scanned_since_last_report;
+	unsigned long	pbm_last_report_time;
+	float 			pbm_worker_speed;
+
 } ParallelBlockTableScanWorkerData;
 typedef struct ParallelBlockTableScanWorkerData *ParallelBlockTableScanWorker;
 

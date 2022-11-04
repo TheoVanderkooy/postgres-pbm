@@ -269,7 +269,6 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 	if (!RelationUsesLocalBuffers(scan->rs_base.rs_rd) &&
 		scan->rs_nblocks > NBuffers / 4)
 	{
-		// TODO theo --- consider disabling strategy here
 		allow_strat = (scan->rs_base.rs_flags & SO_ALLOW_STRAT) != 0;
 		allow_sync = (scan->rs_base.rs_flags & SO_ALLOW_SYNC) != 0;
 	}
@@ -569,15 +568,19 @@ heapgettup(HeapScanDesc scan,
 			if (scan->rs_base.rs_parallel != NULL)
 			{
 				ParallelBlockTableScanDesc pbscan =
-				(ParallelBlockTableScanDesc) scan->rs_base.rs_parallel;
+					(ParallelBlockTableScanDesc) scan->rs_base.rs_parallel;
 				ParallelBlockTableScanWorker pbscanwork =
-				scan->rs_parallelworkerdata;
+					scan->rs_parallelworkerdata;
 
 				table_block_parallelscan_startblock_init(scan->rs_base.rs_rd,
 														 pbscanwork, pbscan);
 
 				page = table_block_parallelscan_nextpage(scan->rs_base.rs_rd,
 														 pbscanwork, pbscan);
+#ifdef USE_PBM
+				/* Initialize the PBM-related fields of the scan */
+				PBM_InitParallelSeqScan(scan, page);
+#endif
 
 				/* Other processes might have already finished the scan. */
 				if (page == InvalidBlockNumber)
@@ -791,12 +794,21 @@ heapgettup(HeapScanDesc scan,
 		else if (scan->rs_base.rs_parallel != NULL)
 		{
 			ParallelBlockTableScanDesc pbscan =
-			(ParallelBlockTableScanDesc) scan->rs_base.rs_parallel;
+				(ParallelBlockTableScanDesc) scan->rs_base.rs_parallel;
 			ParallelBlockTableScanWorker pbscanwork =
-			scan->rs_parallelworkerdata;
+				scan->rs_parallelworkerdata;
+#ifdef USE_PBM
+			BlockNumber cur_page = page;
+#endif
 
 			page = table_block_parallelscan_nextpage(scan->rs_base.rs_rd,
 													 pbscanwork, pbscan);
+#ifdef USE_PBM
+			/* Report parallel scan status to PBM. This happens even if we
+			 * reached the end. */
+			PBM_ParallelWorker_ReportSeqScanPosition(scan, pbscan, cur_page, page);
+#endif
+
 			finished = (page == InvalidBlockNumber);
 		}
 		else
@@ -824,8 +836,8 @@ heapgettup(HeapScanDesc scan,
 		}
 
 #ifdef USE_PBM
-		if (!finished) {
-			Assert(page != InvalidBlockNumber);
+		/* Report PBM progress for non-parallel scans */
+		if (!finished && scan->rs_base.rs_parallel == NULL) {
 			PBM_ReportSeqScanPosition(scan, page);
 		}
 #endif // USE_PBM
@@ -913,15 +925,19 @@ heapgettup_pagemode(HeapScanDesc scan,
 			if (scan->rs_base.rs_parallel != NULL)
 			{
 				ParallelBlockTableScanDesc pbscan =
-				(ParallelBlockTableScanDesc) scan->rs_base.rs_parallel;
+					(ParallelBlockTableScanDesc) scan->rs_base.rs_parallel;
 				ParallelBlockTableScanWorker pbscanwork =
-				scan->rs_parallelworkerdata;
+					scan->rs_parallelworkerdata;
 
 				table_block_parallelscan_startblock_init(scan->rs_base.rs_rd,
 														 pbscanwork, pbscan);
 
 				page = table_block_parallelscan_nextpage(scan->rs_base.rs_rd,
 														 pbscanwork, pbscan);
+#ifdef USE_PBM
+				/* Initialize the PBM-related fields of the scan */
+				PBM_InitParallelSeqScan(scan, page);
+#endif
 
 				/* Other processes might have already finished the scan. */
 				if (page == InvalidBlockNumber)
@@ -1106,12 +1122,22 @@ heapgettup_pagemode(HeapScanDesc scan,
 		else if (scan->rs_base.rs_parallel != NULL)
 		{
 			ParallelBlockTableScanDesc pbscan =
-			(ParallelBlockTableScanDesc) scan->rs_base.rs_parallel;
+				(ParallelBlockTableScanDesc) scan->rs_base.rs_parallel;
 			ParallelBlockTableScanWorker pbscanwork =
-			scan->rs_parallelworkerdata;
+				scan->rs_parallelworkerdata;
+#ifdef USE_PBM
+			BlockNumber cur_page = page;
+#endif
 
 			page = table_block_parallelscan_nextpage(scan->rs_base.rs_rd,
 													 pbscanwork, pbscan);
+
+#ifdef USE_PBM
+			/* Report parallel scan status to PBM. This happens even if we
+			 * reached the end. */
+			PBM_ParallelWorker_ReportSeqScanPosition(scan, pbscan, cur_page, page);
+#endif
+
 			finished = (page == InvalidBlockNumber);
 		}
 		else
@@ -1138,8 +1164,8 @@ heapgettup_pagemode(HeapScanDesc scan,
 				ss_report_location(scan->rs_base.rs_rd, page);
 		}
 #ifdef USE_PBM
-		if (!finished) {
-			Assert(page != InvalidBlockNumber);
+		/* Report PBM progress for non-parallel scans */
+		if (!finished && scan->rs_base.rs_parallel == NULL) {
 			PBM_ReportSeqScanPosition(scan, page);
 		}
 #endif // USE_PBM

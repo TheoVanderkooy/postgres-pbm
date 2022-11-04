@@ -918,13 +918,21 @@ table_beginscan_strat(Relation rel, Snapshot snapshot,
 					  bool allow_strat, bool allow_sync)
 {
 	uint32		flags = SO_TYPE_SEQSCAN | SO_ALLOW_PAGEMODE;
+	TableScanDesc scan;
 
 	if (allow_strat)
 		flags |= SO_ALLOW_STRAT;
 	if (allow_sync)
 		flags |= SO_ALLOW_SYNC;
 
-	return rel->rd_tableam->scan_begin(rel, snapshot, nkeys, key, NULL, flags);
+	scan = rel->rd_tableam->scan_begin(rel, snapshot, nkeys, key, NULL, flags);
+
+#ifdef USE_PBM
+	/* Register the scan with the PBM. Table scan is always a heap scan */
+	PBM_RegisterSeqScan((struct HeapScanDescData *)scan);
+#endif /* USE_PBM */
+
+	return scan;
 }
 
 /*
@@ -940,6 +948,11 @@ table_beginscan_bm(Relation rel, Snapshot snapshot,
 	uint32		flags = SO_TYPE_BITMAPSCAN | SO_ALLOW_PAGEMODE;
 
 	return rel->rd_tableam->scan_begin(rel, snapshot, nkeys, key, NULL, flags);
+
+	/*
+	 * PBM: bitmap scan is registered in the caller
+	 * (actually during "next", not begin, because we need the bitmap first)
+	 */
 }
 
 /*
@@ -965,6 +978,10 @@ table_beginscan_sampling(Relation rel, Snapshot snapshot,
 		flags |= SO_ALLOW_PAGEMODE;
 
 	return rel->rd_tableam->scan_begin(rel, snapshot, nkeys, key, NULL, flags);
+
+	/*
+	 * PBM: we don't care about sample scans.
+	 */
 }
 
 /*
@@ -978,6 +995,10 @@ table_beginscan_tid(Relation rel, Snapshot snapshot)
 	uint32		flags = SO_TYPE_TIDSCAN;
 
 	return rel->rd_tableam->scan_begin(rel, snapshot, 0, NULL, NULL, flags);
+
+	/*
+	 * PBM: pretty sure we don't care about this?
+	 */
 }
 
 /*
@@ -991,6 +1012,10 @@ table_beginscan_analyze(Relation rel)
 	uint32		flags = SO_TYPE_ANALYZE;
 
 	return rel->rd_tableam->scan_begin(rel, NULL, 0, NULL, NULL, flags);
+
+	/*
+	 * PBM: we don't care about analyze scans.
+	 */
 }
 
 /*
@@ -1011,10 +1036,9 @@ table_rescan(TableScanDesc scan,
 {
 	scan->rs_rd->rd_tableam->scan_rescan(scan, key, false, false, false, false);
 
-#ifdef USE_PBM
-	/* Re-register the scan */
-	PBM_RegisterSeqScan((struct HeapScanDescData *)scan);
-#endif
+	/*
+	 * PBM: re-registering should be handled by the caller
+	 */
 }
 
 /*
@@ -1032,6 +1056,10 @@ table_rescan_set_params(TableScanDesc scan, struct ScanKeyData *key,
 	scan->rs_rd->rd_tableam->scan_rescan(scan, key, true,
 										 allow_strat, allow_sync,
 										 allow_pagemode);
+
+	/*
+	 * PBM: this is used for samples scans, so we don't care
+	 */
 }
 
 /*
@@ -1097,6 +1125,10 @@ table_rescan_tidrange(TableScanDesc sscan, ItemPointer mintid,
 
 	sscan->rs_rd->rd_tableam->scan_rescan(sscan, NULL, false, false, false, false);
 	sscan->rs_rd->rd_tableam->scan_set_tidrange(sscan, mintid, maxtid);
+
+	/*
+	 * PBM: we don't care about TID scan.
+	 */
 }
 
 /*
@@ -1157,6 +1189,10 @@ static inline void
 table_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
 {
 	rel->rd_tableam->parallelscan_reinitialize(rel, pscan);
+
+	/*
+	 * PBM: caller we re-register the scan
+	 */
 }
 
 

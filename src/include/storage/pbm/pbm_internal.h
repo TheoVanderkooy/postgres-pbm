@@ -31,9 +31,6 @@ static const unsigned int PQ_BucketOutOfRange = (unsigned int)(-1);
  *-------------------------------------------------------------------------
  */
 
-/* Block number is shifted by this amount to determine the group. */
-#define BLOCK_GROUP_SHIFT 5
-
 /* Log of the number of block groups in 1 segment in the hash table. */
 #define LOG_BLOCK_GROUP_SEG_SIZE 8
 
@@ -91,6 +88,7 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 /* Debugging flags */
 #define TRACE_PBM
 //#define TRACE_PBM_REPORT_PROGRESS
+//#define TRACE_PBM_REPORT_PROGRESS_VERBOSE
 //#define TRACE_PBM_BITMAP_PROGRESS
 //#define TRACE_PBM_PRINT_SCANMAP
 //#define TRACE_PBM_PRINT_BLOCKGROUPMAP
@@ -101,6 +99,7 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 
 //#define SANITY_PBM_BUFFERS
 //#define SANITY_PBM_BLOCK_GROUPS
+//#define SANITY_PBM_SCAN_FULLY_UNREGISTERED
 
 
 /*-------------------------------------------------------------------------
@@ -121,8 +120,8 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 #define LOCK_GUARD_V2(lock, mode) LOCK_GUARD_WITH_RES(_ignore_, lock, mode)
 
 /* Group blocks by ID to reduce the amount of metadata required */
-#define BLOCK_GROUP(block) ((block) >> BLOCK_GROUP_SHIFT)
-#define GROUP_TO_FIRST_BLOCK(group) ((group) << BLOCK_GROUP_SHIFT)
+#define BLOCK_GROUP(block) ((block) >> PBM_BLOCK_GROUP_SHIFT)
+#define GROUP_TO_FIRST_BLOCK(group) ((group) << PBM_BLOCK_GROUP_SHIFT)
 
 /* Block group hash table segment: */
 #define BLOCK_GROUP_SEG_SIZE (1 << LOG_BLOCK_GROUP_SEG_SIZE)
@@ -171,9 +170,13 @@ typedef struct PBM_ScanData {
 	TableData 	tbl;		// the table being scanned
 	BlockNumber startBlock;	// where the scan started
 	BlockNumber	nblocks;	// # of blocks (not block *groups*) in the table
+	struct ParallelBlockTableScanDescData * pbscan;	// data for parallel sequential scans (null if not a parallel seq scan)
 
 	// Statistics written by one thread, but read by all
 	volatile _Atomic(SharedScanStats) stats;
+
+	// Only used in "leader" of parallel sequential scan
+	uint64	pseq_nalloced;
 } ScanData;
 
 /* Entry (KVP) in the scans hash map */
