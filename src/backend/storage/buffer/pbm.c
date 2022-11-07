@@ -12,11 +12,13 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
+#include "optimizer/optimizer.h"
 #include "storage/bufmgr.h"
 #include "storage/shmem.h"
 
 // included last to avoid IDE complaining about unused imports...
 #include "storage/buf_internals.h"
+#include "access/parallel.h"
 #include "access/heapam.h"
 #include "catalog/index.h"
 #include "lib/simplehash.h"
@@ -224,7 +226,7 @@ Size PbmShmemSize(void) {
 /*
  * Setup data structures for a new sequential scan.
  */
-void PBM_RegisterSeqScan(HeapScanDesc scan) {
+void PBM_RegisterSeqScan(HeapScanDesc scan, struct ParallelContext *pctx) {
 	ScanId id;
 	ScanHashEntry * s_entry;
 	TableData tbl;
@@ -338,11 +340,13 @@ void PBM_RegisterSeqScan(HeapScanDesc scan) {
 	scan->scanId = id;
 	scan->pbmSharedScanData = s_entry;
 	scan->pbmLocalScanStats = (LocalSeqScanStats) {
-			.last_report_time = get_time_ns(),
-			.last_pos = startblock,
+		.last_report_time = get_time_ns(),
+		.last_pos = startblock,
 	};
 	if (isParallel) {
 		pscan->pbmSharedScanData = s_entry;
+		Assert(pctx != NULL);
+		s_entry->data.pseq.nworkers = pctx->nworkers_to_launch + 1;
 	}
 
 
@@ -409,10 +413,9 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 			remove_seq_scan_from_range_circular(scan->pbmSharedScanData, start, end);
 		}
 	} else {
-		ParallelBlockTableScanDesc pbscan = (ParallelBlockTableScanDesc)scan->rs_base.rs_parallel;
 		BlockNumber startBlock = scanData.startBlock;
 		BlockNumber nblocks = scanData.nblocks;
-		uint64 nalloced = scanData.pseq_nalloced;
+		uint64 nalloced = scanData.pseq.nalloced;
 
 		elog(INFO, "PBM_UnregisterSeqScan(%lu) nallocated=%lu, start=%u, nblocks=%u", id, nalloced, startBlock, nblocks);
 
@@ -444,7 +447,6 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
  * Update progress of a sequential scan.
  */
 void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) {
-	const ScanId id = scan->scanId;
 	unsigned long curTime, elapsed;
 	ScanHashEntry *const entry = scan->pbmSharedScanData;
 	BlockNumber blocks;
@@ -458,7 +460,7 @@ void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) 
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_REPORT_PROGRESS_VERBOSE)
 	/* If we want to trace *every* call */
-	elog(LOG, "ReportSeqScanPosition(%lu), pos=%u, group=%u, parallel=%s", id, pos, curGroupPos
+	elog(LOG, "ReportSeqScanPosition(%lu), pos=%u, group=%u, parallel=%s", scan->scanId, pos, curGroupPos
 		, (entry->data.pbscan == NULL? "false" : "true")
 	);
 #endif
@@ -510,7 +512,7 @@ void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) 
 	if (curGroupPos < 30 || curGroupPos % 64 == 0) {
 		SharedScanStats stats = entry->data.stats;
 		elog(INFO, "ReportSeqScanPosition(%lu) at block %d (group=%d), elapsed=%ld, blocks=%d, est_speed=%f",
-			 id, pos, BLOCK_GROUP(pos), elapsed, blocks, stats.est_speed);
+			 scan->scanId, pos, BLOCK_GROUP(pos), elapsed, blocks, stats.est_speed);
 	}
 #endif
 
@@ -535,6 +537,14 @@ void PBM_InitParallelSeqScan(struct HeapScanDescData * scan, BlockNumber pos) {
 	elog(INFO, "PBM_InitParallelSeqScan! start_pos=%u, is_leader=%s"
 		 , pos, (scan->pbmSharedScanData == NULL ? "false" : "true")
 	);
+
+
+	/* Initialize chunk size if applicable */
+	if (scan->pbmSharedScanData != NULL) {
+// ### For now, we require the leader to participate since it updates the PBM stats.
+		Assert(parallel_leader_participation);
+		scan->pbmSharedScanData->data.pseq.chunk_size = scan->rs_parallelworkerdata->phsw_chunk_size;
+	}
 }
 
 /*
@@ -601,15 +611,21 @@ void PBM_ParallelWorker_ReportSeqScanPosition(struct HeapScanDescData *scan, Par
 		 * Leader should also: update global stats
 		 */
 		if (is_leader) {
+			uint64 nalloced = pg_atomic_read_u64(&pbscan->phs_nallocated);
+
 			SharedScanStats stats = {
 				.est_speed = pbscan->pbm_est_scan_speed,
 				.blocks_scanned = pbscan->pbm_nscanned,
 			};
-			uint64 nalloced = pg_atomic_read_u64(&pbscan->phs_nallocated);
+			if (stats.est_speed == 0.f) {
+				stats.est_speed = pbm->initial_est_speed;
+			}
 
 			scan->pbmSharedScanData->data.stats = stats;
 
-			scan->pbmSharedScanData->data.pseq_nalloced = nalloced;
+			/* Sequential-scan-only fields */
+			scan->pbmSharedScanData->data.pseq.nalloced = nalloced;
+			scan->pbmSharedScanData->data.pseq.chunk_size = pbscanwork->phsw_chunk_size;
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_REPORT_PROGRESS)
 			elog(INFO, "ReportParallelSeqScanPosition(%lu) (last=%u, cur=%u, next=%u) leader updating stats: "
@@ -826,7 +842,6 @@ extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* ms
 
 	/* Nothing to do if there is no scan registered. */
 	if (NULL == scan->pbmSharedScanData) {
-		// ### could assert there is no scan? maybe expensive
 		return;
 	}
 
@@ -1233,13 +1248,17 @@ ScanHashEntry *RegisterCreateScanEntry(TableData *const tbl, const BlockNumber s
 		.tbl = (*tbl),
 		.startBlock = startblock,
 		.nblocks = nblocks,
-		.pbscan = parallelSeqScanData,
 		// These stats will be updated later
 		.stats = (SharedScanStats) {
 			.est_speed = init_est_speed,
 			.blocks_scanned = 0,
 		},
-		.pseq_nalloced = 0,
+		// parallel seq scan fields
+		.pbscan = parallelSeqScanData,
+		.pseq = {
+			.nalloced = 0,
+			.chunk_size = 0,
+		},
 	};
 
 	return s_entry;
@@ -1708,6 +1727,7 @@ void RemoveBufFromBlockGroup(BufferDesc *const buf) {
  */
 unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem *const bg_scan) {
 	ScanHashEntry * s_data = bg_scan->scan_entry;
+	ParallelBlockTableScanDesc pscan = s_data->data.pbscan;
 	const BlockNumber blocks_behind = GROUP_TO_FIRST_BLOCK(bg_scan->blocks_behind);
 	BlockNumber blocks_remaining;
 	SharedScanStats stats;
@@ -1716,18 +1736,66 @@ unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem *const bg_s
 	// read stats from the struct
 	stats = s_data->data.stats;
 
-	// Estimate time to next access time
-	// First: estimate distance (# blocks) to the block based on # of blocks scanned and position
-	// 		of the block group in the scan
-	// Then: distance/speed = time to next access (estimate)
-	if (blocks_behind < stats.blocks_scanned) {
-		// ### consider: if we've already been passed, then maybe this is "not requested" anymore?
-		blocks_remaining = 0;
-	} else {
-		blocks_remaining = blocks_behind - stats.blocks_scanned;
-	}
+	if (pscan == NULL || blocks_behind >= s_data->data.pseq.nalloced) {
+		/*
+		 * Estimate time to next access time for:
+		 *  - non-parallel sequential scans
+		 *  - bitmap scans (parallel and non-parallel)
+		 *  - parallel sequential scans where the block group has not been
+		 *  	"allocated" to a worker yet, and we can use the over-all
+		 *  	progress of the scan instead of needing to guess where its
+		 *  	position within a chunk.
+		 */
+		// First: estimate distance (# blocks) to the block based on # of blocks scanned and position
+		// 		of the block group in the scan
+		// Then: distance/speed = time to next access (estimate)
+		if (blocks_behind < stats.blocks_scanned) {
+			// ### consider: if we've already been passed, then maybe this is "not requested" anymore?
+			blocks_remaining = 0;
+		} else {
+			blocks_remaining = blocks_behind - stats.blocks_scanned;
+		}
 
-	res = (long)((float)blocks_remaining / stats.est_speed);
+		res = (long) ((float) blocks_remaining / stats.est_speed);
+	} else {
+		/*
+		 * Parallel sequential scan where the block is within one of the allocated chunks
+		 *
+		 * blocks_behind and nalloced are both relative to the start position, so
+		 * using their difference and the chunk size we can figure out which chunk
+		 * the block is in, and where it is in the chunk. (note: this might be off
+		 * when chunk size decreases, which will cause blocks in the second half
+		 * of a larger chunk to appear to be sooner than they should be. This seems
+		 * not worth correcting)
+		 */
+		uint64 nalloced = s_data->data.pseq.nalloced;
+		uint32 chunk_size = s_data->data.pseq.chunk_size;
+		uint32 nworkers = s_data->data.pseq.nworkers;
+		float worker_speed;
+
+		Assert(chunk_size > 0);
+
+		uint32 n_alloced_past = nalloced - blocks_behind;
+		uint32 n_chunks_passed = n_alloced_past / chunk_size;
+		uint32 chunk_start_behind = nalloced - chunk_size * (n_chunks_passed + 1);
+		uint32 blks_since_chunk_start = blocks_behind - chunk_start_behind;
+
+		/*
+		 * Blocks from the start of the chunk: we don't know how far the worker
+		 * is through the chunk, but it is between 0 and blks_since_start. On
+		 * average it is half way, so use that as our guess.
+		 */
+		blocks_remaining = blks_since_chunk_start / 2;
+
+		/*
+		 * Scan speed: we are now considering just one worker, so its speed is lower.
+		 * Assume each worker goes at the same rate and just take the average.
+		 */
+		worker_speed = stats.est_speed / (float)nworkers;
+
+		/* Calculate the result */
+		res = (long) ((float) blocks_remaining / worker_speed);
+	}
 	return res;
 }
 

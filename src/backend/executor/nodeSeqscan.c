@@ -233,7 +233,7 @@ ExecReScanSeqScan(SeqScanState *node)
 
 #ifdef USE_PBM
 		/* Register a new scan for re-scan */
-		PBM_RegisterSeqScan((struct HeapScanDescData *)scan);
+		PBM_RegisterSeqScan((struct HeapScanDescData *) scan, NULL);
 #endif /* USE_PBM */
 	}
 
@@ -286,7 +286,7 @@ ExecSeqScanInitializeDSM(SeqScanState *node,
 		table_beginscan_parallel(node->ss.ss_currentRelation, pscan);
 
 #ifdef USE_PBM
-	PBM_RegisterSeqScan((struct HeapScanDescData *)node->ss.ss_currentScanDesc);
+	PBM_RegisterSeqScan((struct HeapScanDescData *) node->ss.ss_currentScanDesc, pcxt);
 #endif
 }
 
@@ -306,7 +306,7 @@ ExecSeqScanReInitializeDSM(SeqScanState *node,
 	table_parallelscan_reinitialize(node->ss.ss_currentRelation, pscan);
 
 #ifdef USE_PBM
-	PBM_RegisterSeqScan((struct HeapScanDescData *)node->ss.ss_currentScanDesc);
+	PBM_RegisterSeqScan((struct HeapScanDescData *) node->ss.ss_currentScanDesc, NULL);
 #endif
 }
 

@@ -37,6 +37,7 @@ struct BlockGroupData;
 struct BufferDesc;
 struct HeapScanDescData;
 struct ParallelBlockTableScanDescData;
+struct ParallelContext;
 
 
 /* ===== TYPES DEFINITIONS ===== */
@@ -57,7 +58,7 @@ extern Size PbmShmemSize(void);
 
 /* ===== SEQUENTIAL SCAN METHODS ===== */
 
-extern void PBM_RegisterSeqScan(struct HeapScanDescData * scan);
+extern void PBM_RegisterSeqScan(struct HeapScanDescData *scan, struct ParallelContext *pctx);
 extern void PBM_UnregisterSeqScan(struct HeapScanDescData * scan);
 extern void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos);
 

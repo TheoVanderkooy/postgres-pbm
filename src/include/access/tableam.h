@@ -891,7 +891,7 @@ table_beginscan(Relation rel, Snapshot snapshot,
 
 #ifdef USE_PBM
 	/* Register the scan with the PBM. Table scan is always a heap scan */
-	PBM_RegisterSeqScan((struct HeapScanDescData *)scan);
+	PBM_RegisterSeqScan((struct HeapScanDescData *)scan, NULL);
 	// TODO theo maybe move this. want to do it after `heap_setscanlimits` if we call that...
 #endif /* USE_PBM */
 
@@ -929,7 +929,7 @@ table_beginscan_strat(Relation rel, Snapshot snapshot,
 
 #ifdef USE_PBM
 	/* Register the scan with the PBM. Table scan is always a heap scan */
-	PBM_RegisterSeqScan((struct HeapScanDescData *)scan);
+	PBM_RegisterSeqScan((struct HeapScanDescData *)scan, NULL);
 #endif /* USE_PBM */
 
 	return scan;

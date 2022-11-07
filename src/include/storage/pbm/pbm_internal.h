@@ -175,8 +175,16 @@ typedef struct PBM_ScanData {
 	// Statistics written by one thread, but read by all
 	volatile _Atomic(SharedScanStats) stats;
 
-	// Only used in "leader" of parallel sequential scan
-	uint64	pseq_nalloced;
+	union {
+		// Only used in "leader" of parallel sequential scan
+		struct {
+			uint32	nworkers;
+			uint64	nalloced;
+			BlockNumber	chunk_size;
+		} pseq;
+		// no other special cases for now
+	};
+
 } ScanData;
 
 /* Entry (KVP) in the scans hash map */
