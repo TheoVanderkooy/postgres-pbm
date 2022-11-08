@@ -477,7 +477,7 @@ void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) 
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_REPORT_PROGRESS)
 	/* Only trace calls which don't return immediately */
-	elog(LOG, "PBM_ReportSeqScanPosition(%lu), pos=%u, group=%u", id, pos, curGroupPos);
+	elog(LOG, "PBM_ReportSeqScanPosition(%lu), pos=%u, group=%u", scan->scanId, pos, curGroupPos);
 #endif
 
 	Assert(entry != NULL);
@@ -534,10 +534,11 @@ void PBM_InitParallelSeqScan(struct HeapScanDescData * scan, BlockNumber pos) {
 	pwork->pbm_last_report_time = get_time_ns();
 	pwork->pbm_scanned_since_last_report = 0;
 
+#ifdef TRACE_PBM
 	elog(INFO, "PBM_InitParallelSeqScan! start_pos=%u, is_leader=%s"
 		 , pos, (scan->pbmSharedScanData == NULL ? "false" : "true")
 	);
-
+#endif
 
 	/* Initialize chunk size if applicable */
 	if (scan->pbmSharedScanData != NULL) {
