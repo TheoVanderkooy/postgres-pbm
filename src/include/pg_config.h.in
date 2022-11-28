@@ -812,6 +812,11 @@
 /* Define to the version of this package. */
 #undef PACKAGE_VERSION
 
+/* Amount of shift block number by to determine PBM group. Effectively, divide
+   block number by 2^{PBM shift} to get the group and size of a group is
+   BLCKSZ * 2^{PBM shift} Configure using --with-pbmblockshift. */
+#undef PBM_BLOCK_GROUP_SHIFT
+
 /* Define to the name of a signed 128-bit integer type. */
 #undef PG_INT128_TYPE
 

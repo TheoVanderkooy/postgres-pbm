@@ -281,6 +281,23 @@ AC_DEFINE_UNQUOTED([BLCKSZ], ${BLCKSZ}, [
 ])
 
 #
+# PBM block size shift amount
+#
+AC_MSG_CHECKING([for PBM block group size])
+PGAC_ARG_REQ(with, pbmblockshift, [PBMSHIFT], [set PBM block group shift amount [5]],
+               [pbmshift=$withval],
+               [pbmshift=5])
+AC_MSG_RESULT([${pbmshift}])
+
+AC_DEFINE_UNQUOTED([PBM_BLOCK_GROUP_SHIFT], ${pbmshift}, [
+ Amount of shift block number by to determine PBM group. Effectively, divide
+ block number by 2^{PBM shift} to get the group and size of a group is
+     BLCKSZ * 2^{PBM shift}
+
+ Configure using --with-pbmblockshift.
+])
+
+#
 # Relation segment size
 #
 AC_MSG_CHECKING([for segment size])

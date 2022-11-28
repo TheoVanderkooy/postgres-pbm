@@ -407,8 +407,3 @@
  * Enable predictive buffer manager.
  */
 #define USE_PBM
-
-/*
- * PBlock number is shifted by this amount to determine the group.
- */
-#define PBM_BLOCK_GROUP_SHIFT 5
