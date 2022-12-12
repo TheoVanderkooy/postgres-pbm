@@ -306,7 +306,8 @@ ExecSeqScanReInitializeDSM(SeqScanState *node,
 	table_parallelscan_reinitialize(node->ss.ss_currentRelation, pscan);
 
 #ifdef USE_PBM
-	PBM_RegisterSeqScan((struct HeapScanDescData *) node->ss.ss_currentScanDesc, NULL);
+	// TODO theo --- was passing NULL here for pctx... why??
+	PBM_RegisterSeqScan((struct HeapScanDescData *) node->ss.ss_currentScanDesc, pcxt);
 #endif
 }
 
