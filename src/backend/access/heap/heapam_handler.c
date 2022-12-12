@@ -41,6 +41,7 @@
 #include "storage/lmgr.h"
 #ifdef USE_PBM
 #include "storage/pbm.h"
+#include "storage/pbm/pbm_inline.h"
 #endif
 #include "storage/predicate.h"
 #include "storage/procarray.h"

@@ -417,7 +417,9 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 		BlockNumber nblocks = scanData.nblocks;
 		uint64 nalloced = scanData.pseq.nalloced;
 
+#ifdef TRACE_PBM
 		elog(INFO, "PBM_UnregisterSeqScan(%lu) nallocated=%lu, start=%u, nblocks=%u", id, nalloced, startBlock, nblocks);
+#endif
 
 		/*
 		 * For parallel scans: remove anything that wasn't allocated to a worker
@@ -445,41 +447,24 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 
 /*
  * Update progress of a sequential scan.
+ *
+ * Note: this assumes we've already checked whether this should be done or not.
  */
-void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) {
+void internal_PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) {
 	unsigned long curTime, elapsed;
 	ScanHashEntry *const entry = scan->pbmSharedScanData;
 	BlockNumber blocks;
 	const BlockNumber prevGroupPos	= BLOCK_GROUP(scan->pbmLocalScanStats.last_pos);
 	const BlockNumber curGroupPos	= BLOCK_GROUP(pos);
 
- 	/* Nothing to do if the scan is not registered */
-	if (NULL == entry) {
-		return;
-	}
-
-#if defined(TRACE_PBM) && defined(TRACE_PBM_REPORT_PROGRESS_VERBOSE)
-	/* If we want to trace *every* call */
-	elog(LOG, "ReportSeqScanPosition(%lu), pos=%u, group=%u, parallel=%s", scan->scanId, pos, curGroupPos
-		, (entry->data.pbscan == NULL? "false" : "true")
-	);
-#endif
-
-	Assert(pos != InvalidBlockNumber);
-	Assert(scan->rs_base.rs_parallel == NULL); /* Should not be called for parallel scans */
-
-
-	// Only update stats periodically
-	if (prevGroupPos == curGroupPos) {
-		// do nothing if we haven't gotten any further
-		return;
-	}
-
 #if defined(TRACE_PBM) && defined(TRACE_PBM_REPORT_PROGRESS)
 	/* Only trace calls which don't return immediately */
 	elog(LOG, "PBM_ReportSeqScanPosition(%lu), pos=%u, group=%u", scan->scanId, pos, curGroupPos);
 #endif
 
+	/* Sanity checks */
+	Assert(pos != InvalidBlockNumber);
+	Assert(scan->rs_base.rs_parallel == NULL); /* Should not be called for parallel scans */
 	Assert(entry != NULL);
 
 	// Note: the entry is only *written* in one process.
@@ -497,7 +482,6 @@ void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) 
 
 	update_scan_speed_estimate(elapsed, blocks, entry);
 
-
 	PQ_RefreshRequestedBuckets();
 
 	// Remove the scan from blocks in range [prevGroupPos, curGroupPos)
@@ -506,7 +490,7 @@ void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) 
 	}
 
 // ### consider refreshing (at least some) block groups shortly after the scan starts --- avoid case where initial speed estimate is bad.
-	
+
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_REPORT_PROGRESS)
 	if (curGroupPos < 30 || curGroupPos % 64 == 0) {
@@ -518,6 +502,7 @@ void PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNumber pos) 
 
 
 // ### maybe want to track whether scan is forwards or backwards... (not sure if relevant)
+// ### ASSUMPTION: no backwards scans! (only for cursors anyways)
 }
 
 /*-------------------------------------------------------------------------
@@ -549,139 +534,126 @@ void PBM_InitParallelSeqScan(struct HeapScanDescData * scan, BlockNumber pos) {
 }
 
 /*
- * Special handling for parallel sequential scans
+ * Special handling for parallel sequential scans.
+ *
+ * Note: this assumes we've already checked whether this should be done or not.
  */
-void PBM_ParallelWorker_ReportSeqScanPosition(struct HeapScanDescData *scan, ParallelBlockTableScanDesc pbscan,
-											  BlockNumber cur_page, BlockNumber new_page) {
+void internal_PBM_ParallelWorker_ReportSeqScanPosition(struct HeapScanDescData *scan, ParallelBlockTableScanDesc pbscan,
+													   BlockNumber cur_page, BlockNumber new_page) {
 	ParallelBlockTableScanWorkerData * pbscanwork = scan->rs_parallelworkerdata;
 	BlockNumber last_reported, blocks_elapsed;
 	bool is_leader = (scan->pbmSharedScanData != NULL);
 
-	/* Parallel scan is not registered, ignore it */
-	if (pbscan->pbmSharedScanData == NULL) {
-		return;
-	}
+	BlockNumber nblocks = pbscan->pbmSharedScanData->data.nblocks;
+	BlockNumber last_in_rel = BLOCK_GROUP(nblocks - 1) + 1;
+	BlockNumber lo, hi;
 
-	/* Sanity checks */
-	Assert(pbscanwork != NULL);
+	unsigned long cur_time = get_time_ns();
+	unsigned long t_elapsed = cur_time - pbscanwork->pbm_last_report_time;
 
 	last_reported = pbscanwork->pbm_last_reported_pos;
 	blocks_elapsed = ++pbscanwork->pbm_scanned_since_last_report;
 
-	/* update local progress if we are on a new block group, or a new chunk
-	 * not contiguous with the previous */
-	if (BLOCK_GROUP(cur_page) != BLOCK_GROUP(last_reported)
-			|| new_page != cur_page+1
-			|| new_page == InvalidBlockNumber)
-	{
-		BlockNumber nblocks = pbscan->pbmSharedScanData->data.nblocks;
-		BlockNumber last_in_rel = BLOCK_GROUP(nblocks - 1) + 1;
-		BlockNumber lo, hi;
+	/* Update worker data */
+	pbscanwork->pbm_last_report_time = cur_time;
+	pbscanwork->pbm_last_reported_pos = new_page;
+	pbscanwork->pbm_scanned_since_last_report = 0;
 
-		unsigned long cur_time = get_time_ns();
-		unsigned long t_elapsed = cur_time - pbscanwork->pbm_last_report_time;
+	/* Atomically update global # of blocks scanned */
+	pbscan->pbm_nscanned += blocks_elapsed;
 
-		/* Update worker data */
-		pbscanwork->pbm_last_report_time = cur_time;
-		pbscanwork->pbm_last_reported_pos = new_page;
-		pbscanwork->pbm_scanned_since_last_report = 0;
+	/* Only update local speed if enough blocks have passed */
+	if (blocks_elapsed >= 1 << PBM_BLOCK_GROUP_SHIFT) {
+		float speed = (float)(blocks_elapsed) / (float)(t_elapsed);
+		float old_speed = pbscanwork->pbm_worker_speed;
 
-		/* Atomically update global # of blocks scanned */
-		pbscan->pbm_nscanned += blocks_elapsed;
+		/* Only update over-all speed if it changed at least 10% */
+		float rel_diff = (old_speed == 0.0f ? 0.f : (speed - old_speed) / old_speed );
+		if (old_speed == 0.0f || rel_diff > 0.1 || rel_diff < -0.1) {
+			float delta_speed = speed - old_speed;
+			pbscanwork->pbm_worker_speed = speed;
 
-		/* Only update local speed if enough blocks have passed */
-		if (blocks_elapsed >= 1 << PBM_BLOCK_GROUP_SHIFT) {
-			float speed = (float)(blocks_elapsed) / (float)(t_elapsed);
-			float old_speed = pbscanwork->pbm_worker_speed;
+			/* Atomically update global speed. Global speed is sum of
+			 * the workers, since they are processing in parallel */
+			SpinLockAcquire(&pbscan->pbm_speed_lk);
+			pbscan->pbm_est_scan_speed += delta_speed;
+			SpinLockRelease(&pbscan->pbm_speed_lk);
+		}
+	}
 
-			/* Only update over-all speed if it changed at least 10% */
-			float rel_diff = (old_speed == 0.0f ? 0.f : (speed - old_speed) / old_speed );
-			if (old_speed == 0.0f || rel_diff > 0.1 || rel_diff < -0.1) {
-				float delta_speed = speed - old_speed;
-				pbscanwork->pbm_worker_speed = speed;
+	/*
+	 * Leader should also: update global stats
+	 */
+	if (is_leader) {
+		uint64 nalloced = pg_atomic_read_u64(&pbscan->phs_nallocated);
 
-				/* Atomically update global speed. Global speed is sum of
-				 * the workers, since they are processing in parallel */
-				SpinLockAcquire(&pbscan->pbm_speed_lk);
-				pbscan->pbm_est_scan_speed += delta_speed;
-				SpinLockRelease(&pbscan->pbm_speed_lk);
-			}
+		SharedScanStats stats = {
+			.est_speed = pbscan->pbm_est_scan_speed,
+			.blocks_scanned = pbscan->pbm_nscanned,
+		};
+		if (stats.est_speed == 0.f) {
+			stats.est_speed = pbm->initial_est_speed;
 		}
 
-		/*
-		 * Leader should also: update global stats
-		 */
-		if (is_leader) {
-			uint64 nalloced = pg_atomic_read_u64(&pbscan->phs_nallocated);
+		scan->pbmSharedScanData->data.stats = stats;
 
-			SharedScanStats stats = {
-				.est_speed = pbscan->pbm_est_scan_speed,
-				.blocks_scanned = pbscan->pbm_nscanned,
-			};
-			if (stats.est_speed == 0.f) {
-				stats.est_speed = pbm->initial_est_speed;
-			}
-
-			scan->pbmSharedScanData->data.stats = stats;
-
-			/* Sequential-scan-only fields */
-			scan->pbmSharedScanData->data.pseq.nalloced = nalloced;
-			scan->pbmSharedScanData->data.pseq.chunk_size = pbscanwork->phsw_chunk_size;
+		/* Sequential-scan-only fields */
+		scan->pbmSharedScanData->data.pseq.nalloced = nalloced;
+		scan->pbmSharedScanData->data.pseq.chunk_size = pbscanwork->phsw_chunk_size;
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_REPORT_PROGRESS)
-			elog(INFO, "ReportParallelSeqScanPosition(%lu) (last=%u, cur=%u, next=%u) leader updating stats: "
-					   "nalloced=%lu, speed=%f, scanned=%u"
-				, scan->scanId, last_reported, cur_page, new_page
-				, nalloced, stats.est_speed, stats.blocks_scanned
-			);
-#endif
-		}
-
-		PQ_RefreshRequestedBuckets();
-
-		/*
-		 * Unregister the scan from the block groups we have passed
-		 *
-		 * Want to remove: blocks [last_reported, cur_pos]
-		 *
-		 * We remove at the level of block *groups*, not blocks. It is possible
-		 * for a group to be split between multiple "chunks" of the parallel
-		 * scan, so it will be the first of one chunk and last of another.
-		 *
-		 * In this case, we want to remove when it is the last chunk, not first,
-		 * since when we reach the last block it is likely whoever is responsible
-		 * for the other part already did it since it was the start of their
-		 * chunk.
-		 *
-		 * Use BLOCK_GROUP(cur_pos) + 1 for the end (since range is open on the
-		 * right)
-		 *
-		 * For start: use BLOCK_GROUP(last_reported) IF last_reported is the
-		 * 		first in the group, otherwise + 1 to leave that group for the
-		 * 		other worker.
-		 */
-
-		lo = BLOCK_GROUP(last_reported);
-		if (last_reported != GROUP_TO_FIRST_BLOCK(lo)) {
-			lo += 1;
-
-			/* handle wrap-around */
-			if (lo >= last_in_rel) {
-				lo = 0;
-			}
-		}
-
-		/* hi + 1 because we want to remove inclusively */
-		hi = BLOCK_GROUP(cur_page) + 1;
-
-#if defined(TRACE_PBM) && defined(TRACE_PBM_REPORT_PROGRESS)
-		elog(INFO, "ReportParallelSeqScanPosition(%lu) (last=%u, cur=%u, next=%u) from random worker, pscan=%p before removing scan, lo=%u, hi=%u"
-			, pbscan->pbmSharedScanData->id, last_reported, cur_page, new_page, pbscan, lo, hi
+		elog(INFO, "ReportParallelSeqScanPosition(%lu) (last=%u, cur=%u, next=%u) leader updating stats: "
+				   "nalloced=%lu, speed=%f, scanned=%u"
+			, scan->scanId, last_reported, cur_page, new_page
+			, nalloced, stats.est_speed, stats.blocks_scanned
 		);
 #endif
-
-		remove_seq_scan_from_range_circular(pbscan->pbmSharedScanData, lo, hi);
 	}
+
+	PQ_RefreshRequestedBuckets();
+
+	/*
+	 * Unregister the scan from the block groups we have passed
+	 *
+	 * Want to remove: blocks [last_reported, cur_pos]
+	 *
+	 * We remove at the level of block *groups*, not blocks. It is possible
+	 * for a group to be split between multiple "chunks" of the parallel
+	 * scan, so it will be the first of one chunk and last of another.
+	 *
+	 * In this case, we want to remove when it is the last chunk, not first,
+	 * since when we reach the last block it is likely whoever is responsible
+	 * for the other part already did it since it was the start of their
+	 * chunk.
+	 *
+	 * Use BLOCK_GROUP(cur_pos) + 1 for the end (since range is open on the
+	 * right)
+	 *
+	 * For start: use BLOCK_GROUP(last_reported) IF last_reported is the
+	 * 		first in the group, otherwise + 1 to leave that group for the
+	 * 		other worker.
+	 */
+
+	lo = BLOCK_GROUP(last_reported);
+	if (last_reported != GROUP_TO_FIRST_BLOCK(lo)) {
+		lo += 1;
+
+		/* handle wrap-around */
+		if (lo >= last_in_rel) {
+			lo = 0;
+		}
+	}
+
+	/* hi + 1 because we want to remove inclusively */
+	hi = BLOCK_GROUP(cur_page) + 1;
+
+#if defined(TRACE_PBM) && defined(TRACE_PBM_REPORT_PROGRESS)
+	elog(INFO, "ReportParallelSeqScanPosition(%lu) (last=%u, cur=%u, next=%u) from random worker, pscan=%p before removing scan, lo=%u, hi=%u"
+		, pbscan->pbmSharedScanData->id, last_reported, cur_page, new_page, pbscan, lo, hi
+	);
+#endif
+
+	remove_seq_scan_from_range_circular(pbscan->pbmSharedScanData, lo, hi);
 }
 
 
@@ -899,7 +871,7 @@ extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* ms
 /*
  * Update progress of a bitmap scan.
  */
-extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *const scan, const BlockNumber pos) {
+extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *const scan, const BlockNumber pos) {
 	const ScanId id = scan->scanId;
 	unsigned long curTime, elapsed;
 	ScanHashEntry *const scan_entry = scan->pbmSharedScanData;
@@ -916,19 +888,11 @@ extern void PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *const scan,
 		 id, pos, bg, (scan->pbmSharedScanData != NULL ? "true" : "false"));
 #endif // TRACE_PBM && TRACE_PBM_BITMAP_PROGRESS
 
-	/* Nothing to do if the scan is not registered. I *think* this will happen
-	 * with the non-leader parallel workers for a parallel bitmap scan */
-	if (NULL == scan->pbmSharedScanData) {
-		return;
-	}
-
-	/* Nothing to do if this isn't a new block group. */
-	if (bg == BLOCK_GROUP(scan->pbmLocalScanData.last_pos)) {
-		return;
-	}
-
 	/* This is the first time reporting progress, and we haven't actually done
-	 * anything yet so SKIP */
+	 * anything yet so SKIP
+	 *
+	 * Note: this is an uncommon case so we don't bother to check it in pbm_inline.h
+	 */
 	if (v->len == 0 || bg == v->items[0].block_group) {
 		Assert(0 == i);
 		return;
@@ -995,22 +959,6 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	debug_buffer_access(buf, "new buffer");
 #endif // TRACE_PBM && TRACE_PBM_BUFFERS && TRACE_PBM_BUFFERS_NEW
 
-// ### clean up debugging code...
-//#if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS)
-//	/*
-//	 * Follow buffer 1 (idx 0) to see what it does...
-//	 */
-//	if (BufferDescriptorGetBuffer(buf) == 1) {
-//		elog(WARNING, "PbmNewBuffer(0) added new buffer:" //"\n"
-//					  "\tnew={id=%d, tbl={spc=%u, db=%u, rel=%u} block=%u (%u) %d/%d}",
-//			 buf->buf_id, buf->tag.rnode.spcNode, buf->tag.rnode.dbNode, buf->tag.rnode.relNode, buf->tag.blockNum,
-//			 BLOCK_GROUP(buf->tag.blockNum), buf->pbm_bgroup_next, buf->pbm_bgroup_prev
-//		);
-//
-////		debug_buffer_access(buf, "debug buffer 1 new");
-//	}
-//#endif // TRACE_PBM && TRACE_PBM_BUFFERS
-
 	// Buffer must not already be in a block group if it is new!
 	Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_prev);
 	Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_next);
@@ -1073,20 +1021,6 @@ void PbmOnEvictBuffer(struct BufferDesc *const buf) {
 	if (buf->tag.blockNum == InvalidBlockNumber) {
 		return;
 	}
-
-// ### clean up debugging code
-//#if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS)
-//
-//	/*
-//	 * Follow buffer 1 (idx 0) to see what it does...
-//	 */
-//	if (BufferDescriptorGetBuffer(buf) == 1) {
-//		elog(WARNING, "PbmOnEvictBuffer(0) evicting buffer %d tbl={spc=%u, db=%u, rel=%u, fork=%d} block#=%u",
-//			 buf->buf_id, buf->tag.rnode.spcNode, buf->tag.rnode.dbNode, buf->tag.rnode.relNode,
-//			 buf->tag.forkNum, buf->tag.blockNum);
-//	}
-//
-//#endif // TRACE_PBM && TRACE_PBM_BUFFERS
 
 #ifdef SANITY_PBM_BUFFERS
 	// Check everything in the block group actually belongs to the same group
@@ -1925,7 +1859,7 @@ void remove_seq_scan_from_block_range(BlockGroupHashKey *bs_key, const ScanId id
 	 * DEBUGGING: this got an error during `create index`
 	 */
 	if (!found) {
-		elog(LOG, "remove_seq_scan_from_block_range(id=%lu, lo=%u, hi=%u) key={rnode={spc=%u, db=%u, rel=%u}, fork=%d, seg=%u}",
+		elog(WARNING, "remove_seq_scan_from_block_range(id=%lu, lo=%u, hi=%u) key={rnode={spc=%u, db=%u, rel=%u}, fork=%d, seg=%u}",
  			 id, lo, hi,
 			 bs_key->rnode.spcNode, bs_key->rnode.dbNode, bs_key->rnode.relNode,
 			 bs_key->forkNum, bs_key->seg

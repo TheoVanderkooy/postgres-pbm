@@ -289,6 +289,8 @@ void PQ_RemoveBlockGroup(BlockGroupData *const block_group) {
 		// Otherwise retry
 		pq_bucket_unlock(removed_from);
 
+		// TODO --- this happened repeatedly! a few times per minute with settings:
+		//   ./main.py bench -sf 10 -w tpch_c -cm 1 -p 32 -i btree+brin -c dates -sm 128MB
 		elog(WARNING, "Block group moved to a different bucket while trying to remove it!");
 	}
 

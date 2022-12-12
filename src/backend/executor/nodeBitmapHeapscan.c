@@ -47,6 +47,7 @@
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/pbm.h"
+#include "storage/pbm/pbm_inline.h"
 #include "storage/predicate.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"

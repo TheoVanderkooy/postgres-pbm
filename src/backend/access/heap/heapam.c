@@ -59,6 +59,7 @@
 #include "storage/bufmgr.h"
 #ifdef USE_PBM
 #include "storage/pbm.h"
+#include "storage/pbm/pbm_inline.h"
 #endif
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
