@@ -47,6 +47,8 @@ struct PBM_LocalSeqScanStats {
 	unsigned long last_report_time;
 // ### is this already in the scan descriptor?? use that instead?
 	BlockNumber	last_pos;	/* This is in terms of # of *blocks*, not block groups */
+
+	pbm_bg_iterator bg_it;
 };
 
 

@@ -84,6 +84,12 @@ static inline BlockGroupData * search_block_group(const BufferDesc * buf, bool* 
 static BlockGroupData * search_or_create_block_group(const BufferDesc * buf);
 
 
+// block group iterator methods: for remembering position on block group map
+static inline void bgit_init(pbm_bg_iterator * it, const BlockGroupHashKey * bgkey);
+static inline BlockGroupHashEntry * bgit_advance_one(pbm_bg_iterator * it);
+static inline BlockGroupData * bgit_advance_to(pbm_bg_iterator * it, BlockNumber bg);
+
+
 // managing buffer <--> block group links
 // this is most of the real work for the callbacks from freelist.c
 static inline BlockGroupData * AddBufToBlockGroup(BufferDesc * buf);
@@ -98,10 +104,11 @@ static unsigned long PageNextConsumption(BlockGroupData * bgdata, bool * request
 
 // removing scans from block groups
 static inline bool block_group_delete_scan(ScanId id, BlockGroupData * groupData);
-static inline void remove_seq_scan_from_range_circular(const ScanHashEntry * scan_entry, uint32 lo, uint32 hi);
-static inline void remove_seq_scan_from_block_range(BlockGroupHashKey *bs_key, ScanId id, uint32 lo, uint32 hi);
-static inline int remove_bitmap_scan_from_block_range(BlockGroupHashEntry *bg_entry, ScanId id,
-													  struct PBM_LocalBitmapScanState *scan_state, BlockNumber bg_hi);
+static inline void
+remove_seq_scan_from_range_circular(pbm_bg_iterator *bg_it, const ScanHashEntry * scan_entry, uint32 lo, uint32 hi);
+static inline void remove_seq_scan_from_block_range(pbm_bg_iterator *bg_it, ScanId id, uint32 lo, uint32 hi);
+static inline int
+remove_bitmap_scan_from_block_range(const ScanId id, struct PBM_LocalBitmapScanState *const scan_state, const BlockNumber bg_hi);
 
 
 // PQ methods
@@ -343,6 +350,10 @@ void PBM_RegisterSeqScan(HeapScanDesc scan, struct ParallelContext *pctx) {
 		.last_report_time = get_time_ns(),
 		.last_pos = startblock,
 	};
+	/* Initialize block group iterator so we don't need hash lookups all the time. */
+	bgit_init(&scan->pbmLocalScanStats.bg_it, &bgkey);
+	scan->pbmLocalScanStats.bg_it.entry = bseg_first;
+
 	if (isParallel) {
 		pscan->pbmSharedScanData = s_entry;
 		Assert(pctx != NULL);
@@ -410,7 +421,7 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 		// Everything before `start` should already be removed when the scan passed that location
 		// Everything from `start` (inclusive) to `end` (exclusive) needs to have the scan removed
 		if (scanData.nblocks > 0) {
-			remove_seq_scan_from_range_circular(scan->pbmSharedScanData, start, end);
+			remove_seq_scan_from_range_circular(&scan->pbmLocalScanStats.bg_it, scan->pbmSharedScanData, start, end);
 		}
 	} else {
 		BlockNumber startBlock = scanData.startBlock;
@@ -426,8 +437,17 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 		 * Find the first un-allocated page (if applicable)
 		 */
 		if (nblocks > 0 && nalloced < nblocks) {
+			pbm_bg_iterator it = {
+				.entry = NULL,
+				.bgkey = {
+					.rnode = scanData.tbl.rnode,
+					.forkNum = scanData.tbl.forkNum,
+				},
+			};
+
 			start = (startBlock + nalloced) % nblocks;
-			remove_seq_scan_from_range_circular(scan->pbmSharedScanData, start, end);
+
+			remove_seq_scan_from_range_circular(&it, scan->pbmSharedScanData, start, end);
 		}
 	}
 
@@ -486,11 +506,8 @@ void internal_PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNum
 
 	// Remove the scan from blocks in range [prevGroupPos, curGroupPos)
 	if (curGroupPos != prevGroupPos) {
-		remove_seq_scan_from_range_circular(entry, prevGroupPos, curGroupPos);
+		remove_seq_scan_from_range_circular(&scan->pbmLocalScanStats.bg_it, entry, prevGroupPos, curGroupPos);
 	}
-
-// ### consider refreshing (at least some) block groups shortly after the scan starts --- avoid case where initial speed estimate is bad.
-
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_REPORT_PROGRESS)
 	if (curGroupPos < 30 || curGroupPos % 64 == 0) {
@@ -527,9 +544,19 @@ void PBM_InitParallelSeqScan(struct HeapScanDescData * scan, BlockNumber pos) {
 
 	/* Initialize chunk size if applicable */
 	if (scan->pbmSharedScanData != NULL) {
+		BlockGroupHashKey bgkey;
+
 // ### For now, we require the leader to participate since it updates the PBM stats.
 		Assert(parallel_leader_participation);
 		scan->pbmSharedScanData->data.pseq.chunk_size = scan->rs_parallelworkerdata->phsw_chunk_size;
+
+		bgkey = (BlockGroupHashKey) {
+			.rnode = scan->rs_base.rs_rd->rd_node,
+			.forkNum = MAIN_FORKNUM,
+			.seg = 0,
+		};
+
+		bgit_init(&scan->pbmLocalScanStats.bg_it, &bgkey);
 	}
 }
 
@@ -653,7 +680,7 @@ void internal_PBM_ParallelWorker_ReportSeqScanPosition(struct HeapScanDescData *
 	);
 #endif
 
-	remove_seq_scan_from_range_circular(pbscan->pbmSharedScanData, lo, hi);
+	remove_seq_scan_from_range_circular(&scan->pbmLocalScanStats.bg_it, pbscan->pbmSharedScanData, lo, hi);
 }
 
 
@@ -769,6 +796,10 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 		.last_report_time = get_time_ns(),
 		.block_groups = v,
 		.vec_idx = 0,
+		.bg_it = {
+				.entry = bseg_first,
+				.bgkey = bgkey,
+		},
 	};
 
 #ifdef TRACE_PBM
@@ -806,12 +837,8 @@ extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* ms
 	const ScanId id = scan->scanId;
 	const int vec_idx = scan->pbmLocalScanData.vec_idx;
 	const int vec_len = scan->pbmLocalScanData.block_groups.len;
-	BlockNumber bg;
 	uint32 upper;
 	ScanData scanData;
-	BlockGroupHashKey bgkey;
-	BlockGroupHashEntry * bg_entry;
-	bool found;
 
 	/* Nothing to do if there is no scan registered. */
 	if (NULL == scan->pbmSharedScanData) {
@@ -825,28 +852,14 @@ extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* ms
 
 	scanData = scan->pbmSharedScanData->data;
 
-	/* Hash key of first segment. */
-	bg = scan->pbmLocalScanData.block_groups.items[vec_idx].block_group;
-	bgkey = (BlockGroupHashKey) {
-		.rnode = scan->pbmSharedScanData->data.tbl.rnode,
-		.forkNum = scan->pbmSharedScanData->data.tbl.forkNum,
-		.seg = BLOCK_GROUP_SEGMENT(bg),
-	};
-
 	/* Shift PQ buckets if needed */
 	PQ_RefreshRequestedBuckets();
 
 	/* Remove from the rest of the block groups, unless there are none */
 	if (scan->pbmLocalScanData.block_groups.len > 0 && vec_idx < vec_len) {
-		/* Find the first relevant segment */
-		LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
-			bg_entry = hash_search(pbm->BlockGroupMap, &bgkey, HASH_FIND, &found);
-		}
-		Assert(found);
-
-		/* Delete from there to the end */
+		/* Delete the scan from relevant range */
 		upper = (scanData.nblocks > 0 ? BLOCK_GROUP(scanData.nblocks - 1) + 1 : 0);
-		remove_bitmap_scan_from_block_range(bg_entry, id, &scan->pbmLocalScanData, upper);
+		remove_bitmap_scan_from_block_range(id, &scan->pbmLocalScanData, upper);
 
 		/* Remove from the scan map */
 		UnregisterDeleteScan(id, scanData.stats);
@@ -879,9 +892,6 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *co
 	int i = scan->pbmLocalScanData.vec_idx;
 	const BlockNumber bg = BLOCK_GROUP(pos);
 	BlockNumber cnt = 0;
-	BlockGroupHashKey bs_key;
-	BlockGroupHashEntry * bg_entry;
-	bool found;
 
 #if defined(TRACE_PBM) && defined (TRACE_PBM_BITMAP_PROGRESS)
 	elog(INFO, "PBM_ReportBitmapScanPosition(%lu): pos=%u bg=%u   is_registered=%s",
@@ -903,18 +913,6 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *co
 	Assert(bg > v->items[i].block_group);
 	Assert(scan_entry != NULL);
 
-	bs_key = (BlockGroupHashKey) {
-		.rnode = scan_entry->data.tbl.rnode,
-		.forkNum = scan_entry->data.tbl.forkNum,
-		.seg = BLOCK_GROUP_SEGMENT(v->items[i].block_group), // First group to unregister
-	};
-
-	/* Find the first relevant segment */
-	LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
-		bg_entry = hash_search(pbm->BlockGroupMap, &bs_key, HASH_FIND, &found);
-	}
-	Assert(found);
-
 	/* Update processing speed estimates. */
 	curTime = get_time_ns();
 	elapsed = curTime - scan->pbmLocalScanData.last_report_time;
@@ -934,7 +932,7 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *co
 	PQ_RefreshRequestedBuckets();
 
 	/* Remove the scan reference from the processed block group(s) and update index */
-	i = remove_bitmap_scan_from_block_range(bg_entry, id, &scan->pbmLocalScanData, bg);
+	i = remove_bitmap_scan_from_block_range(id, &scan->pbmLocalScanData, bg);
 	scan->pbmLocalScanData.vec_idx = i;
 }
 
@@ -1556,6 +1554,62 @@ BlockGroupData * search_or_create_block_group(const BufferDesc *const buf) {
 	return &bg_entry->groups[bgroup % BLOCK_GROUP_SEG_SIZE];
 }
 
+void bgit_init(pbm_bg_iterator * it, const BlockGroupHashKey *const bgkey) {
+	it->bgkey = *bgkey;
+	it->entry = NULL;
+}
+
+BlockGroupHashEntry * bgit_advance_one(pbm_bg_iterator *const it) {
+	BlockNumber seg = it->entry->key.seg;
+	it->entry = it->entry->seg_next;
+
+	Assert(it->entry != NULL);
+	Assert(it->entry->key.seg == seg + 1);
+
+	return it->entry;
+}
+
+BlockGroupData * bgit_advance_to(pbm_bg_iterator *const it, const BlockNumber bg) {
+	BlockNumber seg = BLOCK_GROUP_SEGMENT(bg);
+	BlockNumber seg_offset = bg % BLOCK_GROUP_SEG_SIZE;
+
+	/* If we haven't looked up the entry yet or it would need wrapping around,
+	 * do the lookup now. */
+	if (NULL == it->entry || seg < it->entry->key.seg) {
+		bool found;
+
+		it->bgkey.seg = seg;
+		LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
+			it->entry = hash_search(pbm->BlockGroupMap, &it->bgkey, HASH_FIND, &found);
+		}
+
+		/* DEBUGGING: this got an error during `create index`
+		 * (maybe can remove this -- was moved from `remove_seq_scan_from_block_range`)
+		 */
+		if (!found) {
+			elog(WARNING, "bgit_advance_to(bg=%u) key={rnode={spc=%u, db=%u, rel=%u}, fork=%d, seg=%u}",
+				 bg,
+				 it->bgkey.rnode.spcNode, it->bgkey.rnode.dbNode, it->bgkey.rnode.relNode,
+				 it->bgkey.forkNum, it->bgkey.seg
+			);
+
+			PBM_DEBUG_print_pbm_state();
+			PBM_DEBUG_sanity_check_buffers();
+		}
+		Assert(found);
+	}
+
+	Assert(seg >= it->entry->key.seg);
+
+	/* Advance to the appropriate segment if necessary */
+	while (it->entry->key.seg < seg) {
+		bgit_advance_one(it);
+	}
+
+	/* Once we have the right segment, return the relevant group from it. */
+	return &it->entry->groups[seg_offset];
+}
+
 /*
  * Link the given buffer in to the associated block group.
  * Buffer must not already be part of any group.
@@ -1808,27 +1862,22 @@ bool block_group_delete_scan(ScanId id, BlockGroupData *groupData) {
 /*
  * Remove a scan from a range of blocks which may wrap around if lo > hi.
  *
- * parameters are block *group* numbers.
+ * Parameters are block *group* numbers.
  */
-void remove_seq_scan_from_range_circular(const ScanHashEntry *const scan_entry, const uint32 lo, const uint32 hi) {
+void remove_seq_scan_from_range_circular(pbm_bg_iterator *bg_it, const ScanHashEntry *const scan_entry, const uint32 lo, const uint32 hi) {
 	const ScanId id = scan_entry->id;
 	const BlockNumber nblocks = scan_entry->data.nblocks;
-	BlockGroupHashKey bs_key = {
-		.rnode = scan_entry->data.tbl.rnode,
-		.forkNum = scan_entry->data.tbl.forkNum,
-		.seg = 0,
-	};
 
 	/* Nothing to remove if there were no blocks to begin with */
 	if (0 == nblocks) return;
 
-	/* Remove the ranges, handling wrap-arround if applicable */
+	/* Remove the ranges, handling wrap-around if applicable */
 	if (lo <= hi) {
-		remove_seq_scan_from_block_range(&bs_key, id, lo, hi);
+		remove_seq_scan_from_block_range(bg_it, id, lo, hi);
 	} else {
 		BlockNumber upper = BLOCK_GROUP(nblocks - 1) + 1;
-		remove_seq_scan_from_block_range(&bs_key, id, lo, upper);
-		remove_seq_scan_from_block_range(&bs_key, id, 0, hi);
+		remove_seq_scan_from_block_range(bg_it, id, lo, upper);
+		remove_seq_scan_from_block_range(bg_it, id, 0, hi);
 	}
 }
 
@@ -1838,10 +1887,9 @@ void remove_seq_scan_from_range_circular(const ScanHashEntry *const scan_entry, 
  * This acquires SHARED lock on PbmBlocksLock, and locks the individual
  * block groups as required.
  */
-void remove_seq_scan_from_block_range(BlockGroupHashKey *bs_key, const ScanId id, const uint32 lo, const uint32 hi) {
+void remove_seq_scan_from_block_range(pbm_bg_iterator * bg_it, const ScanId id, const uint32 lo, const uint32 hi) {
 	uint32 bgnum;
 	uint32 i;
-	bool found;
 	BlockGroupHashEntry * bs_entry;
 
 	// Nothing to do with empty range
@@ -1849,34 +1897,17 @@ void remove_seq_scan_from_block_range(BlockGroupHashKey *bs_key, const ScanId id
 		return;
 	}
 
-	// Search for the starting hash entry
-	bs_key->seg = BLOCK_GROUP_SEGMENT(lo);
-	LOCK_GUARD_V2(PbmBlocksLock, LW_SHARED) {
-		bs_entry = hash_search(pbm->BlockGroupMap, bs_key, HASH_FIND, &found);
-	}
-
-	/*
-	 * DEBUGGING: this got an error during `create index`
-	 */
-	if (!found) {
-		elog(WARNING, "remove_seq_scan_from_block_range(id=%lu, lo=%u, hi=%u) key={rnode={spc=%u, db=%u, rel=%u}, fork=%d, seg=%u}",
- 			 id, lo, hi,
-			 bs_key->rnode.spcNode, bs_key->rnode.dbNode, bs_key->rnode.relNode,
-			 bs_key->forkNum, bs_key->seg
-		);
-
-		PBM_DEBUG_print_pbm_state();
-		PBM_DEBUG_sanity_check_buffers();
-	}
-
 	/* Sanity checks */
 	Assert(lo <= hi);
-	Assert(found);
+
+	/* Find starting hash entry */
+	bgit_advance_to(bg_it, lo);
+	bs_entry = bg_it->entry;
 
 	// Loop over the linked hash map entries
 	bgnum 	= lo;
 	i 		= bgnum % BLOCK_GROUP_SEG_SIZE;
-	for ( ; bs_entry != NULL && bgnum < hi; bs_entry = bs_entry->seg_next) {
+	for ( ; bs_entry != NULL && bgnum < hi; bs_entry = bgit_advance_one(bg_it)) {
 		// Loop over block groups in the entry
 		for ( ; i < BLOCK_GROUP_SEG_SIZE && bgnum < hi; ++i, ++bgnum) {
 			BlockGroupData * block_group = &bs_entry->groups[i];
@@ -1904,15 +1935,15 @@ void remove_seq_scan_from_block_range(BlockGroupHashKey *bs_key, const ScanId id
  *
  * Used for both reporting progress and cleaning up at the end of a scan.
  */
-int remove_bitmap_scan_from_block_range(BlockGroupHashEntry * bg_entry, const ScanId id,
-										struct PBM_LocalBitmapScanState *const scan_state, const BlockNumber bg_hi) {
+int remove_bitmap_scan_from_block_range(const ScanId id, struct PBM_LocalBitmapScanState *const scan_state,
+										const BlockNumber bg_hi) {
+	pbm_bg_iterator bg_it = scan_state->bg_it;
 	const bgcnt_vec *const v = &scan_state->block_groups;
 	int i;
 
 	/* Remove scan from the relevant block groups */
 	for (i = scan_state->vec_idx; bg_hi > v->items[i].block_group; ++i) {
 		const BlockNumber blk = v->items[i].block_group;
-		const BlockNumber seg = BLOCK_GROUP_SEGMENT(blk);
 		BlockGroupData * data;
 		bool deleted;
 
@@ -1922,13 +1953,9 @@ int remove_bitmap_scan_from_block_range(BlockGroupHashEntry * bg_entry, const Sc
 		}
 
 		/* Advance segment iterator to the next needed segment if applicable */
-		while (bg_entry->key.seg < seg) {
-			bg_entry = bg_entry->seg_next;
-			Assert(bg_entry != NULL);
-		}
+		data = bgit_advance_to(&bg_it, blk);
 
 		/* Delete scan from the group and refresh the group if applicable */
-		data = &bg_entry->groups[blk % BLOCK_GROUP_SEG_SIZE];
 		deleted = block_group_delete_scan(id, data);
 		if (deleted) {
 			RefreshBlockGroup(data);

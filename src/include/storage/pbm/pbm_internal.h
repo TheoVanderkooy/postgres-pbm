@@ -236,12 +236,7 @@ typedef struct BlockGroupData {
 	dlist_node blist;
 } BlockGroupData;
 
-/* Key in Block Group Data Map */
-typedef struct BlockGroupHashKey {
-	RelFileNode	rnode;		// physical relation
-	ForkNumber	forkNum;	// fork in the relation
-	uint32		seg;		// "block group segment" in the hash table
-} BlockGroupHashKey;
+/* BlockGroupHashKey defined in pbm.h */
 
 /* Entry in Block Group Data Map */
 typedef struct BlockGroupHashEntry {
