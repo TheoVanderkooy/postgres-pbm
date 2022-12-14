@@ -97,7 +97,7 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 //#define TRACE_PBM_BUFFERS_EVICT
 //#define TRACE_PBM_PQ_REFRESH
 
-//#define SANITY_PBM_BUFFERS
+//#define SANITY_PBM_BUFFERS /* Note: this one is only valid with no concurrency! */
 //#define SANITY_PBM_BLOCK_GROUPS
 //#define SANITY_PBM_SCAN_FULLY_UNREGISTERED
 

@@ -532,31 +532,32 @@ void internal_PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNum
  */
 void PBM_InitParallelSeqScan(struct HeapScanDescData * scan, BlockNumber pos) {
 	ParallelBlockTableScanWorker pwork = scan->rs_parallelworkerdata;
+	bool is_leader = (scan->pbmSharedScanData != NULL);
+	BlockGroupHashKey bgkey = (BlockGroupHashKey) {
+			.rnode = scan->rs_base.rs_rd->rd_node,
+			.forkNum = MAIN_FORKNUM,
+			.seg = 0,
+	};
+
 	pwork->pbm_last_reported_pos = pos;
 	pwork->pbm_last_report_time = get_time_ns();
 	pwork->pbm_scanned_since_last_report = 0;
 
 #ifdef TRACE_PBM
-	elog(INFO, "PBM_InitParallelSeqScan! start_pos=%u, is_leader=%s"
-		 , pos, (scan->pbmSharedScanData == NULL ? "false" : "true")
+	elog(INFO, "PBM_InitParallelSeqScan! start_pos=%u, is_leader=%s, scan_shared=%p scanId=%ld"
+		 , pos, (!is_leader ? "false" : "true")
+		 , scan->pbmSharedScanData, scan->scanId
 	);
 #endif
 
-	/* Initialize chunk size if applicable */
-	if (scan->pbmSharedScanData != NULL) {
-		BlockGroupHashKey bgkey;
+	/* Everyone needs to initialize their local block group iterator. */
+	bgit_init(&scan->pbmLocalScanStats.bg_it, &bgkey);
 
+	/* Initialize chunk size if we are the leader */
+	if (is_leader) {
 // ### For now, we require the leader to participate since it updates the PBM stats.
 		Assert(parallel_leader_participation);
 		scan->pbmSharedScanData->data.pseq.chunk_size = scan->rs_parallelworkerdata->phsw_chunk_size;
-
-		bgkey = (BlockGroupHashKey) {
-			.rnode = scan->rs_base.rs_rd->rd_node,
-			.forkNum = MAIN_FORKNUM,
-			.seg = 0,
-		};
-
-		bgit_init(&scan->pbmLocalScanStats.bg_it, &bgkey);
 	}
 }
 
@@ -1554,17 +1555,26 @@ BlockGroupData * search_or_create_block_group(const BufferDesc *const buf) {
 	return &bg_entry->groups[bgroup % BLOCK_GROUP_SEG_SIZE];
 }
 
+/* Initialize a block group iterator for the table given in bgkey */
 void bgit_init(pbm_bg_iterator * it, const BlockGroupHashKey *const bgkey) {
 	it->bgkey = *bgkey;
 	it->entry = NULL;
 }
 
+/*
+ * Advance a block group iterator to the next *segment*.
+ * Requires the iterator to already have looked up the entry.
+ */
 BlockGroupHashEntry * bgit_advance_one(pbm_bg_iterator *const it) {
-	BlockNumber seg = it->entry->key.seg;
-	it->entry = it->entry->seg_next;
+	BlockNumber seg;
 
 	Assert(it->entry != NULL);
-	Assert(it->entry->key.seg == seg + 1);
+
+	seg = it->entry->key.seg;
+	it->entry = it->entry->seg_next;
+
+	/* Sanity check: either we're at the end or the segment increased by 1 */
+	Assert(NULL == it->entry || it->entry->key.seg == seg + 1);
 
 	return it->entry;
 }
@@ -1587,14 +1597,14 @@ BlockGroupData * bgit_advance_to(pbm_bg_iterator *const it, const BlockNumber bg
 		 * (maybe can remove this -- was moved from `remove_seq_scan_from_block_range`)
 		 */
 		if (!found) {
+			PBM_DEBUG_print_pbm_state();
+			PBM_DEBUG_sanity_check_buffers();
+
 			elog(WARNING, "bgit_advance_to(bg=%u) key={rnode={spc=%u, db=%u, rel=%u}, fork=%d, seg=%u}",
 				 bg,
 				 it->bgkey.rnode.spcNode, it->bgkey.rnode.dbNode, it->bgkey.rnode.relNode,
 				 it->bgkey.forkNum, it->bgkey.seg
 			);
-
-			PBM_DEBUG_print_pbm_state();
-			PBM_DEBUG_sanity_check_buffers();
 		}
 		Assert(found);
 	}
@@ -2069,9 +2079,13 @@ void sanity_check_verify_block_group_buffers(const BufferDesc * const buf) {
 
 			list_all_buffers();
 
-			elog(ERROR, "BLOCK GROUP has buffer from the wrong group!"
+			/* Note: this check is likely to fail with parallel workloads
+			 * because the buffers can get moved around while we're checking
+			 * everything. */
+			elog(ERROR, "BLOCK GROUP has buffer from the wrong group!  buf_id=%d"
 						"\n\texpected: \ttbl={spc=%u, db=%u, rel=%u, fork=%d} block_group=%u"
 						"\n\tgot:      \ttbl={spc=%u, db=%u, rel=%u, fork=%d} block#=%u (group=%u)",
+				 it->buf_id,
 				 rnode.spcNode, rnode.dbNode, rnode.relNode, fork, bgroup,
 				 tag.rnode.spcNode, tag.rnode.dbNode, tag.rnode.relNode, tag.forkNum, tag.blockNum, BLOCK_GROUP(tag.blockNum)
 			);

@@ -79,6 +79,8 @@ typedef struct HeapScanDescData
 
 	/* PBM fields: scan ID and statistics */
 	ScanId scanId;
+	/* Not null for registered scans EXCEPT in parallel workers in parallel scans,
+	 * which should check the ParallelBlockTableScanDesc instead */
 	struct PBM_ScanHashEntry * pbmSharedScanData;
 	struct PBM_LocalSeqScanStats pbmLocalScanStats;
 }			HeapScanDescData;

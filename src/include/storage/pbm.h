@@ -12,7 +12,7 @@
 
 /* ===== CONFIGURATION ===== */
 
-// (move this to pg_config_manual.h later, for now it is here because changing it forces *everything* to recompile)
+// (move this to pg_config_manual.h later, for now it is here because changing pg_config_manual.h forces *everything* to recompile)
 /*
  * What eviction implementation to use:
  *  0: existing clock algorithm w/ "strategies" (default if USE_PBM is disabled)
