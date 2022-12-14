@@ -1916,14 +1916,6 @@ UnpinBuffer(BufferDesc *buf, bool fixOwner)
 				break;
 		}
 
-// TODO theo: consider noyifying PBM when we *unpin* a buffer rather than load it.
-// TODO theo --- to know if the buffer isn't pinned, would need to:
-//  1. lock buffer header
-//  2. check refcount and usage count (? what are those) are 0 (?)
-//  3. ???
-// (is it enough to check if the buf_state refcount is 0? is it possible for it to reach 0 anywhere else?)
-// TODO theo --- consider *also* notifying on unpin, to recalculate priority early
-
 		/* Support LockBufferForCleanup() */
 		if (buf_state & BM_PIN_COUNT_WAITER)
 		{

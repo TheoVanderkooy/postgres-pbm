@@ -1599,9 +1599,6 @@ typedef struct ParallelBitmapHeapState
 	int			prefetch_target;
 	SharedBitmapState state;
 	ConditionVariable cv;
-
-	// TODO theo --- maybe PBM fields?
-
 	char		phs_snapshot_data[FLEXIBLE_ARRAY_MEMBER];
 } ParallelBitmapHeapState;
 
