@@ -280,7 +280,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 {
 	BufferDesc *buf;
 	int			bgwprocno;
-#if PBM_EVICT_MODE == PBM_EVICT_MODE_MULTI
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_MULTI
 	PBM_EvictState pbm_estate;
 	bool lock_acquired_no_wait;
 #elif PBM_EVICT_MODE == PBM_EVICT_MODE_CLOCK
@@ -332,7 +332,29 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 	 */
 	pg_atomic_fetch_add_u32(&StrategyControl->numBufferAllocs, 1);
 
-#if PBM_EVICT_MODE == PBM_EVICT_MODE_MULTI
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+
+	/* Check free list first */
+	buf = check_free_list(strategy, buf_state);
+	if (NULL != buf) {
+		return buf;
+	}
+
+	/*
+	 * TODO:
+	 *  - pick N random buffers which aren't pinned
+	 *  - calculate priority for each
+	 *  - sort by next estimated access time
+	 *  - pick soonest one
+	 *
+	 * TODO CAVEATS
+	 *  - possible for something to get evicted by someone else - so need to copy the tag first!
+	 *  - possible for it to get pinned while we're sorting
+	 *  	- in either of these cases, start by just trying the next highest priority...
+	 *  - need to support "retying" --- but eventually (after NBuffers tries?) return an error
+	 */
+
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_MULTI
 
 	/* Check free list first */
 	buf = check_free_list(strategy, buf_state);
@@ -381,7 +403,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 	Assert(buf != NULL);
 	return buf;
 
-#elif PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE
 	/* Check the free list first */
 	buf = check_free_list(strategy, buf_state);
 	if (NULL != buf) {
@@ -397,7 +419,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 
 	return buf;
 
-#else // otherwise use the old clock algorithm
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_CLOCK
 	/*
 	 * Check the free list first
 	 */

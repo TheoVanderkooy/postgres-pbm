@@ -26,6 +26,7 @@ static inline unsigned int floor_llogb(unsigned long x);
 static inline void my_dlist_prepend(dlist_head * list, dlist_head * other);
 
 
+#ifdef PBM_USE_PQ
 // initialization functions
 static inline void init_pq_bucket(PbmPQBucket* b);
 
@@ -57,8 +58,9 @@ static inline void pq_bucket_unlock_two(PbmPQBucket * b1, PbmPQBucket * b2);
 // private debugging functions
 static inline void DEBUG_assert_bucket_in_pbm_pq(PbmPQBucket * bucket);
 static void DEBUG_print_pq_bucket(StringInfoData * str, PbmPQBucket* bucket);
+#endif /* PBM_USE_PQ */
 
-
+#ifdef PBM_USE_PQ
 /*-------------------------------------------------------------------------
  * PBM priority queue initialization methods
  *-------------------------------------------------------------------------
@@ -387,14 +389,16 @@ bool PQ_CheckEmpty(void) {
 	}
 	return true;
 }
+#endif /* PBM_USE_PQ */
 
 
+#ifdef PBM_USE_PQ
 /*-------------------------------------------------------------------------
  * PBM PQ public API for making eviction decisions
  *-------------------------------------------------------------------------
  */
 
-#if PBM_EVICT_MODE == PBM_EVICT_MODE_MULTI
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_MULTI
 
 /*
  * Initialize the state used to track eviction. This is called once per eviction
@@ -488,7 +492,7 @@ void PBM_EvictPages(PBM_EvictState * state) {
 	pq_bucket_unlock(bucket);
 }
 
-#elif PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE
 
 /*
  * Choose a buffer for eviction from the PBM PQ.
@@ -567,6 +571,7 @@ struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * buf_state_out) {
 	return NULL;
 }
 #endif // PBM_EVICT_MODE
+#endif /* PBM_USE_PQ */
 
 
 /*-------------------------------------------------------------------------
@@ -673,6 +678,7 @@ void PBM_DEBUG_print_pbm_state(void) {
 	StringInfoData str;
 	initStringInfo(&str);
 
+#ifdef PBM_USE_PQ
 	appendStringInfo(&str, "\n\tnot_requested:");
 	DEBUG_print_pq_bucket(&str, pbm->BlockQueue->not_requested_bucket);
 	appendStringInfo(&str, "\n\tother:        ");
@@ -687,6 +693,7 @@ void PBM_DEBUG_print_pbm_state(void) {
 			DEBUG_print_pq_bucket(&str, pbm->BlockQueue->buckets[i]);
 		}
 	}
+#endif /* PBM_USE_PQ */
 
 	ereport(INFO,
 			(errmsg_internal("PBM PQ state:"),
@@ -735,6 +742,7 @@ void my_dlist_prepend(dlist_head * list, dlist_head * other) {
 	dlist_init(other);
 }
 
+#ifdef PBM_USE_PQ
 /* Initialize a PQ bucket */
 void init_pq_bucket(PbmPQBucket* b) {
 #ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
@@ -861,8 +869,10 @@ unsigned int PQ_time_to_bucket(const unsigned long ts) {
 		return bucket_num;
 	}
 }
+#endif /* PBM_USE_PQ */
 
 
+#ifdef PBM_USE_PQ
 /*-------------------------------------------------------------------------
  * PBM PQ bucket locking methods
  *-------------------------------------------------------------------------
@@ -928,8 +938,10 @@ void pq_bucket_unlock_two(PbmPQBucket * b1, PbmPQBucket * b2) {
 	pq_bucket_unlock(b1);
 	pq_bucket_unlock(b2);
 }
+#endif /* PBM_USE_PQ */
 
 
+#ifdef PBM_USE_PQ
 /*-------------------------------------------------------------------------
  * PBM PQ private helper functions
  *-------------------------------------------------------------------------
@@ -978,5 +990,5 @@ void DEBUG_print_pq_bucket(StringInfoData * str, PbmPQBucket* bucket) {
 		appendStringInfo(str, " }");
 	}
 }
-
+#endif /* PBM_USE_PQ */
 

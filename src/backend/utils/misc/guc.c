@@ -3541,6 +3541,16 @@ static struct config_int ConfigureNamesInt[] =
 		check_client_connection_check_interval, NULL, NULL
 	},
 
+	{
+		.gen = {
+			.name = "pbm_evict_num_samples", .context = PGC_SUSET, .group = RESOURCES_MEM,
+			.short_desc = gettext_noop("Sets the number of samples for the PBM buffer eviction."),
+		},
+		.variable = &pbm_evict_num_samples,
+		.boot_val = 10, .min = 1, .max = 100,
+		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL

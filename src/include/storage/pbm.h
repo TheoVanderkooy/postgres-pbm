@@ -21,13 +21,23 @@
  *     mechanism try multiple times to get from the free list
  */
 #define PBM_EVICT_MODE_CLOCK 0
-#define PBM_EVICT_MODE_SINGLE 1
-#define PBM_EVICT_MODE_MULTI 2
+#define PBM_EVICT_MODE_PQ_SINGLE 1
+#define PBM_EVICT_MODE_PQ_MULTI 2
+#define PBM_EVICT_MODE_SAMPLING 3
 #ifdef USE_PBM
-#define PBM_EVICT_MODE PBM_EVICT_MODE_MULTI
+#define PBM_EVICT_MODE PBM_EVICT_MODE_PQ_MULTI
+//#define PBM_EVICT_MODE PBM_EVICT_MODE_SAMPLING
 #else
 #define PBM_EVICT_MODE PBM_EVICT_MODE_CLOCK
 #endif
+
+#if (PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE) || (PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_MULTI)
+#define PBM_USE_PQ
+#endif
+
+
+/* ===== GLOBAL CONFIGURATION VARIABLES ===== */
+int pbm_evict_num_samples;
 
 
 /* ===== FORWARD DECLARATIONS (sorted) ===== */
@@ -83,9 +93,9 @@ extern void PbmOnEvictBuffer(struct BufferDesc * buf);
 
 
 /* ===== EVICTION METHODS ===== */
-#if PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE
 extern struct BufferDesc* PBM_EvictPage(uint32 * buf_state);
-#elif PBM_EVICT_MODE == PBM_EVICT_MODE_MULTI
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_MULTI
 typedef struct PBM_EvictState {
 	int next_bucket_idx;
 } PBM_EvictState;

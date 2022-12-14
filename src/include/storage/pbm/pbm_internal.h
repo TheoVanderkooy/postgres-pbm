@@ -256,6 +256,7 @@ typedef struct BlockGroupHashEntry {
  * The priority queue structure data structures for tracking blocks to evict
  */
 
+#ifdef PBM_USE_PQ
 /* PQ bucket */
 typedef struct PbmPQBucket {
 	// Lock for this bucket
@@ -302,7 +303,7 @@ typedef struct PbmPQ {
 
 	volatile _Atomic(unsigned long) last_shifted_time_slice;
 } PbmPQ;
-
+#endif
 
 /*
  * Main PBM data structure
@@ -335,11 +336,12 @@ typedef struct PbmShared {
 	struct HTAB * BlockGroupMap;
 
 
+#ifdef PBM_USE_PQ
 	/* Protected by PbmPqBucketsLock and PbmEvictionLock */
 
 	/// Priority queue of block groups that could be evicted
 	PbmPQ * BlockQueue;
-
+#endif /* PBM_USE_PQ */
 } PbmShared;
 
 
@@ -356,21 +358,24 @@ extern PbmShared * pbm;
  * PBM PQ Initialization
  *-------------------------------------------------------------------------
  */
+#ifdef PBM_USE_PQ
 extern PbmPQ * InitPbmPQ(void);
 extern Size PbmPqShmemSize(void);
-
+#endif /* PBM_USE_PQ */
 
 /*-------------------------------------------------------------------------
  * PBM PQ manipulation
  *-------------------------------------------------------------------------
  */
+#ifdef PBM_USE_PQ
 extern void PQ_RefreshBlockGroup(BlockGroupData * block_group, unsigned long t, bool requested);
 extern void PQ_RemoveBlockGroup(BlockGroupData * block_group);
 extern bool PQ_ShiftBucketsWithLock(unsigned long ts);
 extern bool PQ_CheckEmpty(void);
-#if PBM_EVICT_MODE == PBM_EVICT_MODE_SINGLE
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE
 extern struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * but_state);
 #endif
+#endif /* PBM_USE_PQ */
 
 
 /*-------------------------------------------------------------------------
