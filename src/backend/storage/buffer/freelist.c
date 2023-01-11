@@ -283,6 +283,8 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_MULTI
 	PBM_EvictState pbm_estate;
 	bool lock_acquired_no_wait;
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
 #elif PBM_EVICT_MODE == PBM_EVICT_MODE_CLOCK
 	int			trycounter;
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
@@ -340,6 +342,35 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 		return buf;
 	}
 
+//	pbm_evict_num_samples is the number of samples!
+	/* TODO can this change?  */
+	const int n_samples = pbm_evict_num_samples;
+
+	//...
+//	pg_backend_random
+
+	long x = random();
+//	random_r();
+
+
+	// RANDOMLY evict something!!
+	for (;;) {
+		// Pick random buffer
+		buf = GetBufferDescriptor(random() % NBuffers);
+
+		// Use the buffer if it isn't pinned
+		local_buf_state = LockBufHdr(buf);
+		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0) {
+			*buf_state = local_buf_state;
+			return buf;
+		}
+
+		// Unlock buffer if it is still pinned, try again
+		UnlockBufHdr(buf, local_buf_state);
+	}
+
+
+
 	/*
 	 * TODO:
 	 *  - pick N random buffers which aren't pinned
@@ -352,6 +383,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 	 *  - possible for it to get pinned while we're sorting
 	 *  	- in either of these cases, start by just trying the next highest priority...
 	 *  - need to support "retying" --- but eventually (after NBuffers tries?) return an error
+	 *  - want to cache block group for each buffer --- probably need a separate array of buffer PBM data...
 	 */
 
 #elif PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_MULTI
