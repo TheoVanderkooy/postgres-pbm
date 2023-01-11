@@ -184,6 +184,7 @@ typedef struct BufferDesc
 	BufferTag	tag;			/* ID of page contained in buffer */
 	int			buf_id;			/* buffer's index number (from 0) */
 
+// TODO theo --- this should only be if using the PBM PQ
 	/* track buffers in the same group in the PBM */
 	int pbm_bgroup_next;				/* PBM next buffer which is loaded in a block */
 	int pbm_bgroup_prev;				/* PBM previous buffer in the chain for a given block */

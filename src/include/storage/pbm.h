@@ -32,7 +32,9 @@
 #endif
 
 #if (PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE) || (PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_MULTI)
-#define PBM_USE_PQ
+#define PBM_USE_PQ true
+#else
+#define PBM_USE_PQ false
 #endif
 
 
@@ -88,9 +90,10 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *sc
 
 /* ===== BUFFER TRACKING ===== */
 
+#if PBM_USE_PQ
 extern void PbmNewBuffer(struct BufferDesc * buf);
 extern void PbmOnEvictBuffer(struct BufferDesc * buf);
-
+#endif /* PBM_USE_PQ */
 
 /* ===== EVICTION METHODS ===== */
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE

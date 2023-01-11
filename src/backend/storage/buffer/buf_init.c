@@ -128,6 +128,7 @@ InitBufferPool(void)
 			 */
 			buf->freeNext = i + 1;
 
+// TODO theo --- only do this if required?
 			/*
 			 * PBM: initially buffers are empty so don't contain a block from any group
 			 */

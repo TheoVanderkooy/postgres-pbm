@@ -1076,12 +1076,12 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	if (VacuumCostActive)
 		VacuumCostBalance += VacuumCostPageMiss;
 
-#ifdef USE_PBM
+#if defined(USE_PBM) && PBM_USE_PQ
 	/* Notify the PBM about a new shared buffer */
 	if (!found && !isLocalBuf) {
 		PbmNewBuffer(bufHdr);
 	}
-#endif // USE_PBM
+#endif // USE_PBM && PBM_USE_PQ
 
 	TRACE_POSTGRESQL_BUFFER_READ_DONE(forkNum, blockNum,
 									  smgr->smgr_rnode.node.spcNode,
@@ -1416,13 +1416,13 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		UnpinBuffer(buf, true);
 	}
 
-#ifdef USE_PBM
+#if defined(USE_PBM) && PBM_USE_PQ
 	/*
 	 * Report eviction to the PBM, now that we are sure this is the one that is
 	 * chosen as the victim.
 	 */
 	PbmOnEvictBuffer(buf);
-#endif
+#endif /* USE_PBM && PBM_USE_PQ */
 
 	/*
 	 * Okay, it's finally safe to rename the buffer.
@@ -1551,10 +1551,10 @@ retry:
 		goto retry;
 	}
 
-#ifdef USE_PBM
+#if defined(USE_PBM) && PBM_USE_PQ
 	/* Remove the buffer from PBM when it is invalidated. */
 	PbmOnEvictBuffer(buf);
-#endif /* USE_PBM */
+#endif /* USE_PBM && PBM_USE_PQ */
 
 	/*
 	 * Clear out the buffer's tag and flags.  We must do this to ensure that

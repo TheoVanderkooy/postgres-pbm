@@ -26,7 +26,7 @@ static inline unsigned int floor_llogb(unsigned long x);
 static inline void my_dlist_prepend(dlist_head * list, dlist_head * other);
 
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 // initialization functions
 static inline void init_pq_bucket(PbmPQBucket* b);
 
@@ -60,7 +60,7 @@ static inline void DEBUG_assert_bucket_in_pbm_pq(PbmPQBucket * bucket);
 static void DEBUG_print_pq_bucket(StringInfoData * str, PbmPQBucket* bucket);
 #endif /* PBM_USE_PQ */
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 /*-------------------------------------------------------------------------
  * PBM priority queue initialization methods
  *-------------------------------------------------------------------------
@@ -392,7 +392,7 @@ bool PQ_CheckEmpty(void) {
 #endif /* PBM_USE_PQ */
 
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 /*-------------------------------------------------------------------------
  * PBM PQ public API for making eviction decisions
  *-------------------------------------------------------------------------
@@ -678,7 +678,7 @@ void PBM_DEBUG_print_pbm_state(void) {
 	StringInfoData str;
 	initStringInfo(&str);
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 	appendStringInfo(&str, "\n\tnot_requested:");
 	DEBUG_print_pq_bucket(&str, pbm->BlockQueue->not_requested_bucket);
 	appendStringInfo(&str, "\n\tother:        ");
@@ -702,7 +702,9 @@ void PBM_DEBUG_print_pbm_state(void) {
 
 	debug_log_scan_map();
 	debug_log_blockgroup_map();
+#if PBM_USE_PQ
 	debug_log_find_blockgroup_buffers();
+#endif /* PBM_USE_PQ */
 }
 
 
@@ -742,7 +744,7 @@ void my_dlist_prepend(dlist_head * list, dlist_head * other) {
 	dlist_init(other);
 }
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 /* Initialize a PQ bucket */
 void init_pq_bucket(PbmPQBucket* b) {
 #ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
@@ -872,7 +874,7 @@ unsigned int PQ_time_to_bucket(const unsigned long ts) {
 #endif /* PBM_USE_PQ */
 
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 /*-------------------------------------------------------------------------
  * PBM PQ bucket locking methods
  *-------------------------------------------------------------------------
@@ -941,7 +943,7 @@ void pq_bucket_unlock_two(PbmPQBucket * b1, PbmPQBucket * b2) {
 #endif /* PBM_USE_PQ */
 
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 /*-------------------------------------------------------------------------
  * PBM PQ private helper functions
  *-------------------------------------------------------------------------

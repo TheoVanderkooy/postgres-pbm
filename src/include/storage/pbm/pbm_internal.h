@@ -256,7 +256,7 @@ typedef struct BlockGroupHashEntry {
  * The priority queue structure data structures for tracking blocks to evict
  */
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 /* PQ bucket */
 typedef struct PbmPQBucket {
 	// Lock for this bucket
@@ -336,7 +336,7 @@ typedef struct PbmShared {
 	struct HTAB * BlockGroupMap;
 
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 	/* Protected by PbmPqBucketsLock and PbmEvictionLock */
 
 	/// Priority queue of block groups that could be evicted
@@ -358,7 +358,7 @@ extern PbmShared * pbm;
  * PBM PQ Initialization
  *-------------------------------------------------------------------------
  */
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 extern PbmPQ * InitPbmPQ(void);
 extern Size PbmPqShmemSize(void);
 #endif /* PBM_USE_PQ */
@@ -367,7 +367,7 @@ extern Size PbmPqShmemSize(void);
  * PBM PQ manipulation
  *-------------------------------------------------------------------------
  */
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 extern void PQ_RefreshBlockGroup(BlockGroupData * block_group, unsigned long t, bool requested);
 extern void PQ_RemoveBlockGroup(BlockGroupData * block_group);
 extern bool PQ_ShiftBucketsWithLock(unsigned long ts);
@@ -440,7 +440,8 @@ static inline void bg_unlock_buffers(BlockGroupData * bg) {
 // ### clean this up eventually
 void debug_log_scan_map(void);
 void debug_log_blockgroup_map(void);
+#if PBM_USE_PQ
 void debug_log_find_blockgroup_buffers(void);
-
+#endif /*PBM_USE_PQ*/
 
 #endif //POSTGRESQL_PBM_INTERNAL_H

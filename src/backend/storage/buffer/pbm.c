@@ -91,12 +91,12 @@ static inline void bgit_init(pbm_bg_iterator * it, const BlockGroupHashKey * bgk
 static inline BlockGroupHashEntry * bgit_advance_one(pbm_bg_iterator * it);
 static inline BlockGroupData * bgit_advance_to(pbm_bg_iterator * it, BlockNumber bg);
 
-
+#if PBM_USE_PQ
 // managing buffer <--> block group links
 // this is most of the real work for the callbacks from freelist.c
 static inline BlockGroupData * AddBufToBlockGroup(BufferDesc * buf);
 static inline void RemoveBufFromBlockGroup(BufferDesc * buf);
-
+#endif /* PBM_USE_PQ */
 
 // managing buffer priority
 static inline unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem * bg_scan);
@@ -113,7 +113,7 @@ static inline int
 remove_bitmap_scan_from_block_range(ScanId id, struct PBM_LocalBitmapScanState * scan_state, BlockNumber bg_hi);
 
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 // PQ methods
 static inline void RefreshBlockGroup(BlockGroupData * data);
 static inline void PQ_RefreshRequestedBuckets(void);
@@ -187,7 +187,7 @@ void InitPBM(void) {
 	hash_flags = HASH_ELEM | HASH_BLOBS;
 	pbm->BlockGroupMap = ShmemInitHash("PBM block group stats", 1024, BlockGroupMapMaxSize, &hash_info, hash_flags);
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 	/* Initialize the priority queue */
 	pbm->BlockQueue = InitPbmPQ();
 #endif /* PBM_USE_PQ */
@@ -210,7 +210,7 @@ Size PbmShmemSize(void) {
 	 * round to 2^20...
 	 */
 	size = add_size(size, sizeof(BlockGroupScanListElem) * (1 << 20));
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 	size = add_size(size, PbmPqShmemSize());
 #endif /* PBM_USE_PQ */
 #ifdef TRACE_PBM
@@ -314,7 +314,7 @@ void PBM_RegisterSeqScan(HeapScanDesc scan, struct ParallelContext *pctx) {
 	 * PQ if applicable
 	 */
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 	/* Refresh the PQ first if needed */
 	PQ_RefreshRequestedBuckets();
 #endif /* PBM_USE_PQ */
@@ -346,7 +346,7 @@ void PBM_RegisterSeqScan(HeapScanDesc scan, struct ParallelContext *pctx) {
 			slist_push_head(&data->scans_list, &scan_entry->slist);
 			bg_unlock_scans(data);
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 			/* Refresh the block group in the PQ if applicable */
 			RefreshBlockGroup(data);
 #endif /* PBM_USE_PQ */
@@ -415,7 +415,7 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 #endif // TRACE_PBM_PRINT_SCANMAP
 #endif // TRACE_PBM
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 	// Shift PQ buckets if needed
 	PQ_RefreshRequestedBuckets();
 #endif /* PBM_USE_PQ */
@@ -513,7 +513,7 @@ void internal_PBM_ReportSeqScanPosition(struct HeapScanDescData * scan, BlockNum
 
 	update_scan_speed_estimate(elapsed, blocks, entry);
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 	PQ_RefreshRequestedBuckets();
 #endif /* PBM_USE_PQ */
 
@@ -651,7 +651,7 @@ void internal_PBM_ParallelWorker_ReportSeqScanPosition(struct HeapScanDescData *
 #endif
 	}
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 	PQ_RefreshRequestedBuckets();
 #endif /* PBM_USE_PQ */
 
@@ -753,7 +753,7 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 	s_entry = RegisterCreateScanEntry(&tbl, 0, nblocks, NULL);
 	id = s_entry->id;
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 	/* Refresh the PQ first if needed */
 	PQ_RefreshRequestedBuckets();
 #endif /* PBM_USE_PQ */
@@ -799,7 +799,7 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 		slist_push_head(&data->scans_list, &scan_entry->slist);
 		bg_unlock_scans(data);
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 		/* Refresh the block group in the PQ if applicable */
 		RefreshBlockGroup(data);
 #endif /* PBM_USE_PQ */
@@ -872,7 +872,7 @@ extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* ms
 
 	scanData = scan->pbmSharedScanData->data;
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 	/* Shift PQ buckets if needed */
 	PQ_RefreshRequestedBuckets();
 #endif /* PBM_USE_PQ */
@@ -950,7 +950,7 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *co
 	scan->pbmLocalScanData.last_report_time = curTime;
 	scan->pbmLocalScanData.last_pos = pos;
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 	PQ_RefreshRequestedBuckets();
 #endif /* PBM_USE_PQ */
 
@@ -968,6 +968,7 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *co
 /*
  * Notify the PBM about a new buffer so it can be added to the priority queue
  */
+#if PBM_USE_PQ
 void PbmNewBuffer(BufferDesc * const buf) {
 	BlockGroupData* group;
 
@@ -1016,7 +1017,6 @@ void PbmNewBuffer(BufferDesc * const buf) {
 #endif // tracing
 #endif // SANITY_PBM_BUFFERS
 
-#ifdef PBM_USE_PQ
 /*
  * ### Consider doing this unconditionally.
  * Pros: might get better estimates with more frequent updates
@@ -1026,7 +1026,6 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	if (NULL == group->pq_bucket) {
 		RefreshBlockGroup(group);
 	}
-#endif /* PBM_USE_PQ */
 }
 
 /*
@@ -1055,15 +1054,16 @@ void PbmOnEvictBuffer(struct BufferDesc *const buf) {
 	Assert(buf->pbm_bgroup_next == FREENEXT_NOT_IN_LIST);
 	Assert(buf->pbm_bgroup_prev == FREENEXT_NOT_IN_LIST);
 }
+#endif /* PBM_USE_PQ */
 
 
 /*-------------------------------------------------------------------------
  * Public API: Maintenance methods called in the background
  *-------------------------------------------------------------------------
  */
-#ifndef PBM_USE_PQ
+#if !PBM_USE_PQ
 void PBM_TryRefreshRequestedBuckets(void) {
-	/* No-op of not using the PQ */
+	/* No-op if not using the PQ */
 }
 #else /* defined(PBM_USE_PQ) */
 /*
@@ -1648,6 +1648,7 @@ BlockGroupData * bgit_advance_to(pbm_bg_iterator *const it, const BlockNumber bg
 	return &it->entry->groups[seg_offset];
 }
 
+#if PBM_USE_PQ
 /*
  * Link the given buffer in to the associated block group.
  * Buffer must not already be part of any group.
@@ -1695,10 +1696,7 @@ void RemoveBufFromBlockGroup(BufferDesc *const buf) {
 	int next, prev;
 	bool found;
 	BlockGroupData * group;
-#ifdef PBM_USE_PQ
 	bool need_to_remove;
-#endif /* PBM_USE_PQ */
-
 	/*
 	 * DEBUGGING: got this error once while dropping the *last* index on the table.
 	 *
@@ -1740,20 +1738,17 @@ void RemoveBufFromBlockGroup(BufferDesc *const buf) {
 		group->buffers_head = next;
 	}
 
-#ifdef PBM_USE_PQ
 	// check if the group is empty while we still have the lock
 	need_to_remove = (group->buffers_head == FREENEXT_END_OF_LIST);
-#endif /* PBM_USE_PQ */
 
 	bg_unlock_buffers(group);
 
-#ifdef PBM_USE_PQ
 	// If the whole list is empty now, remove the block from the PQ bucket as well
 	if (need_to_remove) {
 		PQ_RemoveBlockGroup(group);
 	}
-#endif /* PBM_USE_PQ */
 }
+#endif /* PBM_USE_PQ */
 
 /*
  * Estimate when the specific scan will reach the relevant block group.
@@ -1955,7 +1950,7 @@ void remove_seq_scan_from_block_range(pbm_bg_iterator * bg_it, const ScanId id, 
 		// Loop over block groups in the entry
 		for ( ; i < BLOCK_GROUP_SEG_SIZE && bgnum < hi; ++i, ++bgnum) {
 			BlockGroupData * block_group = &bs_entry->groups[i];
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 			bool deleted = block_group_delete_scan(id, block_group);
 			if (deleted) {
 				RefreshBlockGroup(block_group);
@@ -1993,7 +1988,7 @@ int remove_bitmap_scan_from_block_range(const ScanId id, struct PBM_LocalBitmapS
 	for (i = scan_state->vec_idx; bg_hi > v->items[i].block_group; ++i) {
 		const BlockNumber blk = v->items[i].block_group;
 		BlockGroupData * data;
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 		bool deleted;
 #endif /* PBM_USE_PQ */
 
@@ -2006,7 +2001,7 @@ int remove_bitmap_scan_from_block_range(const ScanId id, struct PBM_LocalBitmapS
 		data = bgit_advance_to(&bg_it, blk);
 
 		/* Delete scan from the group and refresh the group if applicable */
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 		deleted = block_group_delete_scan(id, data);
 		if (deleted) {
 			RefreshBlockGroup(data);
@@ -2019,7 +2014,7 @@ int remove_bitmap_scan_from_block_range(const ScanId id, struct PBM_LocalBitmapS
 	return i;
 }
 
-#ifdef PBM_USE_PQ
+#if PBM_USE_PQ
 /*
  * Refresh a block group in the PQ.
  *
@@ -2310,6 +2305,7 @@ void debug_log_blockgroup_map(void) {
 	pfree(str.data);
 }
 
+#if PBM_USE_PQ
 void debug_log_find_blockgroup_buffers(void) {
 	StringInfoData str;
 	initStringInfo(&str);
@@ -2355,6 +2351,7 @@ void debug_log_find_blockgroup_buffers(void) {
 
 	pfree(str.data);
 }
+#endif /* PBM_USE_PQ */
 
 /* Assert the given scan has been completely removed from everything */
 void assert_scan_completely_unregistered(ScanHashEntry * scan) {
