@@ -128,12 +128,15 @@ InitBufferPool(void)
 			 */
 			buf->freeNext = i + 1;
 
-// TODO theo --- only do this if required?
+#if PBM_USE_PQ
 			/*
 			 * PBM: initially buffers are empty so don't contain a block from any group
 			 */
 			buf->pbm_bgroup_next = FREENEXT_NOT_IN_LIST;
 			buf->pbm_bgroup_prev = FREENEXT_NOT_IN_LIST;
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+			buf->pbm_bg = NULL;
+#endif
 
 			LWLockInitialize(BufferDescriptorGetContentLock(buf),
 							 LWTRANCHE_BUFFER_CONTENT);

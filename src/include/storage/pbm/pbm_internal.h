@@ -220,7 +220,9 @@ typedef struct BlockGroupData {
 	slock_t	slock;
 #elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
 	slock_t	scan_lock;
+#if PBM_USE_PQ
 	slock_t	buf_lock;
+#endif /* PBM_USE_PQ */
 #else
 #error "unknown block group lock mode"
 #endif // PBM_BG_LOCK_MODE
@@ -228,12 +230,14 @@ typedef struct BlockGroupData {
 	// Set of scans which care about this block group
 	slist_head scans_list;
 
+#if PBM_USE_PQ
 	// Set of buffers holding data in this block group
 	volatile int buffers_head;
 
 	// Linked-list in PQ buckets
 	struct PbmPQBucket *volatile pq_bucket;
 	dlist_node blist;
+#endif /* PBM_USE_PQ */
 } BlockGroupData;
 
 /* BlockGroupHashKey defined in pbm.h */
@@ -354,20 +358,21 @@ typedef struct PbmShared {
 extern PbmShared * pbm;
 
 
+#if PBM_USE_PQ
 /*-------------------------------------------------------------------------
  * PBM PQ Initialization
  *-------------------------------------------------------------------------
  */
-#if PBM_USE_PQ
+
 extern PbmPQ * InitPbmPQ(void);
 extern Size PbmPqShmemSize(void);
-#endif /* PBM_USE_PQ */
+
 
 /*-------------------------------------------------------------------------
  * PBM PQ manipulation
  *-------------------------------------------------------------------------
  */
-#if PBM_USE_PQ
+
 extern void PQ_RefreshBlockGroup(BlockGroupData * block_group, unsigned long t, bool requested);
 extern void PQ_RemoveBlockGroup(BlockGroupData * block_group);
 extern bool PQ_ShiftBucketsWithLock(unsigned long ts);
@@ -413,6 +418,7 @@ static inline void bg_unlock_scans(BlockGroupData * bg) {
 #endif // PBM_BG_LOCK_MODE
 }
 
+#if PBM_USE_PQ
 static inline void bg_lock_buffers(BlockGroupData * bg, pg_attribute_unused() LWLockMode mode) {
 #if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK
 	LWLockAcquire(&bg->lock, mode);
@@ -432,6 +438,7 @@ static inline void bg_unlock_buffers(BlockGroupData * bg) {
 	SpinLockRelease(&bg->buf_lock);
 #endif // PBM_BG_LOCK_MODE
 }
+#endif /* PBM_USE_PQ */
 
 
 

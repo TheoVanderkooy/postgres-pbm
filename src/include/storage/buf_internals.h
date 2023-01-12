@@ -21,6 +21,7 @@
 #include "storage/condition_variable.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
+#include "storage/pbm/pbm_config.h"
 #include "storage/shmem.h"
 #include "storage/smgr.h"
 #include "storage/spin.h"
@@ -132,6 +133,10 @@ typedef struct buftag
 #define BufMappingPartitionLockByIndex(i) \
 	(&MainLWLockArray[BUFFER_MAPPING_LWLOCK_OFFSET + (i)].lock)
 
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+struct BlockGroupData;
+#endif
+
 /*
  *	BufferDesc -- shared descriptor/state data for a single shared buffer.
  *
@@ -184,10 +189,13 @@ typedef struct BufferDesc
 	BufferTag	tag;			/* ID of page contained in buffer */
 	int			buf_id;			/* buffer's index number (from 0) */
 
-// TODO theo --- this should only be if using the PBM PQ
+#if PBM_USE_PQ
 	/* track buffers in the same group in the PBM */
 	int pbm_bgroup_next;				/* PBM next buffer which is loaded in a block */
 	int pbm_bgroup_prev;				/* PBM previous buffer in the chain for a given block */
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+	struct BlockGroupData * pbm_bg;
+#endif
 
 	/* state of the tag, containing flags, refcount and usagecount */
 	pg_atomic_uint32 state;

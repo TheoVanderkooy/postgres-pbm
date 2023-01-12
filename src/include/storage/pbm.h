@@ -6,39 +6,13 @@
 #define POSTGRESQL_PBM_H
 
 #include "storage/pbm/pbm_minimal.h"
+#include "storage/pbm/pbm_config.h"
 
 #include "storage/block.h"
 
 
-/* ===== CONFIGURATION ===== */
-
-// (move this to pg_config_manual.h later, for now it is here because changing pg_config_manual.h forces *everything* to recompile)
-/*
- * What eviction implementation to use:
- *  0: existing clock algorithm w/ "strategies" (default if USE_PBM is disabled)
- *  1: first implementation with only 1 block at a time (might not work anymore!)
- *  2: method that puts still-valid blocks on the free list and lets the normal
- *     mechanism try multiple times to get from the free list
- */
-#define PBM_EVICT_MODE_CLOCK 0
-#define PBM_EVICT_MODE_PQ_SINGLE 1
-#define PBM_EVICT_MODE_PQ_MULTI 2
-#define PBM_EVICT_MODE_SAMPLING 3
-#ifdef USE_PBM
-#define PBM_EVICT_MODE PBM_EVICT_MODE_PQ_MULTI
-//#define PBM_EVICT_MODE PBM_EVICT_MODE_SAMPLING
-#else
-#define PBM_EVICT_MODE PBM_EVICT_MODE_CLOCK
-#endif
-
-#if (PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE) || (PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_MULTI)
-#define PBM_USE_PQ true
-#else
-#define PBM_USE_PQ false
-#endif
-
-
 /* ===== GLOBAL CONFIGURATION VARIABLES ===== */
+#define PBM_EVICT_MAX_SAMPLES 100
 int pbm_evict_num_samples;
 
 
@@ -90,10 +64,9 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *sc
 
 /* ===== BUFFER TRACKING ===== */
 
-#if PBM_USE_PQ
 extern void PbmNewBuffer(struct BufferDesc * buf);
 extern void PbmOnEvictBuffer(struct BufferDesc * buf);
-#endif /* PBM_USE_PQ */
+
 
 /* ===== EVICTION METHODS ===== */
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE
@@ -108,6 +81,8 @@ extern void PBM_EvictPages(PBM_EvictState * state);
 static inline bool PBM_EvictingFailed(PBM_EvictState * state) {
 	return state->next_bucket_idx < -1;
 }
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+extern struct BufferDesc* PBM_EvictPage(uint32 * buf_state);
 #endif
 
 

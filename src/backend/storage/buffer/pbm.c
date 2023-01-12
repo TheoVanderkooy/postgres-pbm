@@ -29,12 +29,12 @@
 // TODO! look for DEBUGGING comments and disable/remove them once they definitely aren't needed
 
 
-
 /* Global pointer to the single PBM */
 PbmShared* pbm;
 
 /* Configuration variables */
 int pbm_evict_num_samples;
+
 
 /*-------------------------------------------------------------------------
  * Prototypes for private methods
@@ -81,7 +81,7 @@ static inline void free_bg_scan_elem(BlockGroupScanListElem *it);
 
 // lookups in applicable hash maps
 static inline ScanHashEntry * search_scan(ScanId id, HASHACTION action, bool* foundPtr);
-static inline BlockGroupData * search_block_group(const BufferDesc * buf, bool* foundPtr);
+static inline BlockGroupData * search_block_group(const BufferTag * buftag, bool* foundPtr);
 
 static BlockGroupData * search_or_create_block_group(const BufferDesc * buf);
 
@@ -968,7 +968,6 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *co
 /*
  * Notify the PBM about a new buffer so it can be added to the priority queue
  */
-#if PBM_USE_PQ
 void PbmNewBuffer(BufferDesc * const buf) {
 	BlockGroupData* group;
 
@@ -981,6 +980,7 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	debug_buffer_access(buf, "new buffer");
 #endif // TRACE_PBM && TRACE_PBM_BUFFERS && TRACE_PBM_BUFFERS_NEW
 
+#if PBM_USE_PQ
 	// Buffer must not already be in a block group if it is new!
 	Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_prev);
 	Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_next);
@@ -1026,6 +1026,18 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	if (NULL == group->pq_bucket) {
 		RefreshBlockGroup(group);
 	}
+#endif /* PBM_USE_PQ */
+
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+	group = search_or_create_block_group(buf);
+
+	/* Sanity checks: should not already have a group, and we should find the group. */
+	Assert(buf->pbm_bg == NULL);
+	Assert(group != NULL);
+
+	/* Set the block group for the buffer */
+	buf->pbm_bg = group;
+#endif /* PBM_EVICT_MODE_SAMPLING */
 }
 
 /*
@@ -1044,6 +1056,7 @@ void PbmOnEvictBuffer(struct BufferDesc *const buf) {
 		return;
 	}
 
+#if PBM_USE_PQ
 #ifdef SANITY_PBM_BUFFERS
 	// Check everything in the block group actually belongs to the same group
 	sanity_check_verify_block_group_buffers(buf);
@@ -1053,8 +1066,13 @@ void PbmOnEvictBuffer(struct BufferDesc *const buf) {
 
 	Assert(buf->pbm_bgroup_next == FREENEXT_NOT_IN_LIST);
 	Assert(buf->pbm_bgroup_prev == FREENEXT_NOT_IN_LIST);
-}
 #endif /* PBM_USE_PQ */
+
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+	/* If we had cached the block group for this buffer, clear it */
+	buf->pbm_bg = NULL;
+#endif
+}
 
 
 /*-------------------------------------------------------------------------
@@ -1344,7 +1362,7 @@ void bcvec_push_back(bgcnt_vec * vec, BlockNumber bg) {
 		for (int i = 0; i < vec->len; ++i) {
 			new_items[i] = vec->items[i];
 		}
-
+// ### maybe use repalloc here instead?
 		pfree(vec->items);
 
 		vec->cap = new_cap;
@@ -1403,8 +1421,10 @@ void InitSeqScanStatsEntry(BlockGroupScanListElem *temp, ScanId id, ScanHashEntr
 /* Initialize metadata for a block group */
 void InitBlockGroupData(BlockGroupData * data) {
 	slist_init(&data->scans_list);
+#if PBM_USE_PQ
 	data->buffers_head = FREENEXT_END_OF_LIST;
 	data->pq_bucket = NULL;
+#endif /* PBM_USE_PQ */
 
 	// Initialize locks for the block group
 #if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK
@@ -1413,7 +1433,9 @@ void InitBlockGroupData(BlockGroupData * data) {
 	SpinLockInit(&data->slock);
 #elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
 	SpinLockInit(&data->scan_lock);
+#if PBM_USE_PQ
 	SpinLockInit(&data->buf_lock);
+#endif /* PBM_USE_PQ */
 #endif // PBM_BG_LOCK_MODE
 }
 
@@ -1513,12 +1535,12 @@ ScanHashEntry * search_scan(const ScanId id, HASHACTION action, bool* foundPtr) 
  *
  * This acquires PbmBlocksLock internally for the hash lookup.
  */
-BlockGroupData * search_block_group(const BufferDesc *const buf, bool* foundPtr) {
-	const BlockNumber blockNum = buf->tag.blockNum;
+BlockGroupData * search_block_group(const BufferTag *const buftag, bool* foundPtr) {
+	const BlockNumber blockNum = buftag->blockNum;
 	const BlockNumber bgroup = BLOCK_GROUP(blockNum);
 	const BlockGroupHashKey bgkey = (BlockGroupHashKey) {
-			.rnode = buf->tag.rnode,
-			.forkNum = buf->tag.forkNum,
+			.rnode = buftag->rnode,
+			.forkNum = buftag->forkNum,
 			.seg = BLOCK_GROUP_SEGMENT(bgroup),
 	};
 	BlockGroupHashEntry * bg_entry;
@@ -1716,7 +1738,7 @@ void RemoveBufFromBlockGroup(BufferDesc *const buf) {
 	Assert(buf->pbm_bgroup_prev != FREENEXT_NOT_IN_LIST);
 
 	// Need to find and lock the block group before doing anything
-	group = search_block_group(buf, &found);
+	group = search_block_group(&buf->tag, &found);
 	Assert(found);
 	bg_lock_buffers(group, LW_EXCLUSIVE);
 
@@ -2064,10 +2086,178 @@ void PQ_RefreshRequestedBuckets(void) {
 #endif /* PBM_USE_PQ */
 
 
-
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE
 BufferDesc* PBM_EvictPage(uint32 * buf_state) {
 	return PQ_Evict(pbm->BlockQueue, buf_state);
+}
+#elif PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+
+/* Tracking the randomly chosen buffers */
+typedef struct PBM_BufSample {
+	struct BufferDesc * buf; /* The chosen buffer */
+	BufferTag tag; /* The tag when we choose the sample */
+	unsigned long next_access_time;
+} PBM_BufSample;
+
+/*
+ * Heap functions for managing the list of PBM_BufSample.
+ *
+ * Essentially we are doing heap sort: heapify then remove max repeatedly.
+ */
+static inline void swap_buf_s(PBM_BufSample * a, PBM_BufSample * b) {
+	PBM_BufSample temp = *a;
+	*a = *b;
+	*b = temp;
+}
+static inline size_t bh_parent(size_t i) { return (i-1)/2; }
+static inline size_t bh_left(size_t i) { return 2*i + 1; }
+static inline size_t bh_right(size_t i) { return 2*i + 2; }
+static inline void bh_fix_down(size_t i, PBM_BufSample * h, size_t n) {
+	for (;;) {
+		size_t l = bh_left(i);
+		size_t r = bh_right(i);
+		size_t m; /* index of child with larger access time */
+
+		/* Stop if no children */
+		if (l >= n) return;
+
+		/* Find child with larger access time */
+		if (r >= n) m = l;
+		else if (h[l].next_access_time > h[r].next_access_time) m = l;
+		else m = r;
+
+		/* Stop if current is already bigger */
+		if (h[i].next_access_time >= h[m].next_access_time) return;
+
+		/* Otherwise swap down and continue from there */
+		swap_buf_s(&h[i], &h[m]);
+
+		i = m;
+	}
+}
+static inline void bh_heapify(PBM_BufSample * h, size_t n) {
+	for (size_t i = bh_parent(n-1)+1; i > 0; --i) {
+		bh_fix_down(i-1, h, n);
+	}
+}
+static inline void bh_pop(PBM_BufSample * h, size_t n) {
+	h[0] = h[n-1];
+	bh_fix_down(0, h, n-1);
+}
+
+/*
+ * Sanity check that the group is the right hash entry.
+ */
+static inline bool bg_check_buftag(BufferTag * tag, BlockGroupData * bgdata) {
+	const BlockNumber blockNum = tag->blockNum;
+	const BlockNumber bgroup = BLOCK_GROUP(blockNum);
+	const BlockNumber bseg = BLOCK_GROUP_SEGMENT(bgroup);
+	const BlockNumber seg_offset = bgroup % BLOCK_GROUP_SEG_SIZE;
+
+	const BlockGroupData * bg_array_start = bgdata - seg_offset;
+	const size_t groups_offset = offsetof(BlockGroupHashEntry, groups);
+
+	const BlockGroupHashEntry * entry =
+			(BlockGroupHashEntry *)((char *)(bg_array_start) - groups_offset);
+
+	bool tag_matches = (RelFileNodeEquals(entry->key.rnode, tag->rnode))
+			&& (entry->key.forkNum == tag->forkNum)
+			&& (entry->key.seg == bseg);
+
+	return tag_matches;
+}
+
+/*
+ * Choose a buffer to evict using the sampling-based eviction strategy.
+ *
+ * If selection fails because the buffers all got pinned again or evicted by
+ * someone else after we sorted, this will return NULL and the caller should
+ * try a different strategy. (possibly try again, or pick randomly)
+ */
+BufferDesc* PBM_EvictPage(uint32 * buf_state) {
+	BufferDesc * buf;
+	uint32 local_buf_state;
+	BlockGroupData * bgdata;
+	bool requested;
+	unsigned long next_access;
+
+	// array of samples
+	PBM_BufSample samples[PBM_EVICT_MAX_SAMPLES];
+	int n_selected = 0;
+
+	// find the configured number of samples
+	while (n_selected < pbm_evict_num_samples) {
+		/* Pick a random buffer */
+		buf = GetBufferDescriptor(random() % NBuffers);
+		samples[n_selected].buf = buf;
+
+		/* If the buffer is pinned, skip it and pick another */
+		local_buf_state = LockBufHdr(buf);
+		if (BUF_STATE_GET_REFCOUNT(local_buf_state) != 0) {
+			UnlockBufHdr(buf, local_buf_state);
+			continue;
+		}
+
+		/* Copy the tag and potentially cached block group atomically before
+		 * unlocking */
+		samples[n_selected].tag = buf->tag;
+		bgdata = buf->pbm_bg;
+		UnlockBufHdr(buf, local_buf_state);
+
+		/* Sanity checks */
+		Assert(bgdata != NULL);
+		Assert(bg_check_buftag(&samples[n_selected].tag, bgdata));
+
+		/* Compute next access time */
+		next_access = PageNextConsumption(bgdata, &requested);
+		samples[n_selected].next_access_time = next_access;
+
+		/* If it is "not requested", try to use it immediately.
+		 * Need to check it is still not pinned. */
+		if (!requested) {
+			local_buf_state = LockBufHdr(buf);
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0) {
+				/* Not pinned - use it without more samples */
+				*buf_state = local_buf_state;
+				return buf;
+			}
+
+			/* Got pinned - unlock and pick something else */
+			UnlockBufHdr(buf, local_buf_state);
+		} else {
+			/* Buffer is requested and not pinned - keep it as a sample */
+			n_selected += 1;
+		}
+	}
+
+	/* Heapify our samples */
+	bh_heapify(samples, n_selected);
+
+	while (n_selected > 0) {
+		buf = samples[0].buf;
+
+		/* Check buffer with largest next-access time. Make sure that:
+		 *  - nobody pinned it while we weren't looking (and is still using it)
+		 *  - nobody evicted it while we weren't looking so it is actually a different buffer now
+		 */
+		local_buf_state = LockBufHdr(buf);
+		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
+				&& BUFFERTAGS_EQUAL(buf->tag, samples[0].tag)) {
+			/* Not pinned AND tag didn't change - evict this one */
+			*buf_state = local_buf_state;
+			return buf;
+		}
+
+		/* Someone stole it - remove from the heap and pick a different one */
+		UnlockBufHdr(buf, local_buf_state);
+
+		bh_pop(samples, n_selected);
+		--n_selected;
+	}
+
+	/* Too many race conditions while evicting - give up!
+	 * Caller should pick something randomly */
+	return NULL;
 }
 #endif // PBM_EVICT_MODE
 
@@ -2149,7 +2339,7 @@ void list_all_buffers(void) {
 			 BLOCK_GROUP(tag.blockNum), buf->pbm_bgroup_prev, buf->pbm_bgroup_next
 		);
 
-		data = search_block_group(buf, &found);
+		data = search_block_group(&buf->tag, &found);
 
 		if (!found || data == NULL) {
 			elog(WARNING, "\tGROUP NOT FOUND!  prev=%d  next=%d", buf->pbm_bgroup_prev, buf->pbm_bgroup_next);
@@ -2181,7 +2371,7 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 	unsigned long next_access_time = AccessTimeNotRequested;
 	unsigned long now = get_time_ns();
 
-	BlockGroupData *const block_scans = search_block_group(buf, &found);
+	BlockGroupData *const block_scans = search_block_group(&buf->tag, &found);
 	if (true == found) {
 		next_access_time = PageNextConsumption(block_scans, &requested);
 	}

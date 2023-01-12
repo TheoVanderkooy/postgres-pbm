@@ -3547,7 +3547,7 @@ static struct config_int ConfigureNamesInt[] =
 			.short_desc = gettext_noop("Sets the number of samples for the PBM buffer eviction."),
 		},
 		.variable = &pbm_evict_num_samples,
-		.boot_val = 10, .min = 1, .max = 100,
+		.boot_val = 10, .min = 1, .max = PBM_EVICT_MAX_SAMPLES,
 		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
 	},
 

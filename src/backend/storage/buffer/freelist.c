@@ -283,8 +283,6 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_MULTI
 	PBM_EvictState pbm_estate;
 	bool lock_acquired_no_wait;
-#elif PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
-	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
 #elif PBM_EVICT_MODE == PBM_EVICT_MODE_CLOCK
 	int			trycounter;
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
@@ -342,49 +340,36 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 		return buf;
 	}
 
-//	pbm_evict_num_samples is the number of samples!
-	/* TODO can this change?  */
-	const int n_samples = pbm_evict_num_samples;
+	if (pbm_evict_num_samples > 1) {
+		/* Use the sampling method to pick something from the PBM */
+		buf = PBM_EvictPage(buf_state);
+		if (buf != NULL) {
+			return buf;
+		}
+	}
 
-	//...
-//	pg_backend_random
-
-	long x = random();
-//	random_r();
-
-
-	// RANDOMLY evict something!!
+	/* The sampling failed because everything we tried got evicted or pinned by
+	 * someone else after we selected it. Give up and pick completely randomly.
+	 *
+	 * Alternatively, when # samples is 1 the strategy is equivalent to random
+	 * eviction, so skip that logic entirely and go right to random eviction.
+	 */
 	for (;;) {
-		// Pick random buffer
+		uint32 local_buf_state;
+
+		/* Pick a random buffer */
 		buf = GetBufferDescriptor(random() % NBuffers);
 
-		// Use the buffer if it isn't pinned
+		/* Use the buffer if it isn't pinned */
 		local_buf_state = LockBufHdr(buf);
 		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0) {
 			*buf_state = local_buf_state;
 			return buf;
 		}
 
-		// Unlock buffer if it is still pinned, try again
+		/* Buffer is pinned, unlock it and try again */
 		UnlockBufHdr(buf, local_buf_state);
 	}
-
-
-
-	/*
-	 * TODO:
-	 *  - pick N random buffers which aren't pinned
-	 *  - calculate priority for each
-	 *  - sort by next estimated access time
-	 *  - pick soonest one
-	 *
-	 * TODO CAVEATS
-	 *  - possible for something to get evicted by someone else - so need to copy the tag first!
-	 *  - possible for it to get pinned while we're sorting
-	 *  	- in either of these cases, start by just trying the next highest priority...
-	 *  - need to support "retying" --- but eventually (after NBuffers tries?) return an error
-	 *  - want to cache block group for each buffer --- probably need a separate array of buffer PBM data...
-	 */
 
 #elif PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_MULTI
 
