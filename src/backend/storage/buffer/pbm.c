@@ -2198,8 +2198,17 @@ BufferDesc* PBM_EvictPage(uint32 * buf_state) {
 			continue;
 		}
 
-		/* Copy the tag and potentially cached block group atomically before
-		 * unlocking */
+		/* If no cached block group, buffer is not valid so just use it. */
+		if (buf->pbm_bg == NULL) {
+			Assert(!(local_buf_state & BM_VALID));
+			Assert(!(local_buf_state & BM_TAG_VALID));
+			Assert(buf->tag.blockNum == InvalidBlockNumber);
+
+			*buf_state = local_buf_state;
+			return buf;
+		}
+
+		/* Copy the tag and cached block group atomically before unlocking */
 		samples[n_selected].tag = buf->tag;
 		bgdata = buf->pbm_bg;
 		UnlockBufHdr(buf, local_buf_state);
