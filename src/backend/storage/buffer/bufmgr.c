@@ -1354,6 +1354,19 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 			 */
 			UnpinBuffer(buf, true);
 
+			/* TODO PBM: technically, there is a bug here:
+			 * IF the buffer we wanted to use is not valid (we got it from the
+			 * free list), just dropping it will lose it because it is not on
+			 * the free list and also not in PBM structures. Solution is to
+			 * check and put it back on the free list here in that specific
+			 * case.
+			 *
+			 * However, pre-warming before running experiments makes sure all
+			 * buffers have valid tags for the whole test since we don't drop
+			 * tables or anything that might invalidate the buffer. So I can
+			 * also just ignore it :)
+			 */
+
 			/* Can give up that buffer's mapping partition lock now */
 			if (oldPartitionLock != NULL &&
 				oldPartitionLock != newPartitionLock)
