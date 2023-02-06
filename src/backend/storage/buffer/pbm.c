@@ -58,7 +58,9 @@ static inline void update_scan_speed_estimate(unsigned long elapsed, uint32 bloc
 
 // get current time
 static inline unsigned long get_time_ns(void);
+#if PBM_USE_PQ
 static inline unsigned long get_timeslice(void);
+#endif /* PBM_USE_PQ */
 
 
 // block group + count vector methods used by bitmap scans
@@ -1331,10 +1333,12 @@ unsigned long get_time_ns(void) {
 	return NS_PER_SEC * (now.tv_sec - pbm->start_time_sec) + now.tv_nsec;
 }
 
+#if PBM_USE_PQ
 /* Current time slice for the PQ */
 unsigned long get_timeslice(void) {
 	return ns_to_timeslice(get_time_ns());
 }
+#endif /* PBM_USE_PQ */
 
 /* Create an empty bcvec */
 bgcnt_vec bcvec_init(void) {

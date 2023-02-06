@@ -54,12 +54,14 @@ static const long BlockGroupMapMaxSize = (1 << 12);
  */
 #define PBM_CLOCK CLOCK_MONOTONIC
 
+#if PBM_USE_PQ
 /* PQ configuration */
 #define PQ_NUM_NULL_BUCKETS 128
 static const int PQ_NumBucketGroups = 10;
 static const int PQ_NumBucketsPerGroup = 5;
 static const int PQ_NumBuckets = PQ_NumBucketGroups * PQ_NumBucketsPerGroup;
 static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
+#endif /* PBM_USE_PQ */
 
 /*
  * Whether tp use spinlocks or LWLocks for PBM PQ buckets.
@@ -388,10 +390,12 @@ extern struct BufferDesc * PQ_Evict(PbmPQ * pq, uint32 * but_state);
  *-------------------------------------------------------------------------
  */
 
+#if PBM_USE_PQ
 /* Convert a timestamp in ns to the corresponding timeslice in the PQ */
 static inline unsigned long ns_to_timeslice(unsigned long t) {
 	return t / PQ_TimeSlice;
 }
+#endif /* PBM_USE_PQ */
 
 
 /*
