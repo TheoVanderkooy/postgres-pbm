@@ -18,6 +18,7 @@
  *-------------------------------------------------------------------------
  */
 
+#if PBM_USE_PQ
 // math functions missing from <math.h>
 static inline unsigned int floor_llogb(unsigned long x);
 
@@ -26,7 +27,6 @@ static inline unsigned int floor_llogb(unsigned long x);
 static inline void my_dlist_prepend(dlist_head * list, dlist_head * other);
 
 
-#if PBM_USE_PQ
 // initialization functions
 static inline void init_pq_bucket(PbmPQBucket* b);
 
@@ -389,10 +389,8 @@ bool PQ_CheckEmpty(void) {
 	}
 	return true;
 }
-#endif /* PBM_USE_PQ */
 
 
-#if PBM_USE_PQ
 /*-------------------------------------------------------------------------
  * PBM PQ public API for making eviction decisions
  *-------------------------------------------------------------------------
@@ -713,6 +711,7 @@ void PBM_DEBUG_print_pbm_state(void) {
  *-------------------------------------------------------------------------
  */
 
+#if PBM_USE_PQ
 /* floor(log_2(x)) for long values x */
 unsigned int floor_llogb(unsigned long x) {
 	return 8 * sizeof(x) - 1 - __builtin_clzl(x);
@@ -744,7 +743,6 @@ void my_dlist_prepend(dlist_head * list, dlist_head * other) {
 	dlist_init(other);
 }
 
-#if PBM_USE_PQ
 /* Initialize a PQ bucket */
 void init_pq_bucket(PbmPQBucket* b) {
 #ifdef PBM_PQ_BUCKETS_USE_SPINLOCK
@@ -871,10 +869,8 @@ unsigned int PQ_time_to_bucket(const unsigned long ts) {
 		return bucket_num;
 	}
 }
-#endif /* PBM_USE_PQ */
 
 
-#if PBM_USE_PQ
 /*-------------------------------------------------------------------------
  * PBM PQ bucket locking methods
  *-------------------------------------------------------------------------
@@ -940,10 +936,8 @@ void pq_bucket_unlock_two(PbmPQBucket * b1, PbmPQBucket * b2) {
 	pq_bucket_unlock(b1);
 	pq_bucket_unlock(b2);
 }
-#endif /* PBM_USE_PQ */
 
 
-#if PBM_USE_PQ
 /*-------------------------------------------------------------------------
  * PBM PQ private helper functions
  *-------------------------------------------------------------------------
