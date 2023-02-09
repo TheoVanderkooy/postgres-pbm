@@ -27,8 +27,27 @@
 
 #if (PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE) || (PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_MULTI)
 #define PBM_USE_PQ true
+#define PBM_TRACK_STATS false
 #else
 #define PBM_USE_PQ false
+/* Support new features: tracking statistics for unrequested buffers to
+ * estimate next access. */
+#define PBM_TRACK_STATS true && defined(USE_PBM)
+#endif
+
+/*
+ * How to track stats for non-requested buffers:
+ *  0: track PBM_BUFFER_NUM_RECENT_ACCESSES recent access times for a buffer to
+ *     compute average inter-access time
+ * Potential future alternatives:
+ *  - Use exponentially-weighted average of recent inter-access times
+ *  - Track count over recent intervals
+ */
+#define PBM_BUFFER_STATS_MODE_NRECENT 0
+#define PBM_BUFFER_STATS_MODE PBM_BUFFER_STATS_MODE_NRECENT
+
+#if PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_NRECENT
+#define PBM_BUFFER_NUM_RECENT_ACCESS 4
 #endif
 
 #endif //POSTGRESQL_PBM_CONFIG_H

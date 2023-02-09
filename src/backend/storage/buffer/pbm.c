@@ -122,6 +122,15 @@ static inline void PQ_RefreshRequestedBuckets(void);
 #endif /* PBM_USE_PQ */
 
 
+#if PBM_TRACK_STATS
+// tracking recent access stats for buffers
+static inline void clear_buffer_stats(PbmBufferDescStats * stats);
+static inline void init_buffer_stats(PbmBufferDescStatsPadded * stats);
+static inline PbmBufferDescStats * get_buffer_stats(const BufferDesc * buf);
+static inline void update_buffer_recent_access(PbmBufferDescStats * stats, uint64 now);
+#endif /* PBM_TRACK_STATS */
+
+
 // debugging
 static void debug_buffer_access(BufferDesc* buf, char* msg);
 static void assert_scan_completely_unregistered(ScanHashEntry * scan);
@@ -193,6 +202,15 @@ void InitPBM(void) {
 	/* Initialize the priority queue */
 	pbm->BlockQueue = InitPbmPQ();
 #endif /* PBM_USE_PQ */
+
+#if PBM_TRACK_STATS
+	/* Initialize buffer stats */
+	pbm->buffer_stats = ShmemInitStruct("PBM buffer stats", NBuffers * sizeof(PbmBufferDescStatsPadded), &found);
+	Assert(!found);
+	for (int i = 0; i < NBuffers; ++i) {
+		init_buffer_stats(&pbm->buffer_stats[i]);
+	}
+#endif /* PBM_TRACK_STATS */
 }
 
 /*
@@ -374,7 +392,7 @@ void PBM_RegisterSeqScan(HeapScanDesc scan, struct ParallelContext *pctx) {
 
 
 	// debugging
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_REGISTER)
 	elog(INFO, "PBM_RegisterSeqScan(%lu): name=%s, nblocks=%d, num_blocks=%d, "
 			   "startblock=%u, parallel=%s, scan=%p, shared_stats=%p",
 		 id,
@@ -389,7 +407,7 @@ void PBM_RegisterSeqScan(HeapScanDesc scan, struct ParallelContext *pctx) {
 #ifdef TRACE_PBM_PRINT_SCANMAP
 	debug_log_scan_map();
 #endif // TRACE_PBM_PRINT_SCANMAP
-#endif // TRACE_PBM
+#endif // TRACE_PBM && TRACE_PBM_REGISTER
 }
 
 /*
@@ -410,12 +428,12 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 	scanData = scan->pbmSharedScanData->data;
 	is_parallel = (scan->rs_base.rs_parallel != NULL);
 
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_REGISTER)
 	elog(INFO, "PBM_UnregisterSeqScan(%lu) is_parallel=%s", id, (is_parallel ? "true" : "false"));
 #ifdef TRACE_PBM_PRINT_SCANMAP
 	debug_log_scan_map();
 #endif // TRACE_PBM_PRINT_SCANMAP
-#endif // TRACE_PBM
+#endif // TRACE_PBM && TRACE_PBM_REGISTER
 
 #if PBM_USE_PQ
 	// Shift PQ buckets if needed
@@ -441,7 +459,7 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 		BlockNumber nblocks = scanData.nblocks;
 		uint64 nalloced = scanData.pseq.nalloced;
 
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_REGISTER)
 		elog(INFO, "PBM_UnregisterSeqScan(%lu) nallocated=%lu, start=%u, nblocks=%u", id, nalloced, startBlock, nblocks);
 #endif
 
@@ -473,7 +491,7 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 	// Make sure we don't try to unregister again
 	scan->pbmSharedScanData = NULL;
 
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_REGISTER)
 	elog(INFO, "PBM_UnregisterSeqScan(%lu) finished", id);
 #endif
 }
@@ -558,7 +576,7 @@ void PBM_InitParallelSeqScan(struct HeapScanDescData * scan, BlockNumber pos) {
 	pwork->pbm_last_report_time = get_time_ns();
 	pwork->pbm_scanned_since_last_report = 0;
 
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_REGISTER)
 	elog(INFO, "PBM_InitParallelSeqScan! start_pos=%u, is_leader=%s, scan_shared=%p scanId=%ld"
 		 , pos, (!is_leader ? "false" : "true")
 		 , scan->pbmSharedScanData, scan->scanId
@@ -824,7 +842,7 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 		},
 	};
 
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_REGISTER)
 	elog(INFO, "PBM_RegisterBitmapScan(%lu): name=%s, nblocks=%d, "
 			   "vec={len=%d, [{grp=%u, cnt=%u}, ..., {grp=%u, cnt=%u}]}",
 		 id,
@@ -849,7 +867,7 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 #ifdef TRACE_PBM_PRINT_BLOCKGROUPMAP
 	debug_log_blockgroup_map();
 #endif // TRACE_PBM_PRINT_BLOCKGROUPMAP
-#endif /* TRACE_PBM */
+#endif /* TRACE_PBM && TRACE_PBM_REGISTER */
 }
 
 /*
@@ -1045,13 +1063,19 @@ void PbmNewBuffer(BufferDesc * const buf) {
 /*
  * Notify the PBM when we *remove* a buffer to keep data structure up to date.
  */
-void PbmOnEvictBuffer(struct BufferDesc *const buf) {
+void PbmOnEvictBuffer(BufferDesc *const buf) {
 #if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS) && defined(TRACE_PBM_BUFFERS_EVICT)
 	static int num_evicted = 0;
 	elog(WARNING, "evicting buffer %d tbl={spc=%u, db=%u, rel=%u, fork=%d} block#=%u, #evictions=%d",
 		 buf->buf_id, buf->tag.rnode.spcNode, buf->tag.rnode.dbNode, buf->tag.rnode.relNode,
 		 buf->tag.forkNum, buf->tag.blockNum, num_evicted++);
 #endif // TRACE_PBM && TRACE_PBM_BUFFERS && TRACE_PBM_BUFFERS_EVICT
+
+#if defined(TRACE_PBM) && defined(TRACE_PBM_ON_BUFFER_ACCESS)
+	if (buf->buf_id == 0) {
+		elog(WARNING, "PbmOnAccessBuffer(0) buffer evicted!");
+	}
+#endif
 
 	// Nothing to do if we aren't actually evicting anything
 	if (buf->tag.blockNum == InvalidBlockNumber) {
@@ -1070,11 +1094,52 @@ void PbmOnEvictBuffer(struct BufferDesc *const buf) {
 	Assert(buf->pbm_bgroup_prev == FREENEXT_NOT_IN_LIST);
 #endif /* PBM_USE_PQ */
 
+#if PBM_TRACK_STATS
+	clear_buffer_stats(get_buffer_stats(buf));
+#endif /* PBM_TRACK_STATS */
+
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
 	/* If we had cached the block group for this buffer, clear it */
 	buf->pbm_bg = NULL;
 #endif
 }
+
+
+#if PBM_TRACK_STATS
+/*
+ * Notify PBM when a buffer is accessed (regardless of whether it is new or not)
+ * to update any stats we need for it.
+ *
+ * Note: should only be called for shared buffers, not local ones.
+ */
+void PbmOnAccessBuffer(const BufferDesc *const buf) {
+	PbmBufferDescStats * stats = get_buffer_stats(buf);
+	uint64 now = get_time_ns();
+
+	update_buffer_recent_access(stats, now);
+
+#if defined(TRACE_PBM) && defined(TRACE_PBM_ON_BUFFER_ACCESS)
+	if (buf->buf_id == 0) {
+		uint64 times_copy[PBM_BUFFER_NUM_RECENT_ACCESS];
+
+		SpinLockAcquire(&stats->slock);
+		for (int i = 0; i < PBM_BUFFER_NUM_RECENT_ACCESS; ++i) {
+			times_copy[i] = stats->recent_accesses[i];
+		}
+		SpinLockRelease(&stats->slock);
+
+		elog(WARNING, "PbmOnAccessBuffer(0) stats: now=%lu [%lu, %lu, %lu, %lu]"
+			 	 ,now
+				 ,times_copy[0]
+				 ,times_copy[1]
+				 ,times_copy[2]
+				 ,times_copy[3]
+			 );
+	}
+#endif /* TRACE_PBM_ON_BUFFER_ACCESS */
+
+}
+#endif /* PBM_TRACK_STATS */
 
 
 /*-------------------------------------------------------------------------
@@ -2088,6 +2153,49 @@ void PQ_RefreshRequestedBuckets(void) {
 	}
 }
 #endif /* PBM_USE_PQ */
+
+
+#if PBM_TRACK_STATS
+void clear_buffer_stats(PbmBufferDescStats * stats) {
+	/* Use "AccessTimeNotRequested" for fewer than N recent accesses */
+	for(int i = 0; i < PBM_BUFFER_NUM_RECENT_ACCESS; ++i) {
+		stats->recent_accesses[i] = AccessTimeNotRequested;
+	}
+}
+
+void init_buffer_stats(PbmBufferDescStatsPadded * stats) {
+	SpinLockInit(&stats->stats.slock);
+	clear_buffer_stats(&stats->stats);
+}
+
+PbmBufferDescStats * get_buffer_stats(const BufferDesc *const buf) {
+	return &pbm->buffer_stats[buf->buf_id].stats;
+}
+
+void update_buffer_recent_access(PbmBufferDescStats * stats, uint64 now) {
+	static const uint64 upper_idx = PBM_BUFFER_NUM_RECENT_ACCESS - 1;
+	uint64 last;
+
+	SpinLockAcquire(&stats->slock);
+
+	/* Shift everything left by 1 */
+	for (int i = 0; i < upper_idx; ++i) {
+		stats->recent_accesses[i] = stats->recent_accesses[i+1];
+	}
+
+// ### actually, I don't think this matters...
+//	/* Ensure access time written is larger than previous */
+//	last = stats->recent_accesses[upper_idx];
+//	if (last >= now && last != AccessTimeNotRequested) {
+//		now = last + 1;
+//	}
+
+	/* Most recent access ist stored at the end */
+	stats->recent_accesses[upper_idx] = now;
+
+	SpinLockRelease(&stats->slock);
+}
+#endif /* PBM_TRACK_STATS */
 
 
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE

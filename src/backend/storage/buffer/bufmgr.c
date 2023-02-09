@@ -905,6 +905,9 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 								  LW_EXCLUSIVE);
 				else if (mode == RBM_ZERO_AND_CLEANUP_LOCK)
 					LockBufferForCleanup(BufferDescriptorGetBuffer(bufHdr));
+#if PBM_TRACK_STATS
+				PbmOnAccessBuffer(bufHdr);
+#endif /* PBM_TRACK_STATS */
 			}
 
 			return BufferDescriptorGetBuffer(bufHdr);
@@ -1078,8 +1081,13 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 #if defined(USE_PBM)
 	/* Notify the PBM about a new shared buffer */
-	if (!found && !isLocalBuf) {
-		PbmNewBuffer(bufHdr);
+	if (!isLocalBuf) {
+		if (!found) {
+			PbmNewBuffer(bufHdr);
+		}
+#if PBM_TRACK_STATS
+		PbmOnAccessBuffer(bufHdr);
+#endif /* PBM_TRACK_STATS */
 	}
 #endif
 

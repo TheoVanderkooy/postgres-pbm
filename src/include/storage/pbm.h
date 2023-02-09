@@ -67,6 +67,9 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *sc
 extern void PbmNewBuffer(struct BufferDesc * buf);
 extern void PbmOnEvictBuffer(struct BufferDesc * buf);
 
+#if PBM_TRACK_STATS
+extern void PbmOnAccessBuffer(const struct BufferDesc * buf);
+#endif /* PBM_TRACK_STATS */
 
 /* ===== EVICTION METHODS ===== */
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE
