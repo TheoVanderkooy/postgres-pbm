@@ -11,6 +11,8 @@
  *  1: first implementation with only 1 block at a time (might not work anymore!)
  *  2: method that puts still-valid blocks on the free list and lets the normal
  *     mechanism try multiple times to get from the free list
+ *  3: don't track a PQ of block groups, instead randomly sample buffers and
+ *     pick the best option from the sample
  */
 #define PBM_EVICT_MODE_CLOCK 0
 #define PBM_EVICT_MODE_PQ_SINGLE 1
