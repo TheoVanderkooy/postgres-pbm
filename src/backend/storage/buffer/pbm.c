@@ -2337,8 +2337,9 @@ BufferDesc* PBM_EvictPage(uint32 * buf_state) {
 		 * Need to check it is still not pinned. */
 		if (!requested) {
 			local_buf_state = LockBufHdr(buf);
-			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0) {
-				/* Not pinned - use it without more samples */
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
+					&& BUFFERTAGS_EQUAL(buf->tag, samples[n_selected].tag)) {
+				/* Not pinned AND tag didn't change - use it without more samples */
 				*buf_state = local_buf_state;
 				return buf;
 			}
