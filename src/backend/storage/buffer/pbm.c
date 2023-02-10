@@ -103,7 +103,7 @@ static inline void RemoveBufFromBlockGroup(BufferDesc * buf);
 // managing buffer priority
 static inline unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem * bg_scan);
 
-static unsigned long PageNextConsumption(BlockGroupData * bgdata, bool * requestedPtr);
+static unsigned long BlockGroupTimeToNextConsumption(BlockGroupData * bgdata, bool * requestedPtr);
 
 
 // removing scans from block groups
@@ -128,11 +128,14 @@ static inline void clear_buffer_stats(PbmBufferDescStats * stats);
 static inline void init_buffer_stats(PbmBufferDescStatsPadded * stats);
 static inline PbmBufferDescStats * get_buffer_stats(const BufferDesc * buf);
 static inline void update_buffer_recent_access(PbmBufferDescStats * stats, uint64 now);
+static inline uint64 est_inter_access_time(PbmBufferDescStats *stats, uint64 now, int *n_accesses);
 #endif /* PBM_TRACK_STATS */
 
 
 // debugging
+#if defined(TRACE_PBM)
 static void debug_buffer_access(BufferDesc* buf, char* msg);
+#endif
 static void assert_scan_completely_unregistered(ScanHashEntry * scan);
 
 #ifdef SANITY_PBM_BUFFERS
@@ -1128,12 +1131,12 @@ void PbmOnAccessBuffer(const BufferDesc *const buf) {
 		}
 		SpinLockRelease(&stats->slock);
 
-		elog(WARNING, "PbmOnAccessBuffer(0) stats: now=%lu [%lu, %lu, %lu, %lu]"
+		elog(WARNING, "PbmOnAccessBuffer(0) stats: now=%lu [%lu, %lu, ..., %lu, %lu]"
 			 	 ,now
 				 ,times_copy[0]
 				 ,times_copy[1]
-				 ,times_copy[2]
-				 ,times_copy[3]
+				 ,times_copy[PBM_BUFFER_NUM_RECENT_ACCESS-2]
+				 ,times_copy[PBM_BUFFER_NUM_RECENT_ACCESS-1]
 			 );
 	}
 #endif /* TRACE_PBM_ON_BUFFER_ACCESS */
@@ -1892,8 +1895,6 @@ unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem *const bg_s
 		uint32 nworkers = s_data->data.pseq.nworkers;
 		float worker_speed;
 
-		Assert(chunk_size > 0);
-
 		uint32 n_alloced_past = nalloced - blocks_behind;
 		uint32 n_chunks_passed = n_alloced_past / chunk_size;
 		uint32 chunk_start_behind = nalloced - chunk_size * (n_chunks_passed + 1);
@@ -1919,9 +1920,9 @@ unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem *const bg_s
 }
 
 /*
- * Estimate the next access time of a block group based on the tracked metadata.
+ * Estimate the time to next access of a block group based on the tracked metadata.
  */
-unsigned long PageNextConsumption(BlockGroupData *const bgdata, bool *requestedPtr) {
+unsigned long BlockGroupTimeToNextConsumption(BlockGroupData *const bgdata, bool *requestedPtr) {
 	unsigned long min_next_access = AccessTimeNotRequested;
 	slist_iter iter;
 
@@ -1959,7 +1960,7 @@ unsigned long PageNextConsumption(BlockGroupData *const bgdata, bool *requestedP
 		return AccessTimeNotRequested;
 	} else {
 		Assert(min_next_access != AccessTimeNotRequested);
-		return get_time_ns() + min_next_access;
+		return min_next_access;
 	}
 }
 
@@ -2174,7 +2175,6 @@ PbmBufferDescStats * get_buffer_stats(const BufferDesc *const buf) {
 
 void update_buffer_recent_access(PbmBufferDescStats * stats, uint64 now) {
 	static const uint64 upper_idx = PBM_BUFFER_NUM_RECENT_ACCESS - 1;
-	uint64 last;
 
 	SpinLockAcquire(&stats->slock);
 
@@ -2183,17 +2183,49 @@ void update_buffer_recent_access(PbmBufferDescStats * stats, uint64 now) {
 		stats->recent_accesses[i] = stats->recent_accesses[i+1];
 	}
 
-// ### actually, I don't think this matters...
-//	/* Ensure access time written is larger than previous */
-//	last = stats->recent_accesses[upper_idx];
-//	if (last >= now && last != AccessTimeNotRequested) {
-//		now = last + 1;
-//	}
-
 	/* Most recent access ist stored at the end */
 	stats->recent_accesses[upper_idx] = now;
 
 	SpinLockRelease(&stats->slock);
+}
+
+uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_accesses) {
+	uint64 min_access = 0;
+	int num_accesses = PBM_BUFFER_NUM_RECENT_ACCESS;
+
+	SpinLockAcquire(&stats->slock);
+	/* Find min access and count how many times are actually valid */
+	for (int i = 0; i < PBM_BUFFER_NUM_RECENT_ACCESS; ++i) {
+		if (stats->recent_accesses[i] == AccessTimeNotRequested) {
+			--num_accesses;
+		}
+		else {
+			min_access = stats->recent_accesses[i];
+			break;
+		}
+	}
+	SpinLockRelease(&stats->slock);
+
+	/* It is possible we have no recent accesses if the buffer was evicted but
+	 * new page hasn't been "accessed" yet (the method hasn't been called).
+	 * Make sure this is signaled to caller and we don't divide by 0. */
+	if (num_accesses <= 0) {
+		*n_accesses = 0;
+		return AccessTimeNotRequested;
+	}
+
+	/* If we wanted just the average inter-access times: it would be:
+	 * 		(max_access - min_access) / (num_accesses-1)
+	 * Using `now` as the upper bound and `num_accesses` with no -1 is
+	 * pretending we have an access right now. This has a few benefits:
+	 *  - free aging if we don't access a buffer
+	 *  - if we've only accessed it once, it reverts to just "time since last
+	 *    access" which is probably how we would handle that case anyways.
+	 *  - also weights actual inter-access time depending on how much data we
+	 *    have, valuing time-since-last-access more if we have less data.
+	 */
+	*n_accesses = num_accesses;
+	return (now - min_access) / num_accesses;
 }
 #endif /* PBM_TRACK_STATS */
 
@@ -2282,11 +2314,13 @@ static inline bool bg_check_buftag(BufferTag * tag, BlockGroupData * bgdata) {
 /*
  * Choose a buffer to evict using the sampling-based eviction strategy.
  *
+ * This will return a buffer with the header lock held.
+ *
  * If selection fails because the buffers all got pinned again or evicted by
  * someone else after we sorted, this will return NULL and the caller should
  * try a different strategy. (possibly try again, or pick randomly)
  */
-BufferDesc* PBM_EvictPage(uint32 * buf_state) {
+BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 	BufferDesc * buf;
 	uint32 local_buf_state;
 	BlockGroupData * bgdata;
@@ -2330,7 +2364,30 @@ BufferDesc* PBM_EvictPage(uint32 * buf_state) {
 		Assert(bg_check_buftag(&samples[n_selected].tag, bgdata));
 
 		/* Compute next access time */
-		next_access = PageNextConsumption(bgdata, &requested);
+#if PBM_TRACK_STATS
+		{ /* Scope to silence -Wdeclaration-after-statement... */
+			int naccesses;
+			uint64 bg_next_consumption = BlockGroupTimeToNextConsumption(bgdata, &requested);
+			uint64 now = get_time_ns();
+			uint64 buffer_est_inter_access = est_inter_access_time(get_buffer_stats(buf), now, &naccesses);
+			if (requested && naccesses > 1) {
+				/* Consider both registered estimate and inter-access estimate
+				 * if it is requested and more than one recent access */
+				next_access = now + Min(bg_next_consumption, buffer_est_inter_access);
+			} else if (requested) {
+				/* Ignore inter-access time if we only have one access so far */
+				next_access = now + bg_next_consumption;
+			} else if (naccesses > 0) {
+				/* If not requested, use the time-since-last-access.
+				 * Also lie about being requested to prevent it getting used
+				 * immediately in the next block.*/
+				next_access = now + buffer_est_inter_access;
+				requested = true;
+			}
+		}
+#else
+		next_access = get_time_ns() + BlockGroupTimeToNextConsumption(bgdata, &requested);
+#endif
 		samples[n_selected].next_access_time = next_access;
 
 		/* If it is "not requested", try to use it immediately.
@@ -2481,6 +2538,7 @@ void list_all_buffers(void) {
 }
 #endif // SANITY_PBM_BUFFERS
 
+#if defined(TRACE_PBM)
 void debug_buffer_access(BufferDesc* buf, char* msg) {
 	bool found, requested;
 	char* msg2;
@@ -2495,7 +2553,7 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 
 	BlockGroupData *const block_scans = search_block_group(&buf->tag, &found);
 	if (true == found) {
-		next_access_time = PageNextConsumption(block_scans, &requested);
+		next_access_time = BlockGroupTimeToNextConsumption(block_scans, &requested);
 	}
 
 	if (false == found) msg2 = "NOT TRACKED";
@@ -2514,6 +2572,7 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 		 next_access_time
 	);
 }
+#endif
 
 // Print debugging information for a single entry in the scans hash map.
 static

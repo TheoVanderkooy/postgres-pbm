@@ -1,6 +1,11 @@
 PBM in postgres
 ===============
 
+Potential implementation improvements
+-------------------------------------
+- Use dynamic shared memory (dsa.h) for the PBM data structures?
+- ...
+
 Known bugs
 ----------
 - For pbm_part1: it is technically possible for 2 workers to try to load the same buffer at the same time, both allocate *from the free list*, and one of them leaks the free list buffer when it sees someone else loaded the block it wanted. For clock or sampling, the invalid buffer will eventually get found again, but for PBM1 we won't have a reference to it and it is lost.
