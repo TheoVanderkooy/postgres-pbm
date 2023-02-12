@@ -236,6 +236,11 @@ Size PbmShmemSize(void) {
 #if PBM_USE_PQ
 	size = add_size(size, PbmPqShmemSize());
 #endif /* PBM_USE_PQ */
+
+#if PBM_TRACK_STATS
+	size = add_size(size, NBuffers * sizeof(PbmBufferDescStatsPadded));
+#endif /* PBM_TRACK_STATS */
+
 #ifdef TRACE_PBM
 	{
 		Size bytes = size % 1024;
