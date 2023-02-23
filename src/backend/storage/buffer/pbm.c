@@ -103,7 +103,7 @@ static inline void RemoveBufFromBlockGroup(BufferDesc * buf);
 // managing buffer priority
 static inline unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem * bg_scan);
 
-static unsigned long PageNextConsumption(BlockGroupData * bgdata, bool * requestedPtr);
+static unsigned long BlockGroupTimeToNextConsumption(BlockGroupData * bgdata, bool * requestedPtr);
 
 
 // removing scans from block groups
@@ -123,7 +123,9 @@ static inline void PQ_RefreshRequestedBuckets(void);
 
 
 // debugging
+#if defined(TRACE_PBM)
 static void debug_buffer_access(BufferDesc* buf, char* msg);
+#endif
 static void assert_scan_completely_unregistered(ScanHashEntry * scan);
 
 #ifdef SANITY_PBM_BUFFERS
@@ -374,7 +376,7 @@ void PBM_RegisterSeqScan(HeapScanDesc scan, struct ParallelContext *pctx) {
 
 
 	// debugging
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_REGISTER)
 	elog(INFO, "PBM_RegisterSeqScan(%lu): name=%s, nblocks=%d, num_blocks=%d, "
 			   "startblock=%u, parallel=%s, scan=%p, shared_stats=%p",
 		 id,
@@ -389,7 +391,7 @@ void PBM_RegisterSeqScan(HeapScanDesc scan, struct ParallelContext *pctx) {
 #ifdef TRACE_PBM_PRINT_SCANMAP
 	debug_log_scan_map();
 #endif // TRACE_PBM_PRINT_SCANMAP
-#endif // TRACE_PBM
+#endif // TRACE_PBM && TRACE_PBM_REGISTER
 }
 
 /*
@@ -410,12 +412,12 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 	scanData = scan->pbmSharedScanData->data;
 	is_parallel = (scan->rs_base.rs_parallel != NULL);
 
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_REGISTER)
 	elog(INFO, "PBM_UnregisterSeqScan(%lu) is_parallel=%s", id, (is_parallel ? "true" : "false"));
 #ifdef TRACE_PBM_PRINT_SCANMAP
 	debug_log_scan_map();
 #endif // TRACE_PBM_PRINT_SCANMAP
-#endif // TRACE_PBM
+#endif // TRACE_PBM && TRACE_PBM_REGISTER
 
 #if PBM_USE_PQ
 	// Shift PQ buckets if needed
@@ -473,7 +475,7 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 	// Make sure we don't try to unregister again
 	scan->pbmSharedScanData = NULL;
 
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_REGISTER)
 	elog(INFO, "PBM_UnregisterSeqScan(%lu) finished", id);
 #endif
 }
@@ -558,7 +560,7 @@ void PBM_InitParallelSeqScan(struct HeapScanDescData * scan, BlockNumber pos) {
 	pwork->pbm_last_report_time = get_time_ns();
 	pwork->pbm_scanned_since_last_report = 0;
 
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_REGISTER)
 	elog(INFO, "PBM_InitParallelSeqScan! start_pos=%u, is_leader=%s, scan_shared=%p scanId=%ld"
 		 , pos, (!is_leader ? "false" : "true")
 		 , scan->pbmSharedScanData, scan->scanId
@@ -824,7 +826,7 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 		},
 	};
 
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_REGISTER)
 	elog(INFO, "PBM_RegisterBitmapScan(%lu): name=%s, nblocks=%d, "
 			   "vec={len=%d, [{grp=%u, cnt=%u}, ..., {grp=%u, cnt=%u}]}",
 		 id,
@@ -849,7 +851,7 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 #ifdef TRACE_PBM_PRINT_BLOCKGROUPMAP
 	debug_log_blockgroup_map();
 #endif // TRACE_PBM_PRINT_BLOCKGROUPMAP
-#endif /* TRACE_PBM */
+#endif /* TRACE_PBM && TRACE_PBM_REGISTER */
 }
 
 /*
@@ -1854,9 +1856,9 @@ unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem *const bg_s
 }
 
 /*
- * Estimate the next access time of a block group based on the tracked metadata.
+ * Estimate the time to next access of a block group based on the tracked metadata.
  */
-unsigned long PageNextConsumption(BlockGroupData *const bgdata, bool *requestedPtr) {
+unsigned long BlockGroupTimeToNextConsumption(BlockGroupData *const bgdata, bool *requestedPtr) {
 	unsigned long min_next_access = AccessTimeNotRequested;
 	slist_iter iter;
 
@@ -1894,7 +1896,7 @@ unsigned long PageNextConsumption(BlockGroupData *const bgdata, bool *requestedP
 		return AccessTimeNotRequested;
 	} else {
 		Assert(min_next_access != AccessTimeNotRequested);
-		return get_time_ns() + min_next_access;
+		return min_next_access;
 	}
 }
 
@@ -2174,11 +2176,13 @@ static inline bool bg_check_buftag(BufferTag * tag, BlockGroupData * bgdata) {
 /*
  * Choose a buffer to evict using the sampling-based eviction strategy.
  *
+ * This will return a buffer with the header lock held.
+ *
  * If selection fails because the buffers all got pinned again or evicted by
  * someone else after we sorted, this will return NULL and the caller should
  * try a different strategy. (possibly try again, or pick randomly)
  */
-BufferDesc* PBM_EvictPage(uint32 * buf_state) {
+BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 	BufferDesc * buf;
 	uint32 local_buf_state;
 	BlockGroupData * bgdata;
@@ -2221,8 +2225,8 @@ BufferDesc* PBM_EvictPage(uint32 * buf_state) {
 		Assert(bgdata != NULL);
 		Assert(bg_check_buftag(&samples[n_selected].tag, bgdata));
 
-		/* Compute next access time */
-		next_access = PageNextConsumption(bgdata, &requested);
+		/* Compute time to next access */
+		next_access = BlockGroupTimeToNextConsumption(bgdata, &requested);
 		samples[n_selected].next_access_time = next_access;
 
 		/* If it is "not requested", try to use it immediately.
@@ -2373,6 +2377,7 @@ void list_all_buffers(void) {
 }
 #endif // SANITY_PBM_BUFFERS
 
+#if defined(TRACE_PBM)
 void debug_buffer_access(BufferDesc* buf, char* msg) {
 	bool found, requested;
 	char* msg2;
@@ -2387,7 +2392,7 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 
 	BlockGroupData *const block_scans = search_block_group(&buf->tag, &found);
 	if (true == found) {
-		next_access_time = PageNextConsumption(block_scans, &requested);
+		next_access_time = BlockGroupTimeToNextConsumption(block_scans, &requested);
 	}
 
 	if (false == found) msg2 = "NOT TRACKED";
@@ -2406,6 +2411,7 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 		 next_access_time
 	);
 }
+#endif
 
 // Print debugging information for a single entry in the scans hash map.
 static
