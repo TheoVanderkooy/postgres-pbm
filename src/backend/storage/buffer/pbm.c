@@ -34,6 +34,8 @@ PbmShared* pbm;
 
 /* Configuration variables */
 int pbm_evict_num_samples;
+static const unsigned long pbm_bg_atest_max_age_ns = NS_PER_MS * 100;
+/* TODO what estimate to use? make this configurable? */
 
 
 /*-------------------------------------------------------------------------
@@ -103,7 +105,7 @@ static inline void RemoveBufFromBlockGroup(BufferDesc * buf);
 // managing buffer priority
 static inline unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem * bg_scan);
 
-static unsigned long BlockGroupTimeToNextConsumption(BlockGroupData * bgdata, bool * requestedPtr);
+static unsigned long BlockGroupTimeToNextConsumption(BlockGroupData * bgdata, bool * requestedPtr, unsigned long now);
 
 
 // removing scans from block groups
@@ -217,7 +219,7 @@ Size PbmShmemSize(void) {
 #if PBM_USE_PQ
 	size = add_size(size, PbmPqShmemSize());
 #endif /* PBM_USE_PQ */
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) || true
 	{
 		Size bytes = size % 1024;
 		Size kb = (size / 1024) % 1024;
@@ -349,6 +351,9 @@ void PBM_RegisterSeqScan(HeapScanDesc scan, struct ParallelContext *pctx) {
 			bg_lock_scans(data, LW_EXCLUSIVE);
 			slist_push_head(&data->scans_list, &scan_entry->slist);
 			bg_unlock_scans(data);
+
+			/* Invalidated cached next-access-time */
+			data->est_computed_at = 0;
 
 #if PBM_USE_PQ
 			/* Refresh the block group in the PQ if applicable */
@@ -802,6 +807,9 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 		bg_lock_scans(data, LW_EXCLUSIVE);
 		slist_push_head(&data->scans_list, &scan_entry->slist);
 		bg_unlock_scans(data);
+
+		/* Invalidated cached next-access-time */
+		data->est_computed_at = 0;
 
 #if PBM_USE_PQ
 		/* Refresh the block group in the PQ if applicable */
@@ -1443,6 +1451,10 @@ void InitBlockGroupData(BlockGroupData * data) {
 	SpinLockInit(&data->buf_lock);
 #endif /* PBM_USE_PQ */
 #endif // PBM_BG_LOCK_MODE
+
+	/* Next access estimate starts invalid. */
+	data->est_computed_at = 0;
+	data->est_next_access = AccessTimeNotRequested;
 }
 
 /*
@@ -1858,14 +1870,28 @@ unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem *const bg_s
 /*
  * Estimate the time to next access of a block group based on the tracked metadata.
  */
-unsigned long BlockGroupTimeToNextConsumption(BlockGroupData *const bgdata, bool *requestedPtr) {
+unsigned long BlockGroupTimeToNextConsumption(BlockGroupData *const bgdata, bool *requestedPtr, unsigned long now) {
 	unsigned long min_next_access = AccessTimeNotRequested;
 	slist_iter iter;
+	unsigned long bg_est_computed_at;
+	unsigned long bg_est_next_access;
 
 	Assert(bgdata != NULL);
 
 	// Initially assume not requested
 	*requestedPtr = false;
+
+	/* If there is an estimate and it is recent enough, use it directly */
+	bg_est_computed_at = bgdata->est_computed_at;
+	bg_est_next_access = bgdata->est_next_access;
+	if (bg_est_computed_at != 0 &&
+			(bg_est_computed_at > now || now - bg_est_computed_at <= pbm_bg_atest_max_age_ns))
+	{
+		*requestedPtr = (bg_est_next_access != AccessTimeNotRequested);
+		/* Return value is *time to next access*, NOT *next access time* */
+		if (bg_est_next_access <= now) return 1;
+		else return bg_est_next_access - now;
+	}
 
 	// Lock the scan list before we start
 	bg_lock_scans(bgdata, LW_SHARED);
@@ -1888,16 +1914,18 @@ unsigned long BlockGroupTimeToNextConsumption(BlockGroupData *const bgdata, bool
 			*requestedPtr = true;
 		}
 	}
-
 	bg_unlock_scans(bgdata);
 
-	// return the soonest next access time if applicable
 	if (false == *requestedPtr) {
-		return AccessTimeNotRequested;
+		min_next_access = AccessTimeNotRequested;
+		bgdata->est_next_access = AccessTimeNotRequested;
 	} else {
-		Assert(min_next_access != AccessTimeNotRequested);
-		return min_next_access;
+		bgdata->est_next_access = now + min_next_access;
 	}
+
+	bg_est_computed_at = now;
+
+	return min_next_access;
 }
 
 /* Delete a specific scan from the list of the given block group */
@@ -1978,14 +2006,16 @@ void remove_seq_scan_from_block_range(pbm_bg_iterator * bg_it, const ScanId id, 
 		// Loop over block groups in the entry
 		for ( ; i < BLOCK_GROUP_SEG_SIZE && bgnum < hi; ++i, ++bgnum) {
 			BlockGroupData * block_group = &bs_entry->groups[i];
-#if PBM_USE_PQ
 			bool deleted = block_group_delete_scan(id, block_group);
+#if PBM_USE_PQ
 			if (deleted) {
 				RefreshBlockGroup(block_group);
 			}
-#else /* Not using the PQ: just delete */
-			block_group_delete_scan(id, block_group);
 #endif /* PBM_USE_PQ */
+			/* Scan was deleted - invalidate next access estimate */
+			if (deleted) {
+				block_group->est_computed_at = 0;
+			}
 		}
 
 		// start at first block group of the next entry
@@ -2016,9 +2046,7 @@ int remove_bitmap_scan_from_block_range(const ScanId id, struct PBM_LocalBitmapS
 	for (i = scan_state->vec_idx; bg_hi > v->items[i].block_group; ++i) {
 		const BlockNumber blk = v->items[i].block_group;
 		BlockGroupData * data;
-#if PBM_USE_PQ
 		bool deleted;
-#endif /* PBM_USE_PQ */
 
 		/* Don't go past the end of the list */
 		if (i >= v->len) {
@@ -2029,14 +2057,16 @@ int remove_bitmap_scan_from_block_range(const ScanId id, struct PBM_LocalBitmapS
 		data = bgit_advance_to(&bg_it, blk);
 
 		/* Delete scan from the group and refresh the group if applicable */
-#if PBM_USE_PQ
 		deleted = block_group_delete_scan(id, data);
+#if PBM_USE_PQ
 		if (deleted) {
 			RefreshBlockGroup(data);
 		}
-#else /* Not using the PQ: just delete */
-		block_group_delete_scan(id, data);
 #endif /* PBM_USE_PQ */
+		/* Scan was deleted - invalidate next access estimate */
+		if (deleted) {
+			data->est_computed_at = 0;
+		}
 	}
 
 	return i;
@@ -2188,6 +2218,7 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 	BlockGroupData * bgdata;
 	bool requested;
 	unsigned long next_access;
+	unsigned long now;
 
 	// array of samples
 	PBM_BufSample samples[PBM_EVICT_MAX_SAMPLES];
@@ -2226,7 +2257,10 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 		Assert(bg_check_buftag(&samples[n_selected].tag, bgdata));
 
 		/* Compute time to next access */
-		next_access = BlockGroupTimeToNextConsumption(bgdata, &requested);
+		/* NOTE: here "next_access" is "time to next access" NOT "next access time".
+		 * May need changes with pbm_part3. */
+		now = get_time_ns();
+		next_access = BlockGroupTimeToNextConsumption(bgdata, &requested, now);
 		samples[n_selected].next_access_time = next_access;
 
 		/* If it is "not requested", try to use it immediately.
