@@ -34,8 +34,8 @@ PbmShared* pbm;
 
 /* Configuration variables */
 int pbm_evict_num_samples;
-static const unsigned long pbm_bg_atest_max_age_ns = NS_PER_MS * 1000;
-/* TODO what estimate to use? make this configurable? */
+double pbm_bg_naest_max_age_s;
+unsigned long pbm_bg_naest_max_age_ns;
 
 
 /*-------------------------------------------------------------------------
@@ -1921,7 +1921,7 @@ unsigned long BlockGroupTimeToNextConsumption(BlockGroupData *const bgdata, bool
 		bgdata->est_next_access = now + min_next_access;
 	}
 
-	bgdata->est_invalid_at = now + pbm_bg_atest_max_age_ns;
+	bgdata->est_invalid_at = now + pbm_bg_naest_max_age_ns;
 
 	return min_next_access;
 }

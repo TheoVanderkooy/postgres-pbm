@@ -32,6 +32,7 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
+#include "storage/pbm.h"
 
 /*
  * DATESTYLE
@@ -932,4 +933,11 @@ show_role(void)
 
 	/* Otherwise we can just use the GUC string */
 	return role_string ? role_string : "none";
+}
+
+void
+assign_pbm_bg_naest_max_age(const double newval, void *extra)
+{
+	/* Convert seconds to nanoseconds */
+	pbm_bg_naest_max_age_ns = (unsigned long)(newval * 1000. * 1000. * 1000.);
 }
