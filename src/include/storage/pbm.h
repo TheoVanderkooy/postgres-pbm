@@ -58,7 +58,7 @@ extern void internal_PBM_ParallelWorker_ReportSeqScanPosition(struct HeapScanDes
 /* ===== BITMAP SCAN METHODS ===== */
 
 extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan);
-extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* msg/*(to be removed)*/);
+extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* msg/*### (to be removed)*/);
 extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *scan, BlockNumber pos);
 
 

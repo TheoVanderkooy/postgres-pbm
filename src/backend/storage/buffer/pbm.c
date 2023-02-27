@@ -34,7 +34,7 @@ PbmShared* pbm;
 
 /* Configuration variables */
 int pbm_evict_num_samples;
-static const unsigned long pbm_bg_atest_max_age_ns = NS_PER_MS * 100;
+static const unsigned long pbm_bg_atest_max_age_ns = NS_PER_MS * 1000;
 /* TODO what estimate to use? make this configurable? */
 
 
@@ -353,7 +353,7 @@ void PBM_RegisterSeqScan(HeapScanDesc scan, struct ParallelContext *pctx) {
 			bg_unlock_scans(data);
 
 			/* Invalidated cached next-access-time */
-			data->est_computed_at = 0;
+			data->est_invalid_at = 0;
 
 #if PBM_USE_PQ
 			/* Refresh the block group in the PQ if applicable */
@@ -809,7 +809,7 @@ extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan) {
 		bg_unlock_scans(data);
 
 		/* Invalidated cached next-access-time */
-		data->est_computed_at = 0;
+		data->est_invalid_at = 0;
 
 #if PBM_USE_PQ
 		/* Refresh the block group in the PQ if applicable */
@@ -1453,7 +1453,7 @@ void InitBlockGroupData(BlockGroupData * data) {
 #endif // PBM_BG_LOCK_MODE
 
 	/* Next access estimate starts invalid. */
-	data->est_computed_at = 0;
+	data->est_invalid_at = 0;
 	data->est_next_access = AccessTimeNotRequested;
 }
 
@@ -1873,7 +1873,7 @@ unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem *const bg_s
 unsigned long BlockGroupTimeToNextConsumption(BlockGroupData *const bgdata, bool *requestedPtr, unsigned long now) {
 	unsigned long min_next_access = AccessTimeNotRequested;
 	slist_iter iter;
-	unsigned long bg_est_computed_at;
+	unsigned long bg_est_invalid_at;
 	unsigned long bg_est_next_access;
 
 	Assert(bgdata != NULL);
@@ -1882,11 +1882,9 @@ unsigned long BlockGroupTimeToNextConsumption(BlockGroupData *const bgdata, bool
 	*requestedPtr = false;
 
 	/* If there is an estimate and it is recent enough, use it directly */
-	bg_est_computed_at = bgdata->est_computed_at;
+	bg_est_invalid_at = bgdata->est_invalid_at;
 	bg_est_next_access = bgdata->est_next_access;
-	if (bg_est_computed_at != 0 &&
-			(bg_est_computed_at > now || now - bg_est_computed_at <= pbm_bg_atest_max_age_ns))
-	{
+	if (now <= bg_est_invalid_at) {
 		*requestedPtr = (bg_est_next_access != AccessTimeNotRequested);
 		/* Return value is *time to next access*, NOT *next access time* */
 		if (bg_est_next_access <= now) return 1;
@@ -1923,7 +1921,7 @@ unsigned long BlockGroupTimeToNextConsumption(BlockGroupData *const bgdata, bool
 		bgdata->est_next_access = now + min_next_access;
 	}
 
-	bg_est_computed_at = now;
+	bgdata->est_invalid_at = now + pbm_bg_atest_max_age_ns;
 
 	return min_next_access;
 }
@@ -2014,7 +2012,7 @@ void remove_seq_scan_from_block_range(pbm_bg_iterator * bg_it, const ScanId id, 
 #endif /* PBM_USE_PQ */
 			/* Scan was deleted - invalidate next access estimate */
 			if (deleted) {
-				block_group->est_computed_at = 0;
+				block_group->est_invalid_at = 0;
 			}
 		}
 
@@ -2065,7 +2063,7 @@ int remove_bitmap_scan_from_block_range(const ScanId id, struct PBM_LocalBitmapS
 #endif /* PBM_USE_PQ */
 		/* Scan was deleted - invalidate next access estimate */
 		if (deleted) {
-			data->est_computed_at = 0;
+			data->est_invalid_at = 0;
 		}
 	}
 

@@ -245,7 +245,7 @@ typedef struct BlockGroupData {
 
 	// cache of estimated next access time
 	volatile _Atomic(unsigned long) est_next_access;
-	volatile _Atomic(unsigned long) est_computed_at;
+	volatile _Atomic(unsigned long) est_invalid_at;
 } BlockGroupData;
 
 /* BlockGroupHashKey defined in pbm.h */
