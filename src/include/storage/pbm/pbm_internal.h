@@ -23,8 +23,9 @@
 #define NS_PER_SEC 	(1000 * NS_PER_MS) 	// 10^9 ns per second
 
 static const unsigned long AccessTimeNotRequested = (unsigned long)(-1l);
+#if PBM_USE_PQ
 static const unsigned int PQ_BucketOutOfRange = (unsigned int)(-1);
-
+#endif
 
 /*-------------------------------------------------------------------------
  * PBM Configuration
@@ -64,7 +65,7 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 #endif /* PBM_USE_PQ */
 
 /*
- * Whether tp use spinlocks or LWLocks for PBM PQ buckets.
+ * Whether to use spinlocks or LWLocks for PBM PQ buckets.
  * Probably spinlocks are better, but with both implementations we can test it!
  */
 #define PBM_PQ_BUCKETS_USE_SPINLOCK
@@ -242,6 +243,10 @@ typedef struct BlockGroupData {
 	struct PbmPQBucket *volatile pq_bucket;
 	dlist_node blist;
 #endif /* PBM_USE_PQ */
+
+	// cache of estimated next access time
+	volatile _Atomic(unsigned long) est_next_access;
+	volatile _Atomic(unsigned long) est_invalid_at;
 } BlockGroupData;
 
 /* BlockGroupHashKey defined in pbm.h */

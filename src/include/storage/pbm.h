@@ -13,7 +13,9 @@
 
 /* ===== GLOBAL CONFIGURATION VARIABLES ===== */
 #define PBM_EVICT_MAX_SAMPLES 100
-int pbm_evict_num_samples;
+extern int pbm_evict_num_samples;
+extern double pbm_bg_naest_max_age_s;  /* not actually used except by GUC */
+extern unsigned long pbm_bg_naest_max_age_ns;
 
 
 /* ===== FORWARD DECLARATIONS (sorted) ===== */
@@ -58,7 +60,7 @@ extern void internal_PBM_ParallelWorker_ReportSeqScanPosition(struct HeapScanDes
 /* ===== BITMAP SCAN METHODS ===== */
 
 extern void PBM_RegisterBitmapScan(struct BitmapHeapScanState * scan);
-extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* msg/*(to be removed)*/);
+extern void PBM_UnregisterBitmapScan(struct BitmapHeapScanState * scan, char* msg/*### (to be removed)*/);
 extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *scan, BlockNumber pos);
 
 
