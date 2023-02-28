@@ -2224,6 +2224,8 @@ void update_buffer_recent_access(PbmBufferDescStats * stats, uint64 now) {
 
 uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_accesses) {
 	uint64 min_access = 0;
+	uint64 last_access = 0;
+	uint64 est_inter_access, t_since_last;
 	int num_accesses = PBM_BUFFER_NUM_RECENT_ACCESS;
 
 	SpinLockAcquire(&stats->slock);
@@ -2237,28 +2239,29 @@ uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_acc
 			break;
 		}
 	}
+	last_access = stats->recent_accesses[PBM_BUFFER_NUM_RECENT_ACCESS - 1];
 	SpinLockRelease(&stats->slock);
 
-	/* It is possible we have no recent accesses if the buffer was evicted but
-	 * new page hasn't been "accessed" yet (the method hasn't been called).
+	*n_accesses = num_accesses;
+
+	/* It is possible we haven't accessed the buffer enough to estimate the
+	 * average inter-access time yet.
 	 * Make sure this is signaled to caller and we don't divide by 0. */
-	if (num_accesses <= 0) {
-		*n_accesses = 0;
+	if (num_accesses <= 1) {
 		return AccessTimeNotRequested;
 	}
 
-	/* If we wanted just the average inter-access times: it would be:
-	 * 		(max_access - min_access) / (num_accesses-1)
-	 * Using `now` as the upper bound and `num_accesses` with no -1 is
-	 * pretending we have an access right now. This has a few benefits:
-	 *  - free aging if we don't access a buffer
-	 *  - if we've only accessed it once, it reverts to just "time since last
-	 *    access" which is probably how we would handle that case anyways.
-	 *  - also weights actual inter-access time depending on how much data we
-	 *    have, valuing time-since-last-access more if we have less data.
-	 */
-	*n_accesses = num_accesses;
-	return (now - min_access) / num_accesses;
+	/* Compute the average inter-access interval, and time since last access */
+	est_inter_access = (last_access - min_access) / (num_accesses - 1);
+	t_since_last = (now - last_access);
+
+	/* If we don't access the buffer for a while, apply a penalty as our estimates
+	 * may be out of date. */
+	if (t_since_last > est_inter_access) {
+		return (est_inter_access + t_since_last) / 2;
+	} else {
+		return est_inter_access;
+	}
 }
 #endif /* PBM_TRACK_STATS */
 
@@ -2358,7 +2361,7 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 	uint32 local_buf_state;
 	BlockGroupData * bgdata;
 	bool requested;
-	unsigned long next_access;
+	unsigned long next_access = 0;
 	unsigned long now;
 
 	// array of samples
@@ -2412,8 +2415,8 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 			} else if (requested) {
 				/* Ignore inter-access time if we only have one access so far */
 				next_access = bg_next_consumption;
-			} else if (naccesses > 0) {
-				/* If not requested, use the time-since-last-access.
+			} else if (naccesses > 1) {
+				/* If not requested, use the inter-access time.
 				 * Also lie about being requested to prevent it getting used
 				 * immediately in the next block.*/
 				next_access = buffer_est_inter_access;
