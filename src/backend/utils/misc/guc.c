@@ -3826,7 +3826,7 @@ static struct config_real ConfigureNamesReal[] =
 				.short_desc = gettext_noop("Maximum age (in seconds) of cached block-group next-access-time"),
 		},
 		.variable = &pbm_bg_naest_max_age_s,
-		.boot_val = 1.0, .min = 0.0, .max = 10000.0,
+		.boot_val = 10.0, .min = 0.0, .max = 10000.0,
 		.check_hook = NULL, .assign_hook = assign_pbm_bg_naest_max_age, .show_hook = NULL,
 	},
 

@@ -193,6 +193,11 @@ void InitPBM(void) {
 	hash_flags = HASH_ELEM | HASH_BLOBS;
 	pbm->BlockGroupMap = ShmemInitHash("PBM block group stats", 1024, BlockGroupMapMaxSize, &hash_info, hash_flags);
 
+#if defined(PBM_TRACK_EVICTION_TIME)
+	pbm->n_evictions = 0;
+	pbm->total_eviction_time = 0;
+#endif /* PBM_TRACK_EVICTION_TIME */
+
 #if PBM_USE_PQ
 	/* Initialize the priority queue */
 	pbm->BlockQueue = InitPbmPQ();
@@ -1745,8 +1750,9 @@ void RemoveBufFromBlockGroup(BufferDesc *const buf) {
 	 * ### remove debugging check eventually.
 	 */
 	if (buf->pbm_bgroup_next == FREENEXT_NOT_IN_LIST || buf->pbm_bgroup_prev == FREENEXT_NOT_IN_LIST) {
+#if defined(TRACE_PBM)
 		debug_buffer_access(buf, "remove_buf_from_block_group, buffer is not in a block group!");
-
+#endif
 		PBM_DEBUG_print_pbm_state();
 		PBM_DEBUG_sanity_check_buffers();
 	}
@@ -2085,7 +2091,8 @@ void RefreshBlockGroup(BlockGroupData *const data) {
 	// Check if this group should be in the PQ.
 	// If so, move it to the appropriate bucket. If not, remove it from its bucket if applicable.
 	if (has_buffers) {
-		t = PageNextConsumption(data, &requested);
+		uint64 now = get_time_ns();
+		t = now + BlockGroupTimeToNextConsumption(data, &requested, now);
 		PQ_RefreshBlockGroup(data, t, requested);
 	} else {
 		PQ_RemoveBlockGroup(data);
@@ -2119,6 +2126,23 @@ void PQ_RefreshRequestedBuckets(void) {
 }
 #endif /* PBM_USE_PQ */
 
+
+#if defined(PBM_TRACK_EVICTION_TIME)
+void PBM_DEBUG_eviction_timing(uint64 start) {
+	uint64 end = get_time_ns();
+	uint64 total_time = (pbm->total_eviction_time += (end - start));
+	uint64 total_evictions = pbm->n_evictions++;
+	if (total_evictions % 20000 == 0) {
+		elog(NOTICE, "Evictions so far: %lu,  average time (ns): %f",
+			 total_evictions, (double) (total_time) / total_evictions
+		);
+	}
+}
+
+uint64 PBM_DEBUG_CUR_TIME_ns() {
+	return get_time_ns();
+}
+#endif /* PBM_TRACK_EVICTION_TIME */
 
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE
 BufferDesc* PBM_EvictPage(uint32 * buf_state) {

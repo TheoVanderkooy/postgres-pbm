@@ -46,7 +46,7 @@
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
-#ifdef USE_PBM
+#if defined(USE_PBM) || defined(PBM_TRACK_EVICTION_TIME)
 #include "storage/pbm.h"
 #endif
 #include "storage/proc.h"
@@ -1130,6 +1130,9 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	BufferDesc *buf;
 	bool		valid;
 	uint32		buf_state;
+#if defined(PBM_TRACK_EVICTION_TIME)
+	uint64 t_start;
+#endif /* PBM_TRACK_EVICTION_TIME */
 
 	/* create a tag so we can lookup the buffer */
 	INIT_BUFFERTAG(newTag, smgr->smgr_rnode.node, forkNum, blockNum);
@@ -1198,7 +1201,13 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		 * Select a victim buffer.  The buffer is returned with its header
 		 * spinlock still held!
 		 */
+#if defined(PBM_TRACK_EVICTION_TIME)
+		 t_start = PBM_DEBUG_CUR_TIME_ns();
+#endif /* PBM_TRACK_EVICTION_TIME */
 		buf = StrategyGetBuffer(strategy, &buf_state);
+#if defined(PBM_TRACK_EVICTION_TIME)
+		PBM_DEBUG_eviction_timing(t_start);
+#endif /* PBM_TRACK_EVICTION_TIME */
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_CLOCK
 		Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
 #endif

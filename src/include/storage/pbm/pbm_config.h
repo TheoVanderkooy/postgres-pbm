@@ -19,6 +19,7 @@
 #define PBM_EVICT_MODE_PQ_MULTI 2
 #define PBM_EVICT_MODE_SAMPLING 3
 #ifdef USE_PBM
+//#define PBM_EVICT_MODE PBM_EVICT_MODE_CLOCK
 //#define PBM_EVICT_MODE PBM_EVICT_MODE_PQ_MULTI
 #define PBM_EVICT_MODE PBM_EVICT_MODE_SAMPLING
 #else
@@ -30,5 +31,8 @@
 #else
 #define PBM_USE_PQ false
 #endif
+
+/* Track average eviction time and periodically log it. */
+//#define PBM_TRACK_EVICTION_TIME
 
 #endif //POSTGRESQL_PBM_CONFIG_H

@@ -93,5 +93,9 @@ extern struct BufferDesc* PBM_EvictPage(uint32 * buf_state);
 extern void PBM_DEBUG_sanity_check_buffers(void);
 extern void PBM_DEBUG_print_pbm_state(void);
 
+#if defined(PBM_TRACK_EVICTION_TIME)
+extern uint64 PBM_DEBUG_CUR_TIME_ns();
+extern void PBM_DEBUG_eviction_timing(uint64 start);
+#endif /* PBM_TRACK_EVICTION_TIME */
 
 #endif //POSTGRESQL_PBM_H
