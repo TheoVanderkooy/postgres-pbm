@@ -371,7 +371,11 @@ typedef struct PbmShared {
 	/// Map[ (table, BlockGroupSegment) -> set of scans ] + free-list of the list-nodes for tracking statistics on each buffer
 	struct HTAB * BlockGroupMap;
 
-
+	/* Debugging: track time required for eviction */
+#if defined(PBM_TRACK_EVICTION_TIME)
+	_Atomic(uint64) n_evictions;
+	_Atomic(uint64) total_eviction_time;
+#endif /* PBM_TRACK_EVICTION_TIME */
 #if PBM_USE_PQ
 	/* Protected by PbmPqBucketsLock and PbmEvictionLock */
 
