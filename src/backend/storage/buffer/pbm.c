@@ -124,6 +124,12 @@ static inline void PQ_RefreshRequestedBuckets(void);
 #endif /* PBM_USE_PQ */
 
 
+// tracking recent access stats for buffers
+static inline void clear_buffer_stats(PbmBufferDescStats * stats);
+static inline void init_buffer_stats(PbmBufferDescStatsPadded * stats);
+static inline PbmBufferDescStats * get_buffer_stats(const BufferDesc * buf);
+
+
 // debugging
 #if defined(TRACE_PBM)
 static void debug_buffer_access(BufferDesc* buf, char* msg);
@@ -202,6 +208,13 @@ void InitPBM(void) {
 	/* Initialize the priority queue */
 	pbm->BlockQueue = InitPbmPQ();
 #endif /* PBM_USE_PQ */
+
+	/* Initialize buffer stats */
+	pbm->buffer_stats = ShmemInitStruct("PBM buffer stats", NBuffers * sizeof(PbmBufferDescStatsPadded), &found);
+	Assert(!found);
+	for (int i = 0; i < NBuffers; ++i) {
+		init_buffer_stats(&pbm->buffer_stats[i]);
+	}
 }
 
 /*
@@ -224,6 +237,9 @@ Size PbmShmemSize(void) {
 #if PBM_USE_PQ
 	size = add_size(size, PbmPqShmemSize());
 #endif /* PBM_USE_PQ */
+
+	size = add_size(size, NBuffers * sizeof(PbmBufferDescStatsPadded));
+
 #if defined(TRACE_PBM) || true
 	{
 		Size bytes = size % 1024;
@@ -453,7 +469,7 @@ void PBM_UnregisterSeqScan(HeapScanDescData *scan) {
 		BlockNumber nblocks = scanData.nblocks;
 		uint64 nalloced = scanData.pseq.nalloced;
 
-#ifdef TRACE_PBM
+#if defined(TRACE_PBM) && defined(TRACE_PBM_REGISTER)
 		elog(INFO, "PBM_UnregisterSeqScan(%lu) nallocated=%lu, start=%u, nblocks=%u", id, nalloced, startBlock, nblocks);
 #endif
 
@@ -1060,7 +1076,7 @@ void PbmNewBuffer(BufferDesc * const buf) {
 /*
  * Notify the PBM when we *remove* a buffer to keep data structure up to date.
  */
-void PbmOnEvictBuffer(struct BufferDesc *const buf) {
+void PbmOnEvictBuffer(BufferDesc *const buf) {
 #if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS) && defined(TRACE_PBM_BUFFERS_EVICT)
 	static int num_evicted = 0;
 	elog(WARNING, "evicting buffer %d tbl={spc=%u, db=%u, rel=%u, fork=%d} block#=%u, #evictions=%d",
@@ -1847,8 +1863,6 @@ unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem *const bg_s
 		uint32 nworkers = s_data->data.pseq.nworkers;
 		float worker_speed;
 
-		Assert(chunk_size > 0);
-
 		uint32 n_alloced_past = nalloced - blocks_behind;
 		uint32 n_chunks_passed = n_alloced_past / chunk_size;
 		uint32 chunk_start_behind = nalloced - chunk_size * (n_chunks_passed + 1);
@@ -2143,6 +2157,26 @@ uint64 PBM_DEBUG_CUR_TIME_ns() {
 	return get_time_ns();
 }
 #endif /* PBM_TRACK_EVICTION_TIME */
+
+void clear_buffer_stats(PbmBufferDescStats * stats) {
+#if PBM_TRACK_STATS
+	/* Use "AccessTimeNotRequested" for fewer than N recent accesses */
+	for(int i = 0; i < PBM_BUFFER_NUM_RECENT_ACCESS; ++i) {
+		stats->recent_accesses[i] = AccessTimeNotRequested;
+	}
+#endif /* PBM_TRACK_STATS */
+}
+
+void init_buffer_stats(PbmBufferDescStatsPadded * stats) {
+#if PBM_TRACK_STATS
+	SpinLockInit(&stats->stats.slock);
+	clear_buffer_stats(&stats->stats);
+#endif /* PBM_TRACK_STATS */
+}
+
+PbmBufferDescStats * get_buffer_stats(const BufferDesc *const buf) {
+	return &pbm->buffer_stats[buf->buf_id].stats;
+}
 
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE
 BufferDesc* PBM_EvictPage(uint32 * buf_state) {

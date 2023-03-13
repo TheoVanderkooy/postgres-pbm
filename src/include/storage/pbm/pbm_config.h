@@ -28,8 +28,10 @@
 
 #if (PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE) || (PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_MULTI)
 #define PBM_USE_PQ true
+#define PBM_TRACK_STATS false
 #else
 #define PBM_USE_PQ false
+#define PBM_TRACK_STATS false
 #endif
 
 /* Track average eviction time and periodically log it. */

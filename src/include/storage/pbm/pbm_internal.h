@@ -100,6 +100,7 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 //#define TRACE_PBM_BUFFERS_NEW
 //#define TRACE_PBM_BUFFERS_EVICT
 //#define TRACE_PBM_PQ_REFRESH
+//#define TRACE_PBM_ON_BUFFER_ACCESS
 
 //#define SANITY_PBM_BUFFERS /* Note: this one is only valid with no concurrency! */
 //#define SANITY_PBM_BLOCK_GROUPS
@@ -318,6 +319,25 @@ typedef struct PbmPQ {
 #endif
 
 /*
+ * Separate descriptor for PBM-related buffer fields.
+ * (mainly here because I don't want to make the actual buffer descriptor >64B)
+ */
+typedef struct PbmBufferDescStats {
+#if PBM_TRACK_STATS
+	slock_t slock;		/* lock for thse fields */
+
+#if PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_NRECENT
+	uint64 recent_accesses[PBM_BUFFER_NUM_RECENT_ACCESS];
+#endif
+#endif /* PBM_TRACK_STATS */
+} PbmBufferDescStats;
+
+typedef union PbmBufferDescStatsPadded {
+	PbmBufferDescStats stats;
+	char padding[64];
+} PbmBufferDescStatsPadded;
+
+/*
  * Main PBM data structure
  */
 typedef struct PbmShared {
@@ -325,6 +345,9 @@ typedef struct PbmShared {
 
 	/// Record initialization time as offset
 	time_t start_time_sec;
+
+	/// Extra buffer header fields...
+	PbmBufferDescStatsPadded * buffer_stats;
 
 	/* These fields have their own lock here */
 
