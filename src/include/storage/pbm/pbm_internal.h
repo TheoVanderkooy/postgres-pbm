@@ -318,24 +318,24 @@ typedef struct PbmPQ {
 } PbmPQ;
 #endif
 
-#if PBM_TRACK_STATS
 /*
  * Separate descriptor for PBM-related buffer fields.
- * (mainly here because I don't want to make the actual buffer descript >64B
+ * (mainly here because I don't want to make the actual buffer descriptor >64B)
  */
 typedef struct PbmBufferDescStats {
+#if PBM_TRACK_STATS
 	slock_t slock;		/* lock for thse fields */
 
 #if PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_NRECENT
 	uint64 recent_accesses[PBM_BUFFER_NUM_RECENT_ACCESS];
 #endif
+#endif /* PBM_TRACK_STATS */
 } PbmBufferDescStats;
 
 typedef union PbmBufferDescStatsPadded {
 	PbmBufferDescStats stats;
 	char padding[64];
 } PbmBufferDescStatsPadded;
-#endif /* PBM_TRACK_STATS */
 
 /*
  * Main PBM data structure
@@ -346,9 +346,8 @@ typedef struct PbmShared {
 	/// Record initialization time as offset
 	time_t start_time_sec;
 
-#if PBM_TRACK_STATS
+	/// Extra buffer header fields...
 	PbmBufferDescStatsPadded * buffer_stats;
-#endif /* PBM_TRACK_STATS */
 
 	/* These fields have their own lock here */
 

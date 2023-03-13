@@ -31,8 +31,6 @@
 #define PBM_TRACK_STATS false
 #else
 #define PBM_USE_PQ false
-/* Support new features: tracking statistics for unrequested buffers to
- * estimate next access. */
 #define PBM_TRACK_STATS true && defined(USE_PBM)
 #endif
 

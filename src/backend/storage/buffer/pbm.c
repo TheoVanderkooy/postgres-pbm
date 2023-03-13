@@ -124,11 +124,11 @@ static inline void PQ_RefreshRequestedBuckets(void);
 #endif /* PBM_USE_PQ */
 
 
-#if PBM_TRACK_STATS
 // tracking recent access stats for buffers
 static inline void clear_buffer_stats(PbmBufferDescStats * stats);
 static inline void init_buffer_stats(PbmBufferDescStatsPadded * stats);
 static inline PbmBufferDescStats * get_buffer_stats(const BufferDesc * buf);
+#if PBM_TRACK_STATS
 static inline void update_buffer_recent_access(PbmBufferDescStats * stats, uint64 now);
 static inline uint64 est_inter_access_time(PbmBufferDescStats *stats, uint64 now, int *n_accesses);
 #endif /* PBM_TRACK_STATS */
@@ -213,14 +213,12 @@ void InitPBM(void) {
 	pbm->BlockQueue = InitPbmPQ();
 #endif /* PBM_USE_PQ */
 
-#if PBM_TRACK_STATS
 	/* Initialize buffer stats */
 	pbm->buffer_stats = ShmemInitStruct("PBM buffer stats", NBuffers * sizeof(PbmBufferDescStatsPadded), &found);
 	Assert(!found);
 	for (int i = 0; i < NBuffers; ++i) {
 		init_buffer_stats(&pbm->buffer_stats[i]);
 	}
-#endif /* PBM_TRACK_STATS */
 }
 
 /*
@@ -244,9 +242,7 @@ Size PbmShmemSize(void) {
 	size = add_size(size, PbmPqShmemSize());
 #endif /* PBM_USE_PQ */
 
-#if PBM_TRACK_STATS
 	size = add_size(size, NBuffers * sizeof(PbmBufferDescStatsPadded));
-#endif /* PBM_TRACK_STATS */
 
 #if defined(TRACE_PBM) || true
 	{
@@ -2214,7 +2210,6 @@ uint64 PBM_DEBUG_CUR_TIME_ns() {
 #endif /* PBM_TRACK_EVICTION_TIME */
 
 
-#if PBM_TRACK_STATS
 void clear_buffer_stats(PbmBufferDescStats * stats) {
 	/* Use "AccessTimeNotRequested" for fewer than N recent accesses */
 	for(int i = 0; i < PBM_BUFFER_NUM_RECENT_ACCESS; ++i) {
@@ -2231,6 +2226,7 @@ PbmBufferDescStats * get_buffer_stats(const BufferDesc *const buf) {
 	return &pbm->buffer_stats[buf->buf_id].stats;
 }
 
+#if PBM_TRACK_STATS
 void update_buffer_recent_access(PbmBufferDescStats * stats, uint64 now) {
 	static const uint64 upper_idx = PBM_BUFFER_NUM_RECENT_ACCESS - 1;
 
