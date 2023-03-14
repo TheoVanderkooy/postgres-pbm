@@ -193,8 +193,6 @@ typedef struct BufferDesc
 	/* track buffers in the same group in the PBM */
 	int pbm_bgroup_next;				/* PBM next buffer which is loaded in a block */
 	int pbm_bgroup_prev;				/* PBM previous buffer in the chain for a given block */
-#elif PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
-	struct BlockGroupData * pbm_bg;
 #endif
 
 	/* state of the tag, containing flags, refcount and usagecount */
