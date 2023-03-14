@@ -2273,6 +2273,49 @@ static inline bool bg_check_buftag(BufferTag * tag, BlockGroupData * bgdata) {
 }
 
 /*
+ * Evict all buffers in the given block group, except the one we've currently
+ * chosen for replacement.
+ */
+static void evict_rest_of_block_group(BlockGroupData *const bgdata, const BufferDesc *const buf_orig) {
+	int buf_id;
+	BufferDesc * buf;
+	uint32 buf_state;
+
+	bg_lock_buffers(bgdata, LW_SHARED);
+
+	/*
+	 * Add all non-pinned buffers in the block group to the free list
+	 * (except the one we're currently evicting)
+	 */
+	buf_id = bgdata->buffers_head;
+	while (buf_id >= 0) {
+		buf = GetBufferDescriptor(buf_id);
+
+		if (buf != buf_orig) {
+			buf_state = pg_atomic_read_u32(&buf->state);
+
+			/*
+			 * Free the buffer if it isn't pinned.
+			 *
+			 * We do not invalidate the buffer, just add to the free list.
+			 * It can still be used and will be skipped if it gets pinned
+			 * before it is removed from the free list.
+			 *
+			 * Note: we do NOT need to lock the buffer header to add it
+			 */
+			if (BUF_STATE_GET_REFCOUNT(buf_state) == 0) {
+				StrategyFreeBuffer(buf);
+			}
+		}
+
+		/* Next buffer in the group */
+		buf_id = buf->pbm_bgroup_next;
+	}
+
+	bg_unlock_buffers(bgdata);
+}
+
+/*
  * Choose a buffer to evict using the sampling-based eviction strategy.
  *
  * This will return a buffer with the header lock held.
@@ -2341,6 +2384,7 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 					&& BUFFERTAGS_EQUAL(buf->tag, samples[n_selected].tag)) {
 				/* Not pinned AND tag didn't change - use it without more samples */
+				evict_rest_of_block_group(bgdata, buf);
 				*buf_state = local_buf_state;
 				return buf;
 			}
@@ -2367,6 +2411,7 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 				&& BUFFERTAGS_EQUAL(buf->tag, samples[0].tag)) {
 			/* Not pinned AND tag didn't change - evict this one */
+			evict_rest_of_block_group(get_buffer_stats(buf)->pbm_bg, buf);
 			*buf_state = local_buf_state;
 			return buf;
 		}
