@@ -323,6 +323,10 @@ typedef struct PbmPQ {
  * (mainly here because I don't want to make the actual buffer descriptor >64B)
  */
 typedef struct PbmBufferDescStats {
+	/* Block group in the PBM if applicable (protected by buffer header lock) */
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+	struct BlockGroupData * pbm_bg;
+#endif
 #if PBM_TRACK_STATS
 	slock_t slock;		/* lock for thse fields */
 

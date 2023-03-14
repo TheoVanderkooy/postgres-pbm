@@ -1002,7 +1002,8 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *co
  * Notify the PBM about a new buffer so it can be added to the priority queue
  */
 void PbmNewBuffer(BufferDesc * const buf) {
-	BlockGroupData* group;
+	BlockGroupData * group;
+	PbmBufferDescStats * buf_stats = get_buffer_stats(buf);
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS) && defined(TRACE_PBM_BUFFERS_NEW)
 	elog(WARNING, "PbmNewBuffer added new buffer:" //"\n"
@@ -1065,11 +1066,11 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	group = search_or_create_block_group(buf);
 
 	/* Sanity checks: should not already have a group, and we should find the group. */
-	Assert(buf->pbm_bg == NULL);
+	Assert(buf_stats->pbm_bg == NULL);
 	Assert(group != NULL);
 
 	/* Set the block group for the buffer */
-	buf->pbm_bg = group;
+	buf_stats->pbm_bg = group;
 #endif /* PBM_EVICT_MODE_SAMPLING */
 }
 
@@ -1103,7 +1104,7 @@ void PbmOnEvictBuffer(BufferDesc *const buf) {
 
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
 	/* If we had cached the block group for this buffer, clear it */
-	buf->pbm_bg = NULL;
+	get_buffer_stats(buf)->pbm_bg = NULL;
 #endif
 }
 
@@ -2168,6 +2169,9 @@ void clear_buffer_stats(PbmBufferDescStats * stats) {
 }
 
 void init_buffer_stats(PbmBufferDescStatsPadded * stats) {
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+	stats->stats.pbm_bg = NULL;
+#endif /* PBM_EVICT_MODE_SAMPLING */
 #if PBM_TRACK_STATS
 	SpinLockInit(&stats->stats.slock);
 	clear_buffer_stats(&stats->stats);
@@ -2270,6 +2274,7 @@ static inline bool bg_check_buftag(BufferTag * tag, BlockGroupData * bgdata) {
  */
 BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 	BufferDesc * buf;
+	PbmBufferDescStats * buf_stats;
 	uint32 local_buf_state;
 	BlockGroupData * bgdata;
 	bool requested;
@@ -2284,6 +2289,7 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 	while (n_selected < pbm_evict_num_samples) {
 		/* Pick a random buffer */
 		buf = GetBufferDescriptor(random() % NBuffers);
+		buf_stats = get_buffer_stats(buf);
 		samples[n_selected].buf = buf;
 
 		/* If the buffer is pinned, skip it and pick another */
@@ -2294,7 +2300,7 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 		}
 
 		/* If no cached block group, buffer is not valid so just use it. */
-		if (buf->pbm_bg == NULL) {
+		if (buf_stats->pbm_bg == NULL) {
 			Assert(!(local_buf_state & BM_VALID));
 			Assert(!(local_buf_state & BM_TAG_VALID));
 			Assert(buf->tag.blockNum == InvalidBlockNumber);
@@ -2305,7 +2311,7 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 
 		/* Copy the tag and cached block group atomically before unlocking */
 		samples[n_selected].tag = buf->tag;
-		bgdata = buf->pbm_bg;
+		bgdata = buf_stats->pbm_bg;
 		UnlockBufHdr(buf, local_buf_state);
 
 		/* Sanity checks */
