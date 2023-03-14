@@ -700,9 +700,9 @@ void PBM_DEBUG_print_pbm_state(void) {
 
 	debug_log_scan_map();
 	debug_log_blockgroup_map();
-#if PBM_USE_PQ
+#if PBM_TRACK_BLOCKGROUP_BUFFERS
 	debug_log_find_blockgroup_buffers();
-#endif /* PBM_USE_PQ */
+#endif /* PBM_TRACK_BLOCKGROUP_BUFFERS */
 }
 
 
