@@ -34,6 +34,7 @@ PbmShared* pbm;
 
 /* Configuration variables */
 int pbm_evict_num_samples;
+int pbm_evict_num_victims;
 double pbm_bg_naest_max_age_s;
 unsigned long pbm_bg_naest_max_age_ns;
 
@@ -2329,13 +2330,14 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 	PbmBufferDescStats * buf_stats;
 	uint32 local_buf_state;
 	BlockGroupData * bgdata;
-	bool requested;
+	bool requested, last_eviction;
 	unsigned long next_access;
 	unsigned long now;
 
+	int n_selected = 0;
+	int n_evicted = 0;
 	// array of samples
 	PBM_BufSample samples[PBM_EVICT_MAX_SAMPLES];
-	int n_selected = 0;
 
 	// find the configured number of samples
 	while (n_selected < pbm_evict_num_samples) {
@@ -2400,6 +2402,7 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 	/* Heapify our samples */
 	bh_heapify(samples, n_selected);
 
+	/* Select victim to evict */
 	while (n_selected > 0) {
 		buf = samples[0].buf;
 
@@ -2411,9 +2414,32 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 				&& BUFFERTAGS_EQUAL(buf->tag, samples[0].tag)) {
 			/* Not pinned AND tag didn't change - evict this one */
+#ifndef PBM_SAMPLING_EVICT_MULTI
 			evict_rest_of_block_group(get_buffer_stats(buf)->pbm_bg, buf);
 			*buf_state = local_buf_state;
 			return buf;
+#else
+			++n_evicted;
+
+			last_eviction = (n_evicted >= pbm_evict_num_victims);
+
+			/* If in the free list: don't do anything
+			 * Otherwise: evict the whole block group, but if this is the last
+			 *     eviction, don't add current item to free list
+			 */
+			if (buf->freeNext == FREENEXT_NOT_IN_LIST) {
+				evict_rest_of_block_group(get_buffer_stats(buf)->pbm_bg,
+										  last_eviction ? buf : NULL);
+			}
+
+			/* Return the current victim after enough evictions, or if we've
+			 * exhausted the whole sample
+			 */
+			if (last_eviction || n_selected <= 1) {
+				*buf_state = local_buf_state;
+				return buf;
+			}
+#endif
 		}
 
 		/* Someone stole it - remove from the heap and pick a different one */

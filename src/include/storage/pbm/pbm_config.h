@@ -37,6 +37,9 @@
 /* PQ and sampling need to know the set of buffers in each group */
 #define PBM_TRACK_BLOCKGROUP_BUFFERS (PBM_USE_PQ || (PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING))
 
+/* Whether to evict multiple at once with sampling-based PBM */
+#define PBM_SAMPLING_EVICT_MULTI
+
 /* Track average eviction time and periodically log it. */
 //#define PBM_TRACK_EVICTION_TIME
 
