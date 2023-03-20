@@ -3551,6 +3551,17 @@ static struct config_int ConfigureNamesInt[] =
 		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
 	},
 
+	{
+		.gen = {
+			.name = "pbm_evict_num_victims", .context = PGC_SUSET, .group = RESOURCES_MEM,
+			.short_desc = gettext_noop("Sets the size of group evictions for the PBM buffer eviction."),
+			.long_desc = gettext_noop("This should be < pbm_evict_num_samples, but that isn't checked"),
+		},
+		.variable = &pbm_evict_num_victims,
+		.boot_val = 1, .min = 1, .max = PBM_EVICT_MAX_SAMPLES,
+		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL
@@ -3822,8 +3833,8 @@ static struct config_real ConfigureNamesReal[] =
 
 	{
 		.gen = {
-				.name = "pbm_bg_naest_max_age", .context = PGC_SUSET, .group = RESOURCES_MEM,
-				.short_desc = gettext_noop("Maximum age (in seconds) of cached block-group next-access-time"),
+			.name = "pbm_bg_naest_max_age", .context = PGC_SUSET, .group = RESOURCES_MEM,
+			.short_desc = gettext_noop("Maximum age (in seconds) of cached block-group next-access-time"),
 		},
 		.variable = &pbm_bg_naest_max_age_s,
 		.boot_val = 10.0, .min = 0.0, .max = 10000.0,

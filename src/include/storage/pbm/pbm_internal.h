@@ -225,9 +225,9 @@ typedef struct BlockGroupData {
 	slock_t	slock;
 #elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
 	slock_t	scan_lock;
-#if PBM_USE_PQ
+#if PBM_TRACK_BLOCKGROUP_BUFFERS
 	slock_t	buf_lock;
-#endif /* PBM_USE_PQ */
+#endif /* PBM_TRACK_BLOCKGROUP_BUFFERS */
 #else
 #error "unknown block group lock mode"
 #endif // PBM_BG_LOCK_MODE
@@ -235,10 +235,12 @@ typedef struct BlockGroupData {
 	// Set of scans which care about this block group
 	slist_head scans_list;
 
-#if PBM_USE_PQ
+#if PBM_TRACK_BLOCKGROUP_BUFFERS
 	// Set of buffers holding data in this block group
 	volatile int buffers_head;
+#endif
 
+#if PBM_USE_PQ
 	// Linked-list in PQ buckets
 	struct PbmPQBucket *volatile pq_bucket;
 	dlist_node blist;
@@ -459,7 +461,7 @@ static inline void bg_unlock_scans(BlockGroupData * bg) {
 #endif // PBM_BG_LOCK_MODE
 }
 
-#if PBM_USE_PQ
+#if PBM_TRACK_BLOCKGROUP_BUFFERS
 static inline void bg_lock_buffers(BlockGroupData * bg, pg_attribute_unused() LWLockMode mode) {
 #if PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_LWLOCK
 	LWLockAcquire(&bg->lock, mode);
@@ -479,7 +481,7 @@ static inline void bg_unlock_buffers(BlockGroupData * bg) {
 	SpinLockRelease(&bg->buf_lock);
 #endif // PBM_BG_LOCK_MODE
 }
-#endif /* PBM_USE_PQ */
+#endif /* PBM_TRACK_BLOCKGROUP_BUFFERS */
 
 
 
@@ -488,8 +490,8 @@ static inline void bg_unlock_buffers(BlockGroupData * bg) {
 // ### clean this up eventually
 void debug_log_scan_map(void);
 void debug_log_blockgroup_map(void);
-#if PBM_USE_PQ
+#if PBM_TRACK_BLOCKGROUP_BUFFERS
 void debug_log_find_blockgroup_buffers(void);
-#endif /*PBM_USE_PQ*/
+#endif /*PBM_TRACK_BLOCKGROUP_BUFFERS*/
 
 #endif //POSTGRESQL_PBM_INTERNAL_H

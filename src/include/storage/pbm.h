@@ -12,8 +12,9 @@
 
 
 /* ===== GLOBAL CONFIGURATION VARIABLES ===== */
-#define PBM_EVICT_MAX_SAMPLES 100
+#define PBM_EVICT_MAX_SAMPLES 256
 extern int pbm_evict_num_samples;
+extern int pbm_evict_num_victims;
 extern double pbm_bg_naest_max_age_s;  /* not actually used except by GUC */
 extern unsigned long pbm_bg_naest_max_age_ns;
 

@@ -34,6 +34,7 @@ PbmShared* pbm;
 
 /* Configuration variables */
 int pbm_evict_num_samples;
+int pbm_evict_num_victims;
 double pbm_bg_naest_max_age_s;
 unsigned long pbm_bg_naest_max_age_ns;
 
@@ -95,12 +96,12 @@ static inline void bgit_init(pbm_bg_iterator * it, const BlockGroupHashKey * bgk
 static inline BlockGroupHashEntry * bgit_advance_one(pbm_bg_iterator * it);
 static inline BlockGroupData * bgit_advance_to(pbm_bg_iterator * it, BlockNumber bg);
 
-#if PBM_USE_PQ
+#if PBM_TRACK_BLOCKGROUP_BUFFERS
 // managing buffer <--> block group links
 // this is most of the real work for the callbacks from freelist.c
 static inline BlockGroupData * AddBufToBlockGroup(BufferDesc * buf);
 static inline void RemoveBufFromBlockGroup(BufferDesc * buf);
-#endif /* PBM_USE_PQ */
+#endif /* PBM_TRACK_BLOCKGROUP_BUFFERS */
 
 // managing buffer priority
 static inline unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem * bg_scan);
@@ -1007,7 +1008,6 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *co
  */
 void PbmNewBuffer(BufferDesc * const buf) {
 	BlockGroupData * group;
-	PbmBufferDescStats * buf_stats = get_buffer_stats(buf);
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS) && defined(TRACE_PBM_BUFFERS_NEW)
 	elog(WARNING, "PbmNewBuffer added new buffer:" //"\n"
@@ -1018,7 +1018,7 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	debug_buffer_access(buf, "new buffer");
 #endif // TRACE_PBM && TRACE_PBM_BUFFERS && TRACE_PBM_BUFFERS_NEW
 
-#if PBM_USE_PQ
+#if PBM_TRACK_BLOCKGROUP_BUFFERS
 	// Buffer must not already be in a block group if it is new!
 	Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_prev);
 	Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_next);
@@ -1054,7 +1054,9 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	}
 #endif // tracing
 #endif // SANITY_PBM_BUFFERS
+#endif // PBM_TRACK_BLOCKGROUP_BUFFERS
 
+#if PBM_USE_PQ
 /*
  * ### Consider doing this unconditionally.
  * Pros: might get better estimates with more frequent updates
@@ -1065,17 +1067,6 @@ void PbmNewBuffer(BufferDesc * const buf) {
 		RefreshBlockGroup(group);
 	}
 #endif /* PBM_USE_PQ */
-
-#if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
-	group = search_or_create_block_group(buf);
-
-	/* Sanity checks: should not already have a group, and we should find the group. */
-	Assert(buf_stats->pbm_bg == NULL);
-	Assert(group != NULL);
-
-	/* Set the block group for the buffer */
-	buf_stats->pbm_bg = group;
-#endif /* PBM_EVICT_MODE_SAMPLING */
 }
 
 /*
@@ -1100,7 +1091,7 @@ void PbmOnEvictBuffer(BufferDesc *const buf) {
 		return;
 	}
 
-#if PBM_USE_PQ
+#if PBM_TRACK_BLOCKGROUP_BUFFERS
 #ifdef SANITY_PBM_BUFFERS
 	// Check everything in the block group actually belongs to the same group
 	sanity_check_verify_block_group_buffers(buf);
@@ -1108,9 +1099,7 @@ void PbmOnEvictBuffer(BufferDesc *const buf) {
 
 	RemoveBufFromBlockGroup(buf);
 
-	Assert(buf->pbm_bgroup_next == FREENEXT_NOT_IN_LIST);
-	Assert(buf->pbm_bgroup_prev == FREENEXT_NOT_IN_LIST);
-#endif /* PBM_USE_PQ */
+#endif /* PBM_TRACK_BLOCKGROUP_BUFFERS */
 
 #if PBM_TRACK_STATS
 	clear_buffer_stats(get_buffer_stats(buf));
@@ -1508,8 +1497,10 @@ void InitSeqScanStatsEntry(BlockGroupScanListElem *temp, ScanId id, ScanHashEntr
 /* Initialize metadata for a block group */
 void InitBlockGroupData(BlockGroupData * data) {
 	slist_init(&data->scans_list);
-#if PBM_USE_PQ
+#if PBM_TRACK_BLOCKGROUP_BUFFERS
 	data->buffers_head = FREENEXT_END_OF_LIST;
+#endif /* PBM_TRACK_BLOCKGROUP_BUFFERS */
+#if PBM_USE_PQ
 	data->pq_bucket = NULL;
 #endif /* PBM_USE_PQ */
 
@@ -1520,9 +1511,9 @@ void InitBlockGroupData(BlockGroupData * data) {
 	SpinLockInit(&data->slock);
 #elif PBM_BG_LOCK_MODE == PBM_BG_LOCK_MODE_DOUBLE_SPIN
 	SpinLockInit(&data->scan_lock);
-#if PBM_USE_PQ
+#if PBM_TRACK_BLOCKGROUP_BUFFERS
 	SpinLockInit(&data->buf_lock);
-#endif /* PBM_USE_PQ */
+#endif /* PBM_TRACK_BLOCKGROUP_BUFFERS */
 #endif // PBM_BG_LOCK_MODE
 
 	/* Next access estimate starts invalid. */
@@ -1761,7 +1752,7 @@ BlockGroupData * bgit_advance_to(pbm_bg_iterator *const it, const BlockNumber bg
 	return &it->entry->groups[seg_offset];
 }
 
-#if PBM_USE_PQ
+#if PBM_TRACK_BLOCKGROUP_BUFFERS
 /*
  * Link the given buffer in to the associated block group.
  * Buffer must not already be part of any group.
@@ -1792,6 +1783,14 @@ BlockGroupData * AddBufToBlockGroup(BufferDesc *const buf) {
 		GetBufferDescriptor(group_head)->pbm_bgroup_prev = buf->buf_id;
 	}
 
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+	/* Sanity checks: should not already have a group. */
+	Assert(get_buffer_stats(buf)->pbm_bg == NULL);
+
+	/* Set the block group for the buffer */
+	get_buffer_stats(buf)->pbm_bg = group;
+#endif /* PBM_EVICT_MODE_SAMPLING */
+
 	bg_unlock_buffers(group);
 
 	// If this is the first buffer in the block group, caller will add it to the PQ
@@ -1807,9 +1806,11 @@ BlockGroupData * AddBufToBlockGroup(BufferDesc *const buf) {
  */
 void RemoveBufFromBlockGroup(BufferDesc *const buf) {
 	int next, prev;
-	bool found;
 	BlockGroupData * group;
+#if PBM_USE_PQ
 	bool need_to_remove;
+	bool found;
+#endif
 	/*
 	 * DEBUGGING: got this error once while dropping the *last* index on the table.
 	 *
@@ -1830,8 +1831,18 @@ void RemoveBufFromBlockGroup(BufferDesc *const buf) {
 	Assert(buf->pbm_bgroup_prev != FREENEXT_NOT_IN_LIST);
 
 	// Need to find and lock the block group before doing anything
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+	{
+		PbmBufferDescStats * stats = get_buffer_stats(buf);
+		group = stats->pbm_bg;
+		// Remove the block group pointer
+		stats->pbm_bg = NULL;
+		Assert(group != NULL);
+	}
+#else
 	group = search_block_group(&buf->tag, &found);
 	Assert(found);
+#endif
 	bg_lock_buffers(group, LW_EXCLUSIVE);
 
 	next = buf->pbm_bgroup_next;
@@ -1852,6 +1863,7 @@ void RemoveBufFromBlockGroup(BufferDesc *const buf) {
 		group->buffers_head = next;
 	}
 
+#if PBM_USE_PQ
 	// check if the group is empty while we still have the lock
 	need_to_remove = (group->buffers_head == FREENEXT_END_OF_LIST);
 
@@ -1861,8 +1873,11 @@ void RemoveBufFromBlockGroup(BufferDesc *const buf) {
 	if (need_to_remove) {
 		PQ_RemoveBlockGroup(group);
 	}
+#else
+	bg_unlock_buffers(group);
+#endif
 }
-#endif /* PBM_USE_PQ */
+#endif /* PBM_TRACK_BLOCKGROUP_BUFFERS */
 
 /*
  * Estimate when the specific scan will reach the relevant block group.
@@ -2375,6 +2390,49 @@ static inline bool bg_check_buftag(BufferTag * tag, BlockGroupData * bgdata) {
 }
 
 /*
+ * Evict all buffers in the given block group, except the one we've currently
+ * chosen for replacement.
+ */
+static void evict_rest_of_block_group(BlockGroupData *const bgdata, const BufferDesc *const buf_orig) {
+	int buf_id;
+	BufferDesc * buf;
+	uint32 buf_state;
+
+	bg_lock_buffers(bgdata, LW_SHARED);
+
+	/*
+	 * Add all non-pinned buffers in the block group to the free list
+	 * (except the one we're currently evicting)
+	 */
+	buf_id = bgdata->buffers_head;
+	while (buf_id >= 0) {
+		buf = GetBufferDescriptor(buf_id);
+
+		if (buf != buf_orig) {
+			buf_state = pg_atomic_read_u32(&buf->state);
+
+			/*
+			 * Free the buffer if it isn't pinned.
+			 *
+			 * We do not invalidate the buffer, just add to the free list.
+			 * It can still be used and will be skipped if it gets pinned
+			 * before it is removed from the free list.
+			 *
+			 * Note: we do NOT need to lock the buffer header to add it
+			 */
+			if (BUF_STATE_GET_REFCOUNT(buf_state) == 0) {
+				StrategyFreeBuffer(buf);
+			}
+		}
+
+		/* Next buffer in the group */
+		buf_id = buf->pbm_bgroup_next;
+	}
+
+	bg_unlock_buffers(bgdata);
+}
+
+/*
  * Choose a buffer to evict using the sampling-based eviction strategy.
  *
  * This will return a buffer with the header lock held.
@@ -2388,13 +2446,14 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 	PbmBufferDescStats * buf_stats;
 	uint32 local_buf_state;
 	BlockGroupData * bgdata;
-	bool requested;
+	bool requested, last_eviction;
 	unsigned long next_access = 0;
 	unsigned long now;
 
+	int n_selected = 0;
+	int n_evicted = 0;
 	// array of samples
 	PBM_BufSample samples[PBM_EVICT_MAX_SAMPLES];
-	int n_selected = 0;
 
 	// find the configured number of samples
 	while (n_selected < pbm_evict_num_samples) {
@@ -2464,6 +2523,7 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 					&& BUFFERTAGS_EQUAL(buf->tag, samples[n_selected].tag)) {
 				/* Not pinned AND tag didn't change - use it without more samples */
+				evict_rest_of_block_group(bgdata, buf);
 				*buf_state = local_buf_state;
 				return buf;
 			}
@@ -2479,6 +2539,7 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 	/* Heapify our samples */
 	bh_heapify(samples, n_selected);
 
+	/* Select victim to evict */
 	while (n_selected > 0) {
 		buf = samples[0].buf;
 
@@ -2490,8 +2551,32 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 				&& BUFFERTAGS_EQUAL(buf->tag, samples[0].tag)) {
 			/* Not pinned AND tag didn't change - evict this one */
+#ifndef PBM_SAMPLING_EVICT_MULTI
+			evict_rest_of_block_group(get_buffer_stats(buf)->pbm_bg, buf);
 			*buf_state = local_buf_state;
 			return buf;
+#else
+			++n_evicted;
+
+			last_eviction = (n_evicted >= pbm_evict_num_victims);
+
+			/* If in the free list: don't do anything
+			 * Otherwise: evict the whole block group, but if this is the last
+			 *     eviction, don't add current item to free list
+			 */
+			if (buf->freeNext == FREENEXT_NOT_IN_LIST) {
+				evict_rest_of_block_group(get_buffer_stats(buf)->pbm_bg,
+										  last_eviction ? buf : NULL);
+			}
+
+			/* Return the current victim after enough evictions, or if we've
+			 * exhausted the whole sample
+			 */
+			if (last_eviction || n_selected <= 1) {
+				*buf_state = local_buf_state;
+				return buf;
+			}
+#endif
 		}
 
 		/* Someone stole it - remove from the heap and pick a different one */
@@ -2743,7 +2828,7 @@ void debug_log_blockgroup_map(void) {
 	pfree(str.data);
 }
 
-#if PBM_USE_PQ
+#if PBM_TRACK_BLOCKGROUP_BUFFERS
 void debug_log_find_blockgroup_buffers(void) {
 	StringInfoData str;
 	initStringInfo(&str);
@@ -2789,7 +2874,7 @@ void debug_log_find_blockgroup_buffers(void) {
 
 	pfree(str.data);
 }
-#endif /* PBM_USE_PQ */
+#endif /* PBM_TRACK_BLOCKGROUP_BUFFERS */
 
 /* Assert the given scan has been completely removed from everything */
 void assert_scan_completely_unregistered(ScanHashEntry * scan) {

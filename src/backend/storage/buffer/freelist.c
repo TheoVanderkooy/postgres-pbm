@@ -346,6 +346,15 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 		if (buf != NULL) {
 			return buf;
 		}
+#ifdef PBM_SAMPLING_EVICT_MULTI
+		/* If it failed, check the free list again. We "evict" whole block groups
+		 * at once, and potentially multiple if pbm_evict_num_victims > 1 so it
+		 * is possible that evicting fails but leaves things on the free list. */
+		buf = check_free_list(strategy, buf_state);
+		if (NULL != buf) {
+			return buf;
+		}
+#endif
 	}
 
 	/* The sampling failed because everything we tried got evicted or pinned by

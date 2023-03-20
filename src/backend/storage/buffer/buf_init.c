@@ -128,7 +128,7 @@ InitBufferPool(void)
 			 */
 			buf->freeNext = i + 1;
 
-#if PBM_USE_PQ
+#if PBM_TRACK_BLOCKGROUP_BUFFERS
 			/*
 			 * PBM: initially buffers are empty so don't contain a block from any group
 			 */
