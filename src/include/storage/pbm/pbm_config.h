@@ -38,15 +38,20 @@
  * How to track stats for non-requested buffers:
  *  0: track PBM_BUFFER_NUM_RECENT_ACCESSES recent access times for a buffer to
  *     compute average inter-access time
+ *  1: exponentially weighted average
  * Potential future alternatives:
  *  - Use exponentially-weighted average of recent inter-access times
  *  - Track count over recent intervals
  */
 #define PBM_BUFFER_STATS_MODE_NRECENT 0
-#define PBM_BUFFER_STATS_MODE PBM_BUFFER_STATS_MODE_NRECENT
+#define PBM_BUFFER_STATS_MODE_GEOMETRIC 1
+//#define PBM_BUFFER_STATS_MODE PBM_BUFFER_STATS_MODE_NRECENT
+#define PBM_BUFFER_STATS_MODE PBM_BUFFER_STATS_MODE_GEOMETRIC
 
 #if PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_NRECENT
 #define PBM_BUFFER_NUM_RECENT_ACCESS 5
+#elif PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_GEOMETRIC
+#define PBM_BUFFER_NUM_EXACT 4
 #endif
 
 /* PQ and sampling need to know the set of buffers in each group */

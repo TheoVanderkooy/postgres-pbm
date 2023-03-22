@@ -2227,10 +2227,16 @@ uint64 PBM_DEBUG_CUR_TIME_ns() {
 
 
 void clear_buffer_stats(PbmBufferDescStats * stats) {
+#if PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_NRECENT
 	/* Use "AccessTimeNotRequested" for fewer than N recent accesses */
 	for(int i = 0; i < PBM_BUFFER_NUM_RECENT_ACCESS; ++i) {
 		stats->recent_accesses[i] = AccessTimeNotRequested;
 	}
+#elif PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_GEOMETRIC
+	stats->nrecent_accesses = 0;
+	stats->avg_recent_inter_access = 0.;
+	stats->last_access = AccessTimeNotRequested;
+#endif /* PBM_BUFFER_STATS_MODE */
 }
 
 void init_buffer_stats(PbmBufferDescStatsPadded * stats) {
@@ -2249,26 +2255,61 @@ PbmBufferDescStats * get_buffer_stats(const BufferDesc *const buf) {
 
 #if PBM_TRACK_STATS
 void update_buffer_recent_access(PbmBufferDescStats * stats, uint64 now) {
-	static const uint64 upper_idx = PBM_BUFFER_NUM_RECENT_ACCESS - 1;
-
+#if PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_NRECENT
 	SpinLockAcquire(&stats->slock);
 
 	/* Shift everything left by 1 */
-	for (int i = 0; i < upper_idx; ++i) {
+	for (int i = 0; i < PBM_BUFFER_NUM_RECENT_ACCESS - 1; ++i) {
 		stats->recent_accesses[i] = stats->recent_accesses[i+1];
 	}
 
 	/* Most recent access ist stored at the end */
-	stats->recent_accesses[upper_idx] = now;
+	stats->recent_accesses[PBM_BUFFER_NUM_RECENT_ACCESS - 1] = now;
 
 	SpinLockRelease(&stats->slock);
+#elif PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_GEOMETRIC
+	double since_last;
+	double new_avg;
+
+	SpinLockAcquire(&stats->slock);
+
+	/* No inter-access times if no recent accesses */
+	if (stats->nrecent_accesses == 0) {
+		stats->last_access = now;
+		stats->nrecent_accesses = 1;
+		SpinLockRelease(&stats->slock);
+		return;
+	}
+
+	/* Update inter-access time with time since last estimate */
+	if (now >= stats->last_access) {
+		since_last = (double)(now - stats->last_access);
+		stats->last_access = now;
+	} else {
+		since_last = (double)(stats->last_access - now);
+	}
+
+	/* Either update exactly or geometrically depending how many recent accesses there are */
+	if (stats->nrecent_accesses <= PBM_BUFFER_NUM_EXACT) {
+		new_avg = (stats->avg_recent_inter_access * (stats->nrecent_accesses - 1) + since_last) / stats->nrecent_accesses;
+		stats->nrecent_accesses += 1;
+	} else {
+		const double alpha = 1./(PBM_BUFFER_NUM_EXACT+1);
+		new_avg = stats->avg_recent_inter_access * (1-alpha) + since_last * alpha;
+	}
+	stats->avg_recent_inter_access = new_avg;
+
+	SpinLockRelease(&stats->slock);
+#endif /* PBM_BUFFER_STATS_MODE */
 }
 
 uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_accesses) {
-	uint64 min_access = 0;
 	uint64 last_access = 0;
 	uint64 est_inter_access, t_since_last;
-	int num_accesses = PBM_BUFFER_NUM_RECENT_ACCESS;
+	int num_accesses;
+#if PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_NRECENT
+	uint64 min_access = 0;
+	num_accesses = PBM_BUFFER_NUM_RECENT_ACCESS;
 
 	SpinLockAcquire(&stats->slock);
 	/* Find min access and count how many times are actually valid */
@@ -2283,7 +2324,15 @@ uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_acc
 	}
 	last_access = stats->recent_accesses[PBM_BUFFER_NUM_RECENT_ACCESS - 1];
 	SpinLockRelease(&stats->slock);
+#elif PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_GEOMETRIC
+	SpinLockAcquire(&stats->slock);
 
+	num_accesses = stats->nrecent_accesses;
+	last_access = stats->last_access;
+	est_inter_access = (uint64)stats->avg_recent_inter_access;
+
+	SpinLockRelease(&stats->slock);
+#endif /* PBM_BUFFER_STATS_MODE */
 	*n_accesses = num_accesses;
 
 	/* It is possible we haven't accessed the buffer enough to estimate the
@@ -2293,9 +2342,11 @@ uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_acc
 		return AccessTimeNotRequested;
 	}
 
-	/* Compute the average inter-access interval, and time since last access */
-	est_inter_access = (last_access - min_access) / (num_accesses - 1);
+	/* Compute time since last access */
 	t_since_last = (now - last_access);
+#if PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_NRECENT
+	est_inter_access = (last_access - min_access) / (num_accesses - 1);
+#endif
 
 	/* If we don't access the buffer for a while, apply a penalty as our estimates
 	 * may be out of date. */

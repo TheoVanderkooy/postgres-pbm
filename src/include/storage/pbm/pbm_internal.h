@@ -330,11 +330,15 @@ typedef struct PbmBufferDescStats {
 	struct BlockGroupData * pbm_bg;
 #endif
 #if PBM_TRACK_STATS
-	slock_t slock;		/* lock for thse fields */
+	slock_t slock;		/* lock for these fields */
 
 #if PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_NRECENT
 	uint64 recent_accesses[PBM_BUFFER_NUM_RECENT_ACCESS];
-#endif
+#elif PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_GEOMETRIC
+	double avg_recent_inter_access;
+	uint64 last_access;
+	int nrecent_accesses;
+#endif /* PBM_BUFFER_STATS_MODE */
 #endif /* PBM_TRACK_STATS */
 } PbmBufferDescStats;
 
