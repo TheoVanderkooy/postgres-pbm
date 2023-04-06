@@ -37,6 +37,7 @@ int pbm_evict_num_samples;
 int pbm_evict_num_victims;
 double pbm_bg_naest_max_age_s;
 unsigned long pbm_bg_naest_max_age_ns;
+bool pbm_evict_whole_group;
 
 
 /*-------------------------------------------------------------------------
@@ -2386,7 +2387,9 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 					&& BUFFERTAGS_EQUAL(buf->tag, samples[n_selected].tag)) {
 				/* Not pinned AND tag didn't change - use it without more samples */
-				evict_rest_of_block_group(bgdata, buf);
+				if (pbm_evict_whole_group) {
+					evict_rest_of_block_group(bgdata, buf);
+				}
 				*buf_state = local_buf_state;
 				return buf;
 			}
@@ -2415,7 +2418,9 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 				&& BUFFERTAGS_EQUAL(buf->tag, samples[0].tag)) {
 			/* Not pinned AND tag didn't change - evict this one */
 #ifndef PBM_SAMPLING_EVICT_MULTI
-			evict_rest_of_block_group(get_buffer_stats(buf)->pbm_bg, buf);
+			if (pbm_evict_whole_group) {
+				evict_rest_of_block_group(get_buffer_stats(buf)->pbm_bg, buf);
+			}
 			*buf_state = local_buf_state;
 			return buf;
 #else
@@ -2428,8 +2433,12 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 			 *     eviction, don't add current item to free list
 			 */
 			if (buf->freeNext == FREENEXT_NOT_IN_LIST) {
-				evict_rest_of_block_group(get_buffer_stats(buf)->pbm_bg,
-										  last_eviction ? buf : NULL);
+				if (pbm_evict_whole_group) {
+					evict_rest_of_block_group(get_buffer_stats(buf)->pbm_bg,
+											  last_eviction ? buf : NULL);
+				} else if (!last_eviction) {
+					StrategyFreeBuffer(buf);
+				}
 			}
 
 			/* Return the current victim after enough evictions, or if we've
