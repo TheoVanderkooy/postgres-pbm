@@ -2111,6 +2111,16 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		.gen = {
+			.name = "pbm_evict_whole_block_group", .context = PGC_SUSET, .group = RESOURCES_MEM,
+			.short_desc = gettext_noop("Whether to evict a whole block group at once."),
+		},
+		.variable = &pbm_evict_whole_group,
+		.boot_val = true,
+		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL
