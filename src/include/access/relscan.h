@@ -177,6 +177,8 @@ typedef struct IndexScanDescData
 
 	/* parallel index scan information, in shared memory */
 	struct ParallelIndexScanDescData *parallel_scan;
+
+	// TODO PBM fields? (parallel index scans too?)
 }			IndexScanDescData;
 
 /* Generic structure for parallel scans */

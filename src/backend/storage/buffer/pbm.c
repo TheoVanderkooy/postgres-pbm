@@ -177,7 +177,7 @@ void InitPBM(void) {
 	Assert(!IsUnderPostmaster);
 
 	/* Initialize fields */
-	pbm->next_id = 0;
+	pbm->next_id = 1;
 	SpinLockInit(&pbm->scan_free_list_lock);
 	slist_init(&pbm->bg_scan_free_list);
 	pbm->initial_est_speed = 0.0001f;
@@ -997,6 +997,55 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *co
 	i = remove_bitmap_scan_from_block_range(id, &scan->pbmLocalScanData, bg);
 	scan->pbmLocalScanData.vec_idx = i;
 }
+
+
+/*-------------------------------------------------------------------------
+ * Public API: Index scan methods
+ *-------------------------------------------------------------------------
+ */
+
+void PBM_RegisterIndexScan(struct IndexScanState * scan) {
+	ScanId id;
+
+	// TODO different set of locks for index scans?
+	/* Insert the scan metadata & generate scan ID */
+	LOCK_GUARD_V2(PbmScansLock, LW_EXCLUSIVE) {
+		// Generate scan ID
+		id = pbm->next_id;
+		pbm->next_id += 1;
+
+		// TODO create entry in some index scan map?
+	}
+
+	elog(WARNING, "PBM_RegisterIndexScan(%lu) rel=%u"
+		 , id, scan->ss.ss_currentRelation->rd_node.relNode
+	 );
+
+	scan->pbm_state.id = id;
+
+	// TODO scan->ss->ps is "PlanState", might have stats we want?
+}
+
+void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
+	/* ID 0 means the scan wasn't registered, so nothing to unregister */
+	if (scan->pbm_state.id == 0) {
+		return;
+	}
+
+	elog(WARNING, "PBM_UnregisterIndexScan(%lu)"
+		 ,scan->pbm_state.id
+	 );
+
+}
+
+void PBM_ReportIndexScanPosition(struct IndexScanState * scan /*TODO other args*/) {
+	elog(WARNING, "PBM_ReportIndexScanPosition(%lu)"
+		 ,scan->pbm_state.id
+	 );
+
+}
+
+
 
 
 /*-------------------------------------------------------------------------

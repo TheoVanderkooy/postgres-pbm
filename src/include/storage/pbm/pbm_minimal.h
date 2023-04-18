@@ -10,6 +10,8 @@
 typedef size_t ScanId;
 
 struct PBM_ScanHashEntry;
+struct IndexScanState;
+struct IndexOnlyScanState;
 
 
 /* Key in Block Group Data Map */
@@ -47,6 +49,11 @@ struct PBM_LocalBitmapScanState {
 	int vec_idx; /* Track current position in `block_groups` as we report progress */
 
 	pbm_bg_iterator bg_it;
+};
+
+struct PBM_IndexScanState {
+	ScanId id;
+	// TODO PBM other fields...
 };
 
 

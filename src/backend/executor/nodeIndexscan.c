@@ -589,6 +589,8 @@ ExecReScanIndexScan(IndexScanState *node)
 					 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
 	node->iss_ReachedEnd = false;
 
+	// TODO PBM -- can probably ignore this but might be useful to count it?
+
 	ExecScanReScan(&node->ss);
 }
 
@@ -818,6 +820,10 @@ ExecEndIndexScan(IndexScanState *node)
 		index_endscan(indexScanDesc);
 	if (indexRelationDesc)
 		index_close(indexRelationDesc, NoLock);
+
+#if defined(USE_PBM)
+	PBM_UnregisterIndexScan(node);
+#endif
 }
 
 /* ----------------------------------------------------------------
@@ -1082,6 +1088,10 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	{
 		indexstate->iss_RuntimeContext = NULL;
 	}
+
+#if defined(USE_PBM)
+	PBM_RegisterIndexScan(indexstate);
+#endif
 
 	/*
 	 * all done.
@@ -1701,6 +1711,8 @@ ExecIndexScanInitializeDSM(IndexScanState *node,
 		index_rescan(node->iss_ScanDesc,
 					 node->iss_ScanKeys, node->iss_NumScanKeys,
 					 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
+
+	// TODO PBM?? parallel index scan??
 }
 
 /* ----------------------------------------------------------------
@@ -1744,4 +1756,6 @@ ExecIndexScanInitializeWorker(IndexScanState *node,
 		index_rescan(node->iss_ScanDesc,
 					 node->iss_ScanKeys, node->iss_NumScanKeys,
 					 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
+
+	// TODO PBM parallel index scan?
 }
