@@ -85,11 +85,16 @@ static inline BlockGroupScanListElem * try_get_bg_scan_elem(void);
 static inline void free_bg_scan_elem(BlockGroupScanListElem *it);
 
 
+// memory management for IndexScanStatsEntry
+static inline IndexScanStatsEntry * alloc_idxscan_stats(void);
+static inline void free_idxscan_stats(IndexScanStatsEntry * stats);
+
+
 // lookups in applicable hash maps
 static inline ScanHashEntry * search_scan(ScanId id, HASHACTION action, bool* foundPtr);
 static inline BlockGroupData * search_block_group(const BufferTag * buftag, bool* foundPtr);
-
-static BlockGroupData * search_or_create_block_group(const BufferDesc * buf);
+static		  BlockGroupData * search_or_create_block_group(const BufferDesc * buf);
+static inline IndexScanHashEntry * search_or_create_idxscan_entry(const RelFileNode * rel);
 
 
 // block group iterator methods: for remembering position on block group map
@@ -221,6 +226,19 @@ void InitPBM(void) {
 	for (int i = 0; i < NBuffers; ++i) {
 		init_buffer_stats(&pbm->buffer_stats[i]);
 	}
+
+	/* Initialize index scan map */
+	hash_info = (HASHCTL) {
+		.keysize = sizeof(RelFileNode),
+		.entrysize = sizeof(IndexScanHashEntry),
+	};
+	hash_flags = HASH_ELEM | HASH_BLOBS;
+	pbm->IndexScanMap = ShmemInitHash("PBM index scan stats", 1024, IndexScanMapMaxSize, &hash_info, hash_flags);
+
+	dlist_init(&pbm->free_idxscan_stats);
+	SpinLockInit(&pbm->free_idxscan_stats_lock);
+
+	// TODO the actual index scan stat structs!
 }
 
 /*
@@ -231,6 +249,7 @@ Size PbmShmemSize(void) {
 	size = add_size(size, sizeof(PbmShared));
 	size = add_size(size, hash_estimate_size(ScanMapMaxSize, sizeof(ScanHashEntry)));
 	size = add_size(size, hash_estimate_size(BlockGroupMapMaxSize, sizeof(BlockGroupHashEntry)));
+	size = add_size(size, hash_estimate_size(IndexScanMapMaxSize, sizeof(IndexScanHashEntry)));
 
 	/*
 	 * Assuming one scan per block in the database on average: (probably an underestimate?)
@@ -245,6 +264,8 @@ Size PbmShmemSize(void) {
 #endif /* PBM_USE_PQ */
 
 	size = add_size(size, NBuffers * sizeof(PbmBufferDescStatsPadded));
+	size = add_size(size, IndexScanNumConcurrent * sizeof(IndexScanStatsEntry));
+	// TODO other index scan related fields?
 
 #if defined(TRACE_PBM) || true
 	{
@@ -1004,41 +1025,75 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *co
  *-------------------------------------------------------------------------
  */
 
+/*
+ * Register an index scan.
+ */
 void PBM_RegisterIndexScan(struct IndexScanState * scan) {
 	ScanId id;
+	RelFileNode * rel_key = &scan->ss.ss_currentRelation->rd_node;
+	IndexScanHashEntry * entry;
+	IndexScanStatsEntry * stats;
 
-	// TODO different set of locks for index scans?
-	/* Insert the scan metadata & generate scan ID */
-	LOCK_GUARD_V2(PbmScansLock, LW_EXCLUSIVE) {
-		// Generate scan ID
-		id = pbm->next_id;
-		pbm->next_id += 1;
-
-		// TODO create entry in some index scan map?
-	}
-
-	elog(WARNING, "PBM_RegisterIndexScan(%lu) rel=%u"
-		 , id, scan->ss.ss_currentRelation->rd_node.relNode
-	 );
-
+	/* Allocate scan ID */
+	// ### could get rid of scan IDs entirely, but helpful for debugging...
+	id = (pbm->next_id++);
 	scan->pbm_state.id = id;
+	scan->pbm_state.is_registered = true;
 
-	// TODO scan->ss->ps is "PlanState", might have stats we want?
+#if defined(TRACE_PBM_REGISTER_INDEX)
+	elog(WARNING, "PBM_RegisterIndexScan(%lu) rel=%u"
+		, id, scan->ss.ss_currentRelation->rd_node.relNode
+	);
+#endif /* TRACE_PBM_REGISTER_INDEX */
+
+	/* Allocate struct for stats for this scan */
+	stats = alloc_idxscan_stats();
+	stats->id = id;
+	scan->pbm_state.stats = stats;
+
+	/* Store the stats in the map */
+	entry = search_or_create_idxscan_entry(rel_key);
+//	SpinLockAcquire(&entry->slock);
+	LOCK_GUARD_V2(&entry->lock, LW_EXCLUSIVE) {
+		dlist_push_head(&entry->dlist, &stats->dlist);
+	}
+//	SpinLockRelease(&entry->slock);
+
+	/*
+	 * TODO PBM:
+	 *  - copy over certain estimates from the query plan
+	 *  	- check `scan->ss->ps` for what we want
+	 *  	- may need to check the parent for how many loops are expected? (hopefully not)
+	 *  	- expected # of tuples
+	 *  - decide to not register if the scan is too short
+	 */
 }
 
 void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
 	/* ID 0 means the scan wasn't registered, so nothing to unregister */
-	if (scan->pbm_state.id == 0) {
+	if (!scan->pbm_state.is_registered) {
 		return;
 	}
 
+#if defined(TRACE_PBM_REGISTER_INDEX)
 	elog(WARNING, "PBM_UnregisterIndexScan(%lu)"
-		 ,scan->pbm_state.id
+		 , scan->pbm_state.id
 	 );
+#endif /* TRACE_PBM_REGISTER_INDEX */
 
+	Assert(NULL != scan->pbm_state.stats);
+
+	/* Remove the stats from the scan and free the entry */
+	dlist_delete(&scan->pbm_state.stats->dlist);
+	free_idxscan_stats(scan->pbm_state.stats);
+
+
+#ifdef TRACE_PBM_PRINT_IDXSCANMAP
+	debug_print_idxscan_data();
+#endif // TRACE_PBM_PRINT_IDXSCANMAP
 }
 
-void PBM_ReportIndexScanPosition(struct IndexScanState * scan /*TODO other args*/) {
+void PBM_ReportIndexScanPosition(struct IndexScanState * scan /*TODO other args?*/) {
 	elog(WARNING, "PBM_ReportIndexScanPosition(%lu)"
 		 ,scan->pbm_state.id
 	 );
@@ -1073,7 +1128,11 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_prev);
 	Assert(FREENEXT_NOT_IN_LIST == buf->pbm_bgroup_next);
 
+	/* Associate with the block group and index scan stats */
 	group = AddBufToBlockGroup(buf);
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+	get_buffer_stats(buf)->pbm_iscan_stats = search_or_create_idxscan_entry(&buf->tag.rnode);
+#endif
 
 	// There must be a group -- either it already existed or we created it.
 	Assert(group != NULL);
@@ -1158,6 +1217,7 @@ void PbmOnEvictBuffer(BufferDesc *const buf) {
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
 	/* If we had cached the block group for this buffer, clear it */
 	get_buffer_stats(buf)->pbm_bg = NULL;
+	get_buffer_stats(buf)->pbm_iscan_stats = NULL;
 #endif
 }
 
@@ -1653,6 +1713,39 @@ void free_bg_scan_elem(BlockGroupScanListElem *it) {
 	SpinLockRelease(&pbm->scan_free_list_lock);
 }
 
+/* Allocate an index scan stats struct. zeros out the stats */
+static inline IndexScanStatsEntry * alloc_idxscan_stats(void) {
+	IndexScanStatsEntry * stats = NULL;
+
+	/* Try free list first */
+	if (!dlist_is_empty(&pbm->free_idxscan_stats)) {
+		SpinLockAcquire(&pbm->free_idxscan_stats_lock);
+		if (!dlist_is_empty(&pbm->free_idxscan_stats)) {
+			dlist_node * dnode = dlist_pop_head_node(&pbm->free_idxscan_stats);
+			stats = dlist_container(IndexScanStatsEntry, dlist, dnode);
+		}
+		SpinLockRelease(&pbm->free_idxscan_stats_lock);
+	}
+
+	/* Allocate a new one if not found */
+	if (NULL == stats) {
+		stats = ShmemAlloc(sizeof(IndexScanStatsEntry));
+	}
+
+	/* Zero stats */
+	memset(&stats->counts, 0, sizeof(stats->counts));
+	// TODO other stats?
+
+	return stats;
+}
+
+/* Free an index scan stats struct */
+static inline void free_idxscan_stats(IndexScanStatsEntry * stats) {
+	SpinLockAcquire(&pbm->free_idxscan_stats_lock);
+	dlist_push_head(&pbm->free_idxscan_stats, &stats->dlist);
+	SpinLockRelease(&pbm->free_idxscan_stats_lock);
+}
+
 /*
  * Search scan map for the given scan by its ID.
  *
@@ -1735,6 +1828,26 @@ BlockGroupData * search_or_create_block_group(const BufferDesc *const buf) {
 
 	// Find the block group within the segment
 	return &bg_entry->groups[bgroup % BLOCK_GROUP_SEG_SIZE];
+}
+
+/* Find or initialize an index scan entry */
+static inline IndexScanHashEntry * search_or_create_idxscan_entry(const RelFileNode * rel) {
+	IndexScanHashEntry * entry;
+	bool found;
+
+	LOCK_GUARD_V2(PbmIdxScansLock, LW_EXCLUSIVE) {
+		entry = hash_search(pbm->IndexScanMap, rel, HASH_ENTER, &found);
+
+		/* Initialise the entry if not found */
+		if (!found) {
+			dlist_init(&entry->dlist);
+			LWLockInitialize(&entry->lock, LWTRANCH_PBM_IDXSCAN);
+//			SpinLockInit(&entry->slock);
+			// TODO initialize other fields?
+		}
+	}
+
+	return entry;
 }
 
 /* Initialize a block group iterator for the table given in bgkey */
@@ -2292,6 +2405,7 @@ void clear_buffer_stats(PbmBufferDescStats * stats) {
 void init_buffer_stats(PbmBufferDescStatsPadded * stats) {
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
 	stats->stats.pbm_bg = NULL;
+	stats->stats.pbm_iscan_stats = NULL;
 #endif /* PBM_EVICT_MODE_SAMPLING */
 #if PBM_TRACK_STATS
 	SpinLockInit(&stats->stats.slock);
@@ -2834,6 +2948,47 @@ void debug_buffer_access(BufferDesc* buf, char* msg) {
 	);
 }
 #endif
+
+void debug_print_idxscan_data(void) {
+	StringInfoData str;
+	HASH_SEQ_STATUS status;
+	IndexScanHashEntry * entry;
+	dlist_iter it;
+
+	hash_seq_init(&status, pbm->IndexScanMap);
+	initStringInfo(&str);
+	appendStringInfo(&str, "Index scan hash map status:");
+
+	for (;;) {
+		entry = hash_seq_search(&status);
+		if (NULL == entry) break;
+
+		appendStringInfo(&str, "\n\t{spc=%u, db=%u, rel=%u}:"
+			, entry->key.spcNode, entry->key.dbNode, entry->key.relNode
+		);
+
+		dlist_foreach(it, &entry->dlist) {
+			IndexScanStatsEntry *stats = dlist_container(IndexScanStatsEntry, dlist, it.cur);
+
+			appendStringInfo(&str,"\n\t\tid=%lu, speed=%f, addr=%p"
+				, stats->id, stats->est_speed, stats
+			);
+		}
+	}
+
+	appendStringInfo(&str, "\n\tfree:  ");
+	dlist_foreach(it, &pbm->free_idxscan_stats) {
+		IndexScanStatsEntry *stats = dlist_container(IndexScanStatsEntry, dlist, it.cur);
+
+		appendStringInfo(&str, "  %lu", stats->id);
+	}
+
+
+	ereport(INFO, (errmsg_internal("PBM index scan map:"), errdetail_internal("%s", str.data)));
+
+	pfree(str.data);
+}
+
 
 // Print debugging information for a single entry in the scans hash map.
 static

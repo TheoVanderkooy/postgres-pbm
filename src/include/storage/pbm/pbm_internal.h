@@ -38,6 +38,8 @@ static const unsigned int PQ_BucketOutOfRange = (unsigned int)(-1);
 /* Hash map sizes */
 static const long ScanMapMaxSize = 1024;
 static const long BlockGroupMapMaxSize = (1 << 12);
+static const long IndexScanMapMaxSize = 1024;
+static const long IndexScanNumConcurrent = 1024;
 /*
  * For 128 GiB = 2^37 bytes database:
  * Block size = 8192 = 2^13 bytes
@@ -88,14 +90,22 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 #define PBM_BG_LOCK_MODE PBM_BG_LOCK_MODE_DOUBLE_SPIN
 
 
+/*
+ * Number of buckets for index scan stats.
+ */
+#define PBM_INDEX_SCAN_NUM_COUNTS (1 << 14)
+
+
 /* Debugging flags */
 //#define TRACE_PBM
 //#define TRACE_PBM_REGISTER
+#define TRACE_PBM_REGISTER_INDEX
 //#define TRACE_PBM_REPORT_PROGRESS
 //#define TRACE_PBM_REPORT_PROGRESS_VERBOSE
 //#define TRACE_PBM_BITMAP_PROGRESS
 //#define TRACE_PBM_PRINT_SCANMAP
 //#define TRACE_PBM_PRINT_BLOCKGROUPMAP
+#define TRACE_PBM_PRINT_IDXSCANMAP
 //#define TRACE_PBM_BUFFERS
 //#define TRACE_PBM_BUFFERS_NEW
 //#define TRACE_PBM_BUFFERS_EVICT
@@ -266,6 +276,36 @@ typedef struct BlockGroupHashEntry {
 	BlockGroupData		groups[BLOCK_GROUP_SEG_SIZE];
 } BlockGroupHashEntry;
 
+/* Stats for a single index scan */
+typedef struct IndexScanStatsEntry {
+	ScanId id;
+
+	// TODO what fields?
+	// TODO make atomic?
+	float est_speed; /* tuples / second? */
+
+	/* List entry */
+	dlist_node dlist;
+
+	// TODO array (of whatever size) of counts
+	uint16 counts[PBM_INDEX_SCAN_NUM_COUNTS];
+} IndexScanStatsEntry;
+
+/* Entry in Index scan map */
+typedef struct IndexScanHashEntry {
+	RelFileNode key;
+
+	// TODO! value fields
+	/*
+	 * TODO:
+	 *  - local lock
+	 *  - dlist_head of scan stats for this relation
+	 *  - ... # of scans? what else?
+	 */
+//	slock_t slock; // TODO spin lock or LWLock?
+	LWLock lock;
+	dlist_head dlist;
+} IndexScanHashEntry;
 
 /*
  * The priority queue structure data structures for tracking blocks to evict
@@ -328,6 +368,7 @@ typedef struct PbmBufferDescStats {
 	/* Block group in the PBM if applicable (protected by buffer header lock) */
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
 	struct BlockGroupData * pbm_bg;
+	struct IndexScanHashEntry * pbm_iscan_stats;
 #endif
 #if PBM_TRACK_STATS
 	slock_t slock;		/* lock for these fields */
@@ -370,15 +411,23 @@ typedef struct PbmShared {
 	/// Map[ scan ID -> scan stats ] to record progress & estimate speed
 	struct HTAB * ScanMap;
 	/// Counter for ID generation
-	ScanId next_id;
+	_Atomic(ScanId) next_id;
 	/// Global estimate of speed used for *new* scans
 	float initial_est_speed;
 
 
 	/* These fields protected by PbmBlocksLock: */
 
-	/// Map[ (table, BlockGroupSegment) -> set of scans ] + free-list of the list-nodes for tracking statistics on each buffer
+	/// Map[ (table, BlockGroupSegment) -> set of scans ]
 	struct HTAB * BlockGroupMap;
+
+
+	/* These fields protected by PbmIdxScansLock: */
+	/// Map[ table -> set of index scans ]
+	struct HTAB * IndexScanMap;
+	slock_t free_idxscan_stats_lock;
+	dlist_head free_idxscan_stats;
+
 
 	/* Debugging: track time required for eviction */
 #if defined(PBM_TRACK_EVICTION_TIME)
@@ -492,6 +541,7 @@ static inline void bg_unlock_buffers(BlockGroupData * bg) {
 
 // debugging
 // ### clean this up eventually
+void debug_print_idxscan_data(void);
 void debug_log_scan_map(void);
 void debug_log_blockgroup_map(void);
 #if PBM_TRACK_BLOCKGROUP_BUFFERS

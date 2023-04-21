@@ -57,3 +57,4 @@ PbmScansLock                        48
 PbmBlocksLock                       49
 PbmPqBucketsLock                    50
 PbmEvictionLock                     51
+PbmIdxScansLock                     52

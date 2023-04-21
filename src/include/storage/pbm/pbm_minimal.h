@@ -52,7 +52,10 @@ struct PBM_LocalBitmapScanState {
 };
 
 struct PBM_IndexScanState {
+	bool is_registered; /* 0-initialized to false */
 	ScanId id;
+
+	struct IndexScanStatsEntry * stats;
 	// TODO PBM other fields...
 };
 

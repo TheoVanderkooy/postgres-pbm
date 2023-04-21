@@ -193,6 +193,7 @@ typedef enum BuiltinTrancheIds
 	// ### not used currently, use for partitioning pbm->BlockGroupsMap (like LWTRANCHE_BUFFER_MAPPING)
 	LWTRANCHE_PBM_BLOCK_GROUP_MAPPING,
 	LWTRANCHE_PBM_PQ_BUCKET, // only used if `PBM_PQ_BUCKETS_USE_SPINLOCK` is defined
+	LWTRANCH_PBM_IDXSCAN,
 
 	LWTRANCHE_FIRST_USER_DEFINED
 }			BuiltinTrancheIds;
