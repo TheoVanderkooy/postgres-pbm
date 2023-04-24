@@ -182,6 +182,8 @@ static const char *const BuiltinTrancheNames[] = {
 	"PbmBlockGroupMapping",
 	/* LWTRANCHE_PBM_PQ_BUCKET */
 	"PbmPqBucket",
+	/* LWTRANCH_PBM_IDXSCAN */
+	"PbmIndexScanStats",
 };
 
 StaticAssertDecl(lengthof(BuiltinTrancheNames) ==

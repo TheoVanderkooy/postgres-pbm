@@ -1041,9 +1041,12 @@ void PBM_RegisterIndexScan(struct IndexScanState * scan) {
 	scan->pbm_state.is_registered = true;
 
 #if defined(TRACE_PBM_REGISTER_INDEX)
-	elog(WARNING, "PBM_RegisterIndexScan(%lu) rel=%u"
-		, id, scan->ss.ss_currentRelation->rd_node.relNode
-	);
+	if (scan->pbm_state.id < 100 || scan->pbm_state.id % 50000 == 0)
+	{
+		elog(WARNING, "PBM_RegisterIndexScan(%lu) rel=%u",
+			 id, scan->ss.ss_currentRelation->rd_node.relNode
+		);
+	}
 #endif /* TRACE_PBM_REGISTER_INDEX */
 
 	/* Allocate struct for stats for this scan */
@@ -1053,6 +1056,7 @@ void PBM_RegisterIndexScan(struct IndexScanState * scan) {
 
 	/* Store the stats in the map */
 	entry = search_or_create_idxscan_entry(rel_key);
+	stats->hash_entry = entry;
 //	SpinLockAcquire(&entry->slock);
 	LOCK_GUARD_V2(&entry->lock, LW_EXCLUSIVE) {
 		dlist_push_head(&entry->dlist, &stats->dlist);
@@ -1076,15 +1080,20 @@ void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
 	}
 
 #if defined(TRACE_PBM_REGISTER_INDEX)
-	elog(WARNING, "PBM_UnregisterIndexScan(%lu)"
-		 , scan->pbm_state.id
-	 );
+	if (scan->pbm_state.id < 100 || scan->pbm_state.id % 50000 == 0)
+	{
+		elog(WARNING, "PBM_UnregisterIndexScan(%lu)",
+			 scan->pbm_state.id
+		);
+	}
 #endif /* TRACE_PBM_REGISTER_INDEX */
 
 	Assert(NULL != scan->pbm_state.stats);
 
 	/* Remove the stats from the scan and free the entry */
-	dlist_delete(&scan->pbm_state.stats->dlist);
+	LOCK_GUARD_V2(&scan->pbm_state.stats->hash_entry->lock, LW_EXCLUSIVE) {
+		dlist_delete(&scan->pbm_state.stats->dlist);
+	}
 	free_idxscan_stats(scan->pbm_state.stats);
 
 
