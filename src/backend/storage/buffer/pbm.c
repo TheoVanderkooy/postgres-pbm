@@ -1835,15 +1835,26 @@ static inline IndexScanHashEntry * search_or_create_idxscan_entry(const RelFileN
 	IndexScanHashEntry * entry;
 	bool found;
 
-	LOCK_GUARD_V2(PbmIdxScansLock, LW_EXCLUSIVE) {
-		entry = hash_search(pbm->IndexScanMap, rel, HASH_ENTER, &found);
+	/* Pre-compute the hash since we may do 2 lookups */
+	uint32 key_hash = get_hash_value(pbm->IndexScanMap, rel);
 
-		/* Initialise the entry if not found */
-		if (!found) {
-			dlist_init(&entry->dlist);
-			LWLockInitialize(&entry->lock, LWTRANCH_PBM_IDXSCAN);
-//			SpinLockInit(&entry->slock);
-			// TODO initialize other fields?
+	/* Will be found most of the time, so avoid taking exclusive locks */
+	LOCK_GUARD_V2(PbmIdxScansLock, LW_SHARED) {
+		entry = hash_search_with_hash_value(pbm->IndexScanMap, rel, key_hash, HASH_FIND, &found);
+	}
+
+	/* Create the entry if if wasn't found */
+	if (!found) {
+		LOCK_GUARD_V2(PbmIdxScansLock, LW_EXCLUSIVE) {
+			entry = hash_search_with_hash_value(pbm->IndexScanMap, rel, key_hash, HASH_ENTER, &found);
+
+			/* Initialise the entry if not found */
+			if (!found) {
+				dlist_init(&entry->dlist);
+				LWLockInitialize(&entry->lock, LWTRANCH_PBM_IDXSCAN);
+				// SpinLockInit(&entry->slock);
+				// TODO initialize other fields?
+			}
 		}
 	}
 
