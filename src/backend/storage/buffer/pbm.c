@@ -1028,7 +1028,6 @@ void PbmNewBuffer(BufferDesc * const buf) {
 
 	// There must be a group -- either it already existed or we created it.
 	Assert(group != NULL);
-	Assert(group->buffers_head == buf->buf_id);
 
 #ifdef SANITY_PBM_BUFFERS
 	sanity_check_verify_block_group_buffers(buf);
