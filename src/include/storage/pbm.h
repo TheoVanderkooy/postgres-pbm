@@ -29,6 +29,8 @@ struct HeapScanDescData;
 struct ParallelBlockTableScanDescData;
 struct ParallelContext;
 struct IndexScanState;
+struct IndexScanDescData;
+struct ParallelIndexScanDescData;
 
 
 /* ===== TYPES DEFINITIONS ===== */
@@ -69,9 +71,9 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *sc
 
 /* ===== INDEX SCAN METHODS ===== */
 
-extern void PBM_RegisterIndexScan(struct IndexScanState * scan);
+extern void PBM_RegisterIndexScan(struct IndexScanState * scan, struct ParallelIndexScanDescData * pscan);
 extern void PBM_UnregisterIndexScan(struct IndexScanState * scan);
-extern void PBM_ReportIndexScanPosition(struct IndexScanState * scan/*TODO args, how to report position? */);
+extern void PBM_ReportIndexScanPosition(struct IndexScanDescData * scan);
 
 
 /* ===== BUFFER TRACKING ===== */

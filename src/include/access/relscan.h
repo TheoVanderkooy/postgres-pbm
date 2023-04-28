@@ -178,7 +178,11 @@ typedef struct IndexScanDescData
 	/* parallel index scan information, in shared memory */
 	struct ParallelIndexScanDescData *parallel_scan;
 
-	// TODO PBM fields? (parallel index scans too?)
+	/* PBM fields: scan ID and statistics */
+#ifdef USE_PBM
+//	struct PBM_IndexScanState pbm_state;
+	struct IndexScanStatsEntry * pbm_stats;
+#endif /* USE_PBM */
 }			IndexScanDescData;
 
 /* Generic structure for parallel scans */
@@ -186,6 +190,9 @@ typedef struct ParallelIndexScanDescData
 {
 	Oid			ps_relid;
 	Oid			ps_indexid;
+#ifdef USE_PBM
+	struct IndexScanStatsEntry * pbm_stats;
+#endif /* USE_PBM */
 	Size		ps_offset;		/* Offset in bytes of am specific structure */
 	char		ps_snapshot_data[FLEXIBLE_ARRAY_MEMBER];
 }			ParallelIndexScanDescData;

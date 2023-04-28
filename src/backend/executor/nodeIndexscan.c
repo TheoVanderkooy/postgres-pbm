@@ -117,6 +117,11 @@ IndexNext(IndexScanState *node)
 
 		node->iss_ScanDesc = scandesc;
 
+#ifdef USE_PBM
+		/* Initialize single-thread index scan */
+		PBM_RegisterIndexScan(node, NULL);
+#endif /* USE_PBM */
+
 		/*
 		 * If no run-time keys to calculate or they are ready, go ahead and
 		 * pass the scankeys to the index AM.
@@ -813,6 +818,10 @@ ExecEndIndexScan(IndexScanState *node)
 		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
+#if defined(USE_PBM)
+	PBM_UnregisterIndexScan(node);
+#endif
+
 	/*
 	 * close the index relation (no-op if we didn't open it)
 	 */
@@ -820,10 +829,6 @@ ExecEndIndexScan(IndexScanState *node)
 		index_endscan(indexScanDesc);
 	if (indexRelationDesc)
 		index_close(indexRelationDesc, NoLock);
-
-#if defined(USE_PBM)
-	PBM_UnregisterIndexScan(node);
-#endif
 }
 
 /* ----------------------------------------------------------------
@@ -1088,10 +1093,6 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	{
 		indexstate->iss_RuntimeContext = NULL;
 	}
-
-#if defined(USE_PBM)
-	PBM_RegisterIndexScan(indexstate);
-#endif
 
 	/*
 	 * all done.
@@ -1703,6 +1704,11 @@ ExecIndexScanInitializeDSM(IndexScanState *node,
 								 node->iss_NumOrderByKeys,
 								 piscan);
 
+#ifdef USE_PBM
+	/* Initialize parallel index scan in the leader */
+	PBM_RegisterIndexScan(node, piscan);
+#endif /* USE_PBM */
+
 	/*
 	 * If no run-time keys to calculate or they are ready, go ahead and pass
 	 * the scankeys to the index AM.
@@ -1756,6 +1762,4 @@ ExecIndexScanInitializeWorker(IndexScanState *node,
 		index_rescan(node->iss_ScanDesc,
 					 node->iss_ScanKeys, node->iss_NumScanKeys,
 					 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
-
-	// TODO PBM parallel index scan?
 }

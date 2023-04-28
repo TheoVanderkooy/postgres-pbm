@@ -1485,13 +1485,6 @@ typedef struct IndexScanState
 	bool	   *iss_OrderByTypByVals;
 	int16	   *iss_OrderByTypLens;
 	Size		iss_PscanLen;
-
-	/* PBM fields: scan ID and statistics */
-	struct PBM_IndexScanState pbm_state;
-//	ScanId scanId;
-//	// TODO other fields for stats??
-//	struct PBM_ScanHashEntry * pbmSharedScanData;
-//	struct PBM_LocalBitmapScanState pbmLocalScanData;
 } IndexScanState;
 
 /* ----------------

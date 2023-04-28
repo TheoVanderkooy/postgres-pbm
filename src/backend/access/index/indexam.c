@@ -584,6 +584,10 @@ index_fetch_heap(IndexScanDesc scan, TupleTableSlot *slot)
 	if (found)
 		pgstat_count_heap_fetch(scan->indexRelation);
 
+#ifdef USE_PBM
+	PBM_ReportIndexScanPosition(scan);
+#endif /* USE_PBM */
+
 	/*
 	 * If we scanned a whole HOT chain and found only dead tuples, tell index
 	 * AM to kill its entry for that TID (this will take effect in the next

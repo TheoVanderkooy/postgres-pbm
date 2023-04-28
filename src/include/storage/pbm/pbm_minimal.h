@@ -51,13 +51,4 @@ struct PBM_LocalBitmapScanState {
 	pbm_bg_iterator bg_it;
 };
 
-struct PBM_IndexScanState {
-	bool is_registered; /* 0-initialized to false */
-	ScanId id;
-
-	struct IndexScanStatsEntry * stats;
-	// TODO PBM other fields...
-};
-
-
 #endif //POSTGRESQL_PBM_MINIMAL_H

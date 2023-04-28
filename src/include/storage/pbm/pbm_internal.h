@@ -103,9 +103,10 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 //#define TRACE_PBM_REPORT_PROGRESS
 //#define TRACE_PBM_REPORT_PROGRESS_VERBOSE
 //#define TRACE_PBM_BITMAP_PROGRESS
+#define TRACE_PBM_INDEX_PROGRESS
 //#define TRACE_PBM_PRINT_SCANMAP
 //#define TRACE_PBM_PRINT_BLOCKGROUPMAP
-#define TRACE_PBM_PRINT_IDXSCANMAP
+//#define TRACE_PBM_PRINT_IDXSCANMAP
 //#define TRACE_PBM_BUFFERS
 //#define TRACE_PBM_BUFFERS_NEW
 //#define TRACE_PBM_BUFFERS_EVICT
@@ -280,12 +281,15 @@ typedef struct BlockGroupHashEntry {
 typedef struct IndexScanStatsEntry {
 	ScanId id;
 
+	_Atomic(int) dbg_times_reported;
+
 	// TODO what fields?
 	// TODO make atomic?
 	float est_speed; /* tuples / second? */
 
-	/* List entry */
+	/* List entry + the list entry it is in. Protected by the entry's lock */
 	dlist_node dlist;
+	struct IndexScanHashEntry * hash_entry;
 
 	// TODO array (of whatever size) of counts
 	uint16 counts[PBM_INDEX_SCAN_NUM_COUNTS];

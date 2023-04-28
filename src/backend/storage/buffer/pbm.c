@@ -9,6 +9,7 @@
 #include "storage/pbm/pbm_internal.h"
 
 /* Other files */
+#include "access/relscan.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
@@ -1028,7 +1029,7 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *co
 /*
  * Register an index scan.
  */
-void PBM_RegisterIndexScan(struct IndexScanState * scan) {
+void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScanDescData *pscan) {
 	ScanId id;
 	RelFileNode * rel_key = &scan->ss.ss_currentRelation->rd_node;
 	IndexScanHashEntry * entry;
@@ -1037,11 +1038,9 @@ void PBM_RegisterIndexScan(struct IndexScanState * scan) {
 	/* Allocate scan ID */
 	// ### could get rid of scan IDs entirely, but helpful for debugging...
 	id = (pbm->next_id++);
-	scan->pbm_state.id = id;
-	scan->pbm_state.is_registered = true;
 
 #if defined(TRACE_PBM_REGISTER_INDEX)
-	if (scan->pbm_state.id < 100 || scan->pbm_state.id % 50000 == 0)
+	if (id < 100 || id % 5000 == 0)
 	{
 		elog(WARNING, "PBM_RegisterIndexScan(%lu) rel=%u",
 			 id, scan->ss.ss_currentRelation->rd_node.relNode
@@ -1052,7 +1051,10 @@ void PBM_RegisterIndexScan(struct IndexScanState * scan) {
 	/* Allocate struct for stats for this scan */
 	stats = alloc_idxscan_stats();
 	stats->id = id;
-	scan->pbm_state.stats = stats;
+	scan->iss_ScanDesc->pbm_stats = stats;
+	if (NULL != pscan) {
+		pscan->pbm_stats = stats;
+	}
 
 	/* Store the stats in the map */
 	entry = search_or_create_idxscan_entry(rel_key);
@@ -1074,27 +1076,37 @@ void PBM_RegisterIndexScan(struct IndexScanState * scan) {
 }
 
 void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
-	/* ID 0 means the scan wasn't registered, so nothing to unregister */
-	if (!scan->pbm_state.is_registered) {
+	struct IndexScanDescData * scandesc;
+	struct IndexScanStatsEntry * pbm_stats;
+
+
+	/* Not registered if no scan descriptor */
+	scandesc = scan->iss_ScanDesc;
+	if (NULL == scandesc) {
+		return;
+	}
+
+	/* For parallel scans, only the leader should unregister -- if it has stats
+	 * in scandesc, not just parallel state. (non-parallel only has it in scandesc) */
+	pbm_stats = scandesc->pbm_stats;
+	if (NULL == pbm_stats) {
 		return;
 	}
 
 #if defined(TRACE_PBM_REGISTER_INDEX)
-	if (scan->pbm_state.id < 100 || scan->pbm_state.id % 50000 == 0)
+	if (pbm_stats->id < 100 || pbm_stats->id % 5000 == 0)
 	{
 		elog(WARNING, "PBM_UnregisterIndexScan(%lu)",
-			 scan->pbm_state.id
+			 pbm_stats->id
 		);
 	}
 #endif /* TRACE_PBM_REGISTER_INDEX */
 
-	Assert(NULL != scan->pbm_state.stats);
-
 	/* Remove the stats from the scan and free the entry */
-	LOCK_GUARD_V2(&scan->pbm_state.stats->hash_entry->lock, LW_EXCLUSIVE) {
-		dlist_delete(&scan->pbm_state.stats->dlist);
+	LOCK_GUARD_V2(&pbm_stats->hash_entry->lock, LW_EXCLUSIVE) {
+		dlist_delete(&pbm_stats->dlist);
 	}
-	free_idxscan_stats(scan->pbm_state.stats);
+	free_idxscan_stats(pbm_stats);
 
 
 #ifdef TRACE_PBM_PRINT_IDXSCANMAP
@@ -1102,10 +1114,35 @@ void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
 #endif // TRACE_PBM_PRINT_IDXSCANMAP
 }
 
-void PBM_ReportIndexScanPosition(struct IndexScanState * scan /*TODO other args?*/) {
-	elog(WARNING, "PBM_ReportIndexScanPosition(%lu)"
-		 ,scan->pbm_state.id
-	 );
+void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
+	IndexScanStatsEntry * pbm_stats;
+	bool parallel;
+
+	if (NULL != scandesc->parallel_scan && NULL != scandesc->parallel_scan->pbm_stats) {
+		/* Registered parallel scan */
+		pbm_stats = scandesc->parallel_scan->pbm_stats;
+		parallel = true;
+	} else if (NULL != scandesc->pbm_stats) {
+		/* Registered non-parallel scan */
+		pbm_stats = scandesc->pbm_stats;
+		parallel = false;
+	} else {
+		/* Otherwise, not registered at all */
+		return;
+	}
+
+	Assert(NULL != pbm_stats);
+
+#if defined(TRACE_PBM_INDEX_PROGRESS)
+	if (pbm_stats->dbg_times_reported < 40 || pbm_stats->dbg_times_reported % 10000 == 0) {
+		elog(WARNING, "PBM_ReportIndexScanPosition(%lu) report time %d parallel? %s",
+			 pbm_stats->id, pbm_stats->dbg_times_reported, parallel ? "yes" : "no"
+		);
+	}
+#endif /* TRACE_PBM_INDEX_PROGRESS */
+
+
+	pbm_stats->dbg_times_reported += 1;
 
 }
 
@@ -1742,6 +1779,7 @@ static inline IndexScanStatsEntry * alloc_idxscan_stats(void) {
 
 	/* Zero stats */
 	memset(&stats->counts, 0, sizeof(stats->counts));
+	stats->dbg_times_reported = 0;
 	// TODO other stats?
 
 	return stats;
