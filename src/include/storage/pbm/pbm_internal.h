@@ -299,14 +299,6 @@ typedef struct IndexScanStatsEntry {
 typedef struct IndexScanHashEntry {
 	RelFileNode key;
 
-	// TODO! value fields
-	/*
-	 * TODO:
-	 *  - local lock
-	 *  - dlist_head of scan stats for this relation
-	 *  - ... # of scans? what else?
-	 */
-//	slock_t slock; // TODO spin lock or LWLock?
 	LWLock lock;
 	dlist_head dlist;
 } IndexScanHashEntry;

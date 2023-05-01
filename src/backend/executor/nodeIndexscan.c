@@ -594,7 +594,9 @@ ExecReScanIndexScan(IndexScanState *node)
 					 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
 	node->iss_ReachedEnd = false;
 
-	// TODO PBM -- can probably ignore this but might be useful to count it?
+#ifdef USE_PBM
+	PBM_ReportIndexScanRescan(node);
+#endif
 
 	ExecScanReScan(&node->ss);
 }

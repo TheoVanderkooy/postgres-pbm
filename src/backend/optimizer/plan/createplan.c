@@ -5320,6 +5320,7 @@ copy_generic_path_info(Plan *dest, Path *src)
 	dest->startup_cost = src->startup_cost;
 	dest->total_cost = src->total_cost;
 	dest->plan_rows = src->rows;
+	dest->plan_loops = src->loops;
 	dest->plan_width = src->pathtarget->width;
 	dest->parallel_aware = src->parallel_aware;
 	dest->parallel_safe = src->parallel_safe;

@@ -121,6 +121,7 @@ typedef struct Plan
 	 * planner's estimate of result size of this plan step
 	 */
 	double		plan_rows;		/* number of rows plan is expected to emit */
+	double		plan_loops;		/* number of loops expected */ /* PBM for now: only valid for index scans */
 	int			plan_width;		/* average row width in bytes */
 
 	/*

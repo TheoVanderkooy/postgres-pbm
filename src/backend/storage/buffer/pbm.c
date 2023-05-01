@@ -1035,15 +1035,19 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	IndexScanHashEntry * entry;
 	IndexScanStatsEntry * stats;
 
+// TODO PBM: decide whether to register or not! if expected # of rows is too low...
+
 	/* Allocate scan ID */
 	// ### could get rid of scan IDs entirely, but helpful for debugging...
 	id = (pbm->next_id++);
 
 #if defined(TRACE_PBM_REGISTER_INDEX)
-	if (id < 100 || id % 5000 == 0)
+	if (id < 500 || id % 5000 == 0)
 	{
-		elog(WARNING, "PBM_RegisterIndexScan(%lu) rel=%u",
-			 id, scan->ss.ss_currentRelation->rd_node.relNode
+		elog(WARNING, "PBM_RegisterIndexScan(%lu) rel=%u   "
+					  "plan_rows=%f loops=%f"
+			 , id, scan->ss.ss_currentRelation->rd_node.relNode
+			 , scan->ss.ps.plan->plan_rows, scan->ss.ps.plan->plan_loops
 		);
 	}
 #endif /* TRACE_PBM_REGISTER_INDEX */
@@ -1059,11 +1063,9 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	/* Store the stats in the map */
 	entry = search_or_create_idxscan_entry(rel_key);
 	stats->hash_entry = entry;
-//	SpinLockAcquire(&entry->slock);
 	LOCK_GUARD_V2(&entry->lock, LW_EXCLUSIVE) {
 		dlist_push_head(&entry->dlist, &stats->dlist);
 	}
-//	SpinLockRelease(&entry->slock);
 
 	/*
 	 * TODO PBM:
@@ -1071,14 +1073,13 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	 *  	- check `scan->ss->ps` for what we want
 	 *  	- may need to check the parent for how many loops are expected? (hopefully not)
 	 *  	- expected # of tuples
-	 *  - decide to not register if the scan is too short
+	 *  - decide to not register if the scan is too short!
 	 */
 }
 
 void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
 	struct IndexScanDescData * scandesc;
 	struct IndexScanStatsEntry * pbm_stats;
-
 
 	/* Not registered if no scan descriptor */
 	scandesc = scan->iss_ScanDesc;
@@ -1107,7 +1108,6 @@ void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
 		dlist_delete(&pbm_stats->dlist);
 	}
 	free_idxscan_stats(pbm_stats);
-
 
 #ifdef TRACE_PBM_PRINT_IDXSCANMAP
 	debug_print_idxscan_data();
@@ -1144,8 +1144,42 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 
 	pbm_stats->dbg_times_reported += 1;
 
+	/*
+	 * TODO:
+	 *  - record relevant statistics?
+	 *  - ...
+	 */
+
 }
 
+// TODO remove this? debugging only...
+void PBM_ReportIndexScanRescan(struct IndexScanState * scan) {
+	IndexScanStatsEntry * pbm_stats;
+	IndexScanDescData * scandesc = scan->iss_ScanDesc;
+
+	/* Not registered */
+	if (NULL == scandesc) return;
+
+	if (NULL != scandesc->parallel_scan && NULL != scandesc->parallel_scan->pbm_stats) {
+		/* Registered parallel scan */
+		pbm_stats = scandesc->parallel_scan->pbm_stats;
+	} else if (NULL != scandesc->pbm_stats) {
+		/* Registered non-parallel scan */
+		pbm_stats = scandesc->pbm_stats;
+	} else {
+		/* Otherwise, not registered at all */
+		return;
+	}
+
+	Assert(NULL != pbm_stats);
+#if defined(TRACE_PBM_INDEX_PROGRESS)
+	if (pbm_stats->dbg_times_reported < 1000 || pbm_stats->dbg_times_reported % 10000 == 0) {
+		elog(WARNING, "PBM_ReportIndexScanRescan(%lu) report time %d",
+			 pbm_stats->id, pbm_stats->dbg_times_reported
+		);
+	}
+#endif /* TRACE_PBM_INDEX_PROGRESS */
+}
 
 
 

@@ -74,6 +74,8 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *sc
 extern void PBM_RegisterIndexScan(struct IndexScanState * scan, struct ParallelIndexScanDescData * pscan);
 extern void PBM_UnregisterIndexScan(struct IndexScanState * scan);
 extern void PBM_ReportIndexScanPosition(struct IndexScanDescData * scan);
+// ### remove checking rescan? doesn't actually need to do anything...
+extern void PBM_ReportIndexScanRescan(struct IndexScanState * scan);
 
 
 /* ===== BUFFER TRACKING ===== */

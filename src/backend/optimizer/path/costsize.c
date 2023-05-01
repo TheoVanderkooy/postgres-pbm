@@ -570,6 +570,10 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 	path->indextotalcost = indexTotalCost;
 	path->indexselectivity = indexSelectivity;
 
+	/* PBM: save loop count estimate to know whether to register the index scan
+	 * or not. For now this is only for index scans. */
+	path->path.loops = loop_count;
+
 	/* all costs for touching index itself included here */
 	startup_cost += indexStartupCost;
 	run_cost += indexTotalCost - indexStartupCost;
