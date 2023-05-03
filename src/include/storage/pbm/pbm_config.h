@@ -60,6 +60,10 @@
 /* Whether to evict multiple at once with sampling-based PBM */
 #define PBM_SAMPLING_EVICT_MULTI
 
+/* Minimum number of average accesses per block to track an index scan */
+#define PBM_IDX_MIN_BLOCK_ACCESSES 1.0f
+
+
 /* Track average eviction time and periodically log it. */
 //#define PBM_TRACK_EVICTION_TIME
 

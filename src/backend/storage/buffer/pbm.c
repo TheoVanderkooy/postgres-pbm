@@ -187,6 +187,7 @@ void InitPBM(void) {
 	SpinLockInit(&pbm->scan_free_list_lock);
 	slist_init(&pbm->bg_scan_free_list);
 	pbm->initial_est_speed = 0.0001f;
+	pbm->initial_est_idx_speed = 0.001f;
 // ### what should be initial-initial speed estimate lol
 // ### need to adjust it for units...
 
@@ -1034,20 +1035,54 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	RelFileNode * rel_key = &scan->ss.ss_currentRelation->rd_node;
 	IndexScanHashEntry * entry;
 	IndexScanStatsEntry * stats;
+	const double rows = scan->ss.ps.plan->plan_rows;
+	const double loops = scan->ss.ps.plan->plan_loops;
+	const double exp_accesses = rows * loops;
+	double accesses_per_block;
+	BlockNumber nblocks;
 
-// TODO PBM: decide whether to register or not! if expected # of rows is too low...
+	/* Don't register an index scan with very few accesses - not worth the extra cost */
+	if (exp_accesses < 100) {
+#if defined(TRACE_PBM_REGISTER_INDEX)
+		if (pbm->next_id < 100) {
+			elog(WARNING, "PBM_RegisterIndexScan(--) not registering, too few accesses: rel=%u   "
+						  "plan_rows=%f loops=%f"
+				, scan->ss.ss_currentRelation->rd_node.relNode
+				, scan->ss.ps.plan->plan_rows, scan->ss.ps.plan->plan_loops
+			);
+		}
+#endif /* TRACE_PBM_REGISTER_INDEX */
+		return;
+	}
+
+	/* Also don't register if each block will be accessed too few times - harder
+	 * to be certain whether a block will be accessed again or not */
+	nblocks = RelationGetNumberOfBlocks(scan->iss_RelationDesc);
+	accesses_per_block = exp_accesses / nblocks;
+
+	if (accesses_per_block < PBM_IDX_MIN_BLOCK_ACCESSES) {
+#if defined(TRACE_PBM_REGISTER_INDEX)
+		if (pbm->next_id < 100) {
+			elog(WARNING, "PBM_RegisterIndexScan(--) not registering: rel=%u   "
+						  "plan_rows=%f loops=%f blocks=%u"
+				, scan->ss.ss_currentRelation->rd_node.relNode
+				, scan->ss.ps.plan->plan_rows, scan->ss.ps.plan->plan_loops, nblocks
+			);
+		}
+#endif /* TRACE_PBM_REGISTER_INDEX */
+	}
 
 	/* Allocate scan ID */
 	// ### could get rid of scan IDs entirely, but helpful for debugging...
 	id = (pbm->next_id++);
 
 #if defined(TRACE_PBM_REGISTER_INDEX)
-	if (id < 500 || id % 5000 == 0)
+	if (id < 200 || id % 5000 == 0)
 	{
 		elog(WARNING, "PBM_RegisterIndexScan(%lu) rel=%u   "
-					  "plan_rows=%f loops=%f"
+					  "plan_rows=%f loops=%f blocks=%u"
 			 , id, scan->ss.ss_currentRelation->rd_node.relNode
-			 , scan->ss.ps.plan->plan_rows, scan->ss.ps.plan->plan_loops
+			 , scan->ss.ps.plan->plan_rows, scan->ss.ps.plan->plan_loops, nblocks
 		);
 	}
 #endif /* TRACE_PBM_REGISTER_INDEX */
@@ -1055,6 +1090,17 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	/* Allocate struct for stats for this scan */
 	stats = alloc_idxscan_stats();
 	stats->id = id;
+	stats->plan_loops = rows;
+	stats->plan_loops = loops;
+	stats->nblocks = nblocks;
+	stats->accesses_per_block = accesses_per_block;
+	/* Initial stat estimates */
+	SpinLockInit(&stats->stats_lock);
+	stats->last_stats_update_count = 0;
+	stats->est_speed = pbm->initial_est_idx_speed;
+	stats->last_stats_update_t = get_time_ns();
+
+	/* Attach to the scan */
 	scan->iss_ScanDesc->pbm_stats = stats;
 	if (NULL != pscan) {
 		pscan->pbm_stats = stats;
@@ -1066,15 +1112,6 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	LOCK_GUARD_V2(&entry->lock, LW_EXCLUSIVE) {
 		dlist_push_head(&entry->dlist, &stats->dlist);
 	}
-
-	/*
-	 * TODO PBM:
-	 *  - copy over certain estimates from the query plan
-	 *  	- check `scan->ss->ps` for what we want
-	 *  	- may need to check the parent for how many loops are expected? (hopefully not)
-	 *  	- expected # of tuples
-	 *  - decide to not register if the scan is too short!
-	 */
 }
 
 void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
@@ -1097,11 +1134,21 @@ void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
 #if defined(TRACE_PBM_REGISTER_INDEX)
 	if (pbm_stats->id < 100 || pbm_stats->id % 5000 == 0)
 	{
-		elog(WARNING, "PBM_UnregisterIndexScan(%lu)",
-			 pbm_stats->id
+		elog(WARNING, "PBM_UnregisterIndexScan(%lu), global_speed=%f",
+			 pbm_stats->id, pbm->initial_est_idx_speed
 		);
 	}
 #endif /* TRACE_PBM_REGISTER_INDEX */
+
+	/* Update global speed estimate */
+/* ### technically is a race condition and could loose updates if two scans end
+ * at exactly the same time (from different threads!) but it is only an estimate
+ * so we don't care. */
+	{
+		const double alpha = 0.85;
+		double old_est = pbm->initial_est_idx_speed;
+		pbm->initial_est_idx_speed = old_est * alpha + pbm_stats->est_speed * (1.f - alpha);
+	}
 
 	/* Remove the stats from the scan and free the entry */
 	LOCK_GUARD_V2(&pbm_stats->hash_entry->lock, LW_EXCLUSIVE) {
@@ -1116,7 +1163,9 @@ void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
 
 void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 	IndexScanStatsEntry * pbm_stats;
-	bool parallel;
+	bool parallel; // TODO is this needed?
+	BlockNumber blk;
+	BlockNumber cur_cnt;
 
 	if (NULL != scandesc->parallel_scan && NULL != scandesc->parallel_scan->pbm_stats) {
 		/* Registered parallel scan */
@@ -1131,25 +1180,45 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 		return;
 	}
 
+	// TODO move stuff to pbm_inline.h maybe?
+
 	Assert(NULL != pbm_stats);
+
+	blk = ItemPointerGetBlockNumber(&scandesc->xs_heaptid);
 
 #if defined(TRACE_PBM_INDEX_PROGRESS)
 	if (pbm_stats->dbg_times_reported < 40 || pbm_stats->dbg_times_reported % 10000 == 0) {
-		elog(WARNING, "PBM_ReportIndexScanPosition(%lu) report time %d parallel? %s",
-			 pbm_stats->id, pbm_stats->dbg_times_reported, parallel ? "yes" : "no"
+		elog(WARNING, "PBM_ReportIndexScanPosition(%lu) report time %d @ blk %u, speed=%f",
+			 pbm_stats->id, pbm_stats->dbg_times_reported, blk, pbm_stats->est_speed
 		);
 	}
 #endif /* TRACE_PBM_INDEX_PROGRESS */
 
+	/* Update scan stats */
 
+// TODO remove "times reported"?
 	pbm_stats->dbg_times_reported += 1;
 
-	/*
-	 * TODO:
-	 *  - record relevant statistics?
-	 *  - ...
-	 */
+	cur_cnt = (pbm_stats->total_count += 1);
+	pbm_stats->counts[blk % PBM_INDEX_SCAN_NUM_COUNTS] += 1;
 
+	/* Update speed estimate if appropriate */
+	if (cur_cnt % 100 == 0 || cur_cnt == 10) {
+		unsigned long t, t_elapsed;
+		uint64 tuples_elapsed;
+		SpinLockAcquire(&pbm_stats->stats_lock);
+		if (cur_cnt > pbm_stats->last_stats_update_count) {
+			t = get_time_ns();
+			t_elapsed = (t - pbm_stats->last_stats_update_t);
+
+			tuples_elapsed = (cur_cnt - pbm_stats->last_stats_update_count);
+
+			pbm_stats->est_speed = (double) (tuples_elapsed) / (double) (t_elapsed);
+			pbm_stats->last_stats_update_count = cur_cnt;
+			pbm_stats->last_stats_update_t = t;
+		}
+		SpinLockRelease(&pbm_stats->stats_lock);
+	}
 }
 
 // TODO remove this? debugging only...
@@ -1813,6 +1882,7 @@ static inline IndexScanStatsEntry * alloc_idxscan_stats(void) {
 
 	/* Zero stats */
 	memset(&stats->counts, 0, sizeof(stats->counts));
+	stats->total_count = 0;
 	stats->dbg_times_reported = 0;
 	// TODO other stats?
 

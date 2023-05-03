@@ -281,18 +281,28 @@ typedef struct BlockGroupHashEntry {
 typedef struct IndexScanStatsEntry {
 	ScanId id;
 
-	_Atomic(int) dbg_times_reported;
+	/* Planner stats */
+	double plan_rows;
+	double plan_loops;
+	BlockNumber nblocks;
+	double accesses_per_block;
 
-	// TODO what fields?
-	// TODO make atomic?
-	float est_speed; /* tuples / second? */
-
-	/* List entry + the list entry it is in. Protected by the entry's lock */
+	/* List entry + the hash entry it is in. Protected by the entry's lock */
 	dlist_node dlist;
 	struct IndexScanHashEntry * hash_entry;
 
-	// TODO array (of whatever size) of counts
-	uint16 counts[PBM_INDEX_SCAN_NUM_COUNTS];
+	/* Runtime stats */
+	_Atomic(int) dbg_times_reported; /* TODO remove, debugging */
+//	volatile _Atomic(SharedScanStats) stats;
+	_Atomic(uint64) total_count;
+
+	/* These stats updated atomically */
+	slock_t stats_lock;
+	double est_speed;
+	unsigned long last_stats_update_t;
+	uint64 last_stats_update_count;
+
+	_Atomic(uint16) counts[PBM_INDEX_SCAN_NUM_COUNTS];
 } IndexScanStatsEntry;
 
 /* Entry in Index scan map */
@@ -423,6 +433,8 @@ typedef struct PbmShared {
 	struct HTAB * IndexScanMap;
 	slock_t free_idxscan_stats_lock;
 	dlist_head free_idxscan_stats;
+	/// Global estimate of speed for *new* index scans
+	_Atomic(float) initial_est_idx_speed;
 
 
 	/* Debugging: track time required for eviction */
