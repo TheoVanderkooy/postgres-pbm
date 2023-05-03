@@ -18,6 +18,7 @@ extern int pbm_evict_num_victims;
 extern double pbm_bg_naest_max_age_s;  /* not actually used except by GUC */
 extern unsigned long pbm_bg_naest_max_age_ns;
 extern bool pbm_evict_whole_group;
+extern bool pbm_evict_use_freq;
 
 
 /* ===== FORWARD DECLARATIONS (sorted) ===== */
