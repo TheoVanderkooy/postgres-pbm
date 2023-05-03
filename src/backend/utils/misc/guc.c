@@ -2121,6 +2121,16 @@ static struct config_bool ConfigureNamesBool[] =
 		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
 	},
 
+	{
+		.gen = {
+			.name = "pbm_evict_use_freq", .context = PGC_SUSET, .group = RESOURCES_MEM,
+			.short_desc = gettext_noop("Whether consider frequency stats for PBM"),
+		},
+		.variable = &pbm_evict_use_freq,
+		.boot_val = true,
+		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL

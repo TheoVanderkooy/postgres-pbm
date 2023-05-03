@@ -38,6 +38,7 @@ int pbm_evict_num_victims;
 double pbm_bg_naest_max_age_s;
 unsigned long pbm_bg_naest_max_age_ns;
 bool pbm_evict_whole_group;
+bool pbm_evict_use_freq;
 
 
 /*-------------------------------------------------------------------------
@@ -2333,6 +2334,10 @@ uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_acc
 
 	SpinLockRelease(&stats->slock);
 #endif /* PBM_BUFFER_STATS_MODE */
+
+	/* Ignore the stats if it is disabled */
+	if (!pbm_evict_use_freq) num_accesses = 0;
+
 	*n_accesses = num_accesses;
 
 	/* It is possible we haven't accessed the buffer enough to estimate the
@@ -2554,7 +2559,7 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 			} else if (requested) {
 				/* Ignore inter-access time if we only have one access so far */
 				next_access = bg_next_consumption;
-			} else if (naccesses > 1) {
+			} else if (naccesses > 1 && pbm_evict_use_freq) {
 				/* If not requested, use the inter-access time.
 				 * Also lie about being requested to prevent it getting used
 				 * immediately in the next block.*/
