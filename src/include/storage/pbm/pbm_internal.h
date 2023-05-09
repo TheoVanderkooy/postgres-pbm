@@ -293,8 +293,9 @@ typedef struct IndexScanStatsEntry {
 	struct IndexScanHashEntry * hash_entry;
 
 	/* Runtime stats */
-	_Atomic(int) dbg_times_reported; /* TODO remove, debugging */
-//	volatile _Atomic(SharedScanStats) stats;
+#if defined(TRACE_PBM_INDEX_PROGRESS)
+	_Atomic(int) dbg_times_reported;
+#endif /* TRACE_PBM_INDEX_PROGRESS */
 	_Atomic(uint64) total_count;
 
 	/* These stats updated atomically */

@@ -1719,8 +1719,6 @@ ExecIndexScanInitializeDSM(IndexScanState *node,
 		index_rescan(node->iss_ScanDesc,
 					 node->iss_ScanKeys, node->iss_NumScanKeys,
 					 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
-
-	// TODO PBM?? parallel index scan??
 }
 
 /* ----------------------------------------------------------------

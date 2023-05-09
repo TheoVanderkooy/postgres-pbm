@@ -2131,6 +2131,16 @@ static struct config_bool ConfigureNamesBool[] =
 		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
 	},
 
+	{
+		.gen = {
+			.name = "pbm_evict_use_idx_scan", .context = PGC_POSTMASTER, .group = RESOURCES_MEM,
+			.short_desc = gettext_noop("Whether to use index scan stats for PBM"),
+		},
+		.variable = &pbm_evict_use_idx_scan,
+		.boot_val = true,
+		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL

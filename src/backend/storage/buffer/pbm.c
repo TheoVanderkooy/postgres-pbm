@@ -40,6 +40,7 @@ double pbm_bg_naest_max_age_s;
 unsigned long pbm_bg_naest_max_age_ns;
 bool pbm_evict_whole_group;
 bool pbm_evict_use_freq;
+bool pbm_evict_use_idx_scan;
 
 
 /*-------------------------------------------------------------------------
@@ -115,6 +116,7 @@ static inline void RemoveBufFromBlockGroup(BufferDesc * buf);
 static inline unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem * bg_scan);
 
 static unsigned long BlockGroupTimeToNextConsumption(BlockGroupData * bgdata, bool * requestedPtr, unsigned long now);
+static inline double idx_scan_est_lambda(uint64 blk_idx, const IndexScanStatsEntry * stats_entry);
 static unsigned long BlockPageTimeToNextIndexAccess(BufferDesc * buf, bool * requested);
 
 // removing scans from block groups
@@ -231,17 +233,19 @@ void InitPBM(void) {
 	}
 
 	/* Initialize index scan map */
-	hash_info = (HASHCTL) {
-		.keysize = sizeof(RelFileNode),
-		.entrysize = sizeof(IndexScanHashEntry),
-	};
-	hash_flags = HASH_ELEM | HASH_BLOBS;
-	pbm->IndexScanMap = ShmemInitHash("PBM index scan stats", 1024, IndexScanMapMaxSize, &hash_info, hash_flags);
+	if (pbm_evict_use_idx_scan) {
+		hash_info = (HASHCTL) {
+				.keysize = sizeof(RelFileNode),
+				.entrysize = sizeof(IndexScanHashEntry),
+		};
+		hash_flags = HASH_ELEM | HASH_BLOBS;
+		pbm->IndexScanMap = ShmemInitHash("PBM index scan stats", 1024, IndexScanMapMaxSize, &hash_info, hash_flags);
 
-	dlist_init(&pbm->free_idxscan_stats);
-	SpinLockInit(&pbm->free_idxscan_stats_lock);
-
-	// TODO the actual index scan stat structs!
+		dlist_init(&pbm->free_idxscan_stats);
+		SpinLockInit(&pbm->free_idxscan_stats_lock);
+	} else {
+		pbm->IndexScanMap = NULL;
+	}
 }
 
 /*
@@ -252,7 +256,9 @@ Size PbmShmemSize(void) {
 	size = add_size(size, sizeof(PbmShared));
 	size = add_size(size, hash_estimate_size(ScanMapMaxSize, sizeof(ScanHashEntry)));
 	size = add_size(size, hash_estimate_size(BlockGroupMapMaxSize, sizeof(BlockGroupHashEntry)));
-	size = add_size(size, hash_estimate_size(IndexScanMapMaxSize, sizeof(IndexScanHashEntry)));
+	if (pbm_evict_use_idx_scan) {
+		size = add_size(size, hash_estimate_size(IndexScanMapMaxSize, sizeof(IndexScanHashEntry)));
+	}
 
 	/*
 	 * Assuming one scan per block in the database on average: (probably an underestimate?)
@@ -267,8 +273,9 @@ Size PbmShmemSize(void) {
 #endif /* PBM_USE_PQ */
 
 	size = add_size(size, NBuffers * sizeof(PbmBufferDescStatsPadded));
-	size = add_size(size, IndexScanNumConcurrent * sizeof(IndexScanStatsEntry));
-	// TODO other index scan related fields?
+	if (pbm_evict_use_idx_scan) {
+		size = add_size(size, IndexScanNumConcurrent * sizeof(IndexScanStatsEntry));
+	}
 
 #if defined(TRACE_PBM) || true
 	{
@@ -1042,8 +1049,9 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	double accesses_per_block;
 	BlockNumber nblocks;
 
-	/* Don't register an index scan with very few accesses - not worth the extra cost */
-	if (exp_accesses < 100) {
+	/* Don't register an index scan with very few accesses - not worth the extra cost
+	 * Also don't register if disabled */
+	if (!pbm_evict_use_idx_scan || exp_accesses < 100) {
 #if defined(TRACE_PBM_REGISTER_INDEX)
 		if (pbm->next_id < 100) {
 			elog(WARNING, "PBM_RegisterIndexScan(--) not registering, too few accesses: rel=%u   "
@@ -1166,7 +1174,7 @@ void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
 }
 
 /*
- * Report progres for an index scan.
+ * Report progress for an index scan.
  */
 void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 	IndexScanStatsEntry * pbm_stats;
@@ -1184,8 +1192,6 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 		return;
 	}
 
-	// TODO move stuff to pbm_inline.h maybe?
-
 	Assert(NULL != pbm_stats);
 
 	blk = ItemPointerGetBlockNumber(&scandesc->xs_heaptid);
@@ -1196,13 +1202,10 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 			 pbm_stats->id, pbm_stats->dbg_times_reported, blk, pbm_stats->est_speed
 		);
 	}
+	pbm_stats->dbg_times_reported += 1;
 #endif /* TRACE_PBM_INDEX_PROGRESS */
 
 	/* Update scan stats */
-
-// TODO remove "times reported"?
-	pbm_stats->dbg_times_reported += 1;
-
 	cur_cnt = (pbm_stats->total_count += 1);
 	pbm_stats->counts[blk % PBM_INDEX_SCAN_NUM_COUNTS] += 1;
 
@@ -1890,8 +1893,9 @@ static inline IndexScanStatsEntry * alloc_idxscan_stats(void) {
 	/* Zero stats */
 	memset(&stats->counts, 0, sizeof(stats->counts));
 	stats->total_count = 0;
+#if defined(TRACE_PBM_INDEX_PROGRESS)
 	stats->dbg_times_reported = 0;
-	// TODO other stats?
+#endif /* TRACE_PBM_INDEX_PROGRESS */
 
 	return stats;
 }
@@ -1990,10 +1994,14 @@ BlockGroupData * search_or_create_block_group(const BufferDesc *const buf) {
 /* Find or initialize an index scan entry */
 static inline IndexScanHashEntry * search_or_create_idxscan_entry(const RelFileNode * rel) {
 	IndexScanHashEntry * entry;
+	uint32 key_hash;
 	bool found;
 
+	/* Check if index scan tracking is enabled */
+	if (!pbm_evict_use_idx_scan) return NULL;
+
 	/* Pre-compute the hash since we may do 2 lookups */
-	uint32 key_hash = get_hash_value(pbm->IndexScanMap, rel);
+	key_hash = get_hash_value(pbm->IndexScanMap, rel);
 
 	/* Will be found most of the time, so avoid taking exclusive locks */
 	LOCK_GUARD_V2(PbmIdxScansLock, LW_SHARED) {
@@ -2009,8 +2017,6 @@ static inline IndexScanHashEntry * search_or_create_idxscan_entry(const RelFileN
 			if (!found) {
 				dlist_init(&entry->dlist);
 				LWLockInitialize(&entry->lock, LWTRANCH_PBM_IDXSCAN);
-				// SpinLockInit(&entry->slock);
-				// TODO initialize other fields?
 			}
 		}
 	}
@@ -2344,6 +2350,59 @@ unsigned long BlockGroupTimeToNextConsumption(BlockGroupData *const bgdata, bool
 	return min_next_access;
 }
 
+/* Calculate `lambda`/"rate" parameter for access distribution of an index scan. */
+double idx_scan_est_lambda(const uint64 blk_idx, const IndexScanStatsEntry * stats_entry) {
+	bool sane = true;
+	double est_lambda;
+
+	/* Extract stats from the entry */
+	const uint64 nblocks = stats_entry->nblocks;
+	const uint64 cur_bucket_accesses = stats_entry->counts[blk_idx];
+	const uint64 cur_total_accesses = stats_entry->total_count;
+	const double est_speed = stats_entry->est_speed;  /* tuples / nanosecond */
+
+	const uint64 blocks_in_bucket = nblocks / PBM_INDEX_SCAN_NUM_COUNTS
+			+ (blk_idx < (nblocks % PBM_INDEX_SCAN_NUM_COUNTS) ? 1 : 0);
+
+#ifdef TRACE_PBM_IDX_EVICT_CALC
+	if (0 == buf->buf_id) {
+			elog(WARNING, "BlockPageTimeToNextIndexAccess(0): scan=%lu, blk=%u, nblocks=%lu, per_block=%f, "
+						  "cur_accesses=%lu, total=%lu, speed=%f, in_bucket=%lu"
+				, stats_entry->id, blk, nblocks, stats_entry->accesses_per_block
+				, cur_bucket_accesses, cur_total_accesses, est_speed, blocks_in_bucket
+			);
+		}
+#endif
+
+	/* Estimate remaining # of block accesses */
+	const double est_cur_block_accesses
+			= (double)cur_bucket_accesses / (double)blocks_in_bucket;
+	const double est_remaining_block_accesses
+			= stats_entry->accesses_per_block - (double)est_cur_block_accesses;
+
+	/* Estimate total accesses remaining */
+	const double est_final_total_accesses = stats_entry->plan_rows * stats_entry->plan_loops;
+	const double est_remaining_total_accesses
+			= est_final_total_accesses - (double)cur_total_accesses;
+
+	/* Sanity checks... */
+	Assert(blocks_in_bucket > 0);
+	sane = (est_remaining_total_accesses > 0) && (est_remaining_block_accesses > 0);
+
+	if (sane) {
+		/* Estimate # of accesses before this block is accessed again (units = tuples) */
+		const double est_remaining_tuples_to_next_block_access
+				= est_remaining_total_accesses / est_remaining_block_accesses;
+
+		/* Estimate the "rate" for this block (=1/time_to_next_access) */
+		est_lambda = est_speed / est_remaining_tuples_to_next_block_access;
+	} else {
+		/* If sanity checks fail, ignore counts and just use over-all average inter-access */
+		est_lambda = est_speed / (double)nblocks;
+	}
+	return est_lambda;
+}
+
 /*
  * Estimate the average time to next access of the index scans on the buffer.
  */
@@ -2362,59 +2421,13 @@ unsigned long BlockPageTimeToNextIndexAccess(BufferDesc * buf, bool * requested)
 		/* Compute the distribution for each scan and combine the results */
 		dlist_foreach(it, &stats->dlist) {
 			IndexScanStatsEntry * entry = dlist_container(IndexScanStatsEntry, dlist, it.cur);
-			bool sane = true;
 			double est_lambda;
-
-			/* Extract stats from the entry */
-			const uint64 nblocks = entry->nblocks;
-			const uint64 cur_bucket_accesses = entry->counts[b_idx];
-			const uint64 cur_total_accesses = entry->total_count;
-			const double est_speed = entry->est_speed;  /* tuples / nanosecond */
-
-			const uint64 blocks_in_bucket = nblocks / PBM_INDEX_SCAN_NUM_COUNTS
-					+ (b_idx < (nblocks % PBM_INDEX_SCAN_NUM_COUNTS) ? 1 : 0);
-
-#ifdef TRACE_PBM_IDX_EVICT_CALC
-			if (0 == buf->buf_id) {
-				elog(WARNING, "BlockPageTimeToNextIndexAccess(0): scan=%lu, blk=%u, nblocks=%lu, per_block=%f, "
-							  "cur_accesses=%lu, total=%lu, speed=%f, in_bucket=%lu"
-					, entry->id, blk, nblocks, entry->accesses_per_block
-					, cur_bucket_accesses, cur_total_accesses, est_speed, blocks_in_bucket
-				);
-			}
-#endif
 
 			/* This could happen for an initially small table which doesn't use
 			 * all buckets and is inserted into during the scan. Ignore this? */
-			if (0 == blocks_in_bucket) {
-				continue;
-			}
+			if (blk >= entry->nblocks) continue;
 
-			/* Estimate remaining # of block accesses */
-			const double est_cur_block_accesses
-					= (double)cur_bucket_accesses / (double)blocks_in_bucket;
-			const double est_remaining_block_accesses
-					= entry->accesses_per_block - (double)est_cur_block_accesses;
-
-			/* Estimate total accesses remaining */
-			const double est_final_total_accesses = entry->plan_rows * entry->plan_loops;
-			const double est_remaining_total_accesses
-					= est_final_total_accesses - (double)cur_total_accesses;
-
-			/* Sanity checks... */
-			sane = (est_remaining_total_accesses > 0) && (est_remaining_block_accesses > 0);
-
-			if (sane) {
-				/* Estimate # of accesses before this block is accessed again (units = tuples) */
-				const double est_remaining_tuples_to_next_block_access
-						= est_remaining_total_accesses / est_remaining_block_accesses;
-
-				/* Estimate the "rate" for this block (=1/time_to_next_access) */
-				est_lambda = est_speed / est_remaining_tuples_to_next_block_access;
-			} else {
-				/* If sanity checks fail, ignore counts and just use over-all average inter-access */
-				est_lambda = est_speed / (double)nblocks;
-			}
+			est_lambda = idx_scan_est_lambda(b_idx, entry);
 
 			/* We are assuming geometric distribution, so with multiple scans
 			 * the rate of the minimum is the sum of the individual rates
