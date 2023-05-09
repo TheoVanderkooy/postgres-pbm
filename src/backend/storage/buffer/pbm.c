@@ -63,7 +63,7 @@ static inline void update_scan_speed_estimate(unsigned long elapsed, uint32 bloc
 
 
 // get current time
-static inline unsigned long get_time_ns(void);
+static inline uint64 get_time_ns(void);
 #if PBM_USE_PQ
 static inline unsigned long get_timeslice(void);
 #endif /* PBM_USE_PQ */
@@ -115,7 +115,7 @@ static inline void RemoveBufFromBlockGroup(BufferDesc * buf);
 static inline unsigned long ScanTimeToNextConsumption(const BlockGroupScanListElem * bg_scan);
 
 static unsigned long BlockGroupTimeToNextConsumption(BlockGroupData * bgdata, bool * requestedPtr, unsigned long now);
-
+static unsigned long BlockPageTimeToNextIndexAccess(BufferDesc * buf, bool * requested);
 
 // removing scans from block groups
 static inline bool block_group_delete_scan(ScanId id, BlockGroupData * groupData);
@@ -1091,7 +1091,7 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	/* Allocate struct for stats for this scan */
 	stats = alloc_idxscan_stats();
 	stats->id = id;
-	stats->plan_loops = rows;
+	stats->plan_rows = rows;
 	stats->plan_loops = loops;
 	stats->nblocks = nblocks;
 	stats->accesses_per_block = accesses_per_block;
@@ -1115,6 +1115,9 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	}
 }
 
+/*
+ * Unregister an index scan.
+ */
 void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
 	struct IndexScanDescData * scandesc;
 	struct IndexScanStatsEntry * pbm_stats;
@@ -1162,20 +1165,20 @@ void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
 #endif // TRACE_PBM_PRINT_IDXSCANMAP
 }
 
+/*
+ * Report progres for an index scan.
+ */
 void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 	IndexScanStatsEntry * pbm_stats;
-	bool parallel; // TODO is this needed?
 	BlockNumber blk;
 	BlockNumber cur_cnt;
 
 	if (NULL != scandesc->parallel_scan && NULL != scandesc->parallel_scan->pbm_stats) {
 		/* Registered parallel scan */
 		pbm_stats = scandesc->parallel_scan->pbm_stats;
-		parallel = true;
 	} else if (NULL != scandesc->pbm_stats) {
 		/* Registered non-parallel scan */
 		pbm_stats = scandesc->pbm_stats;
-		parallel = false;
 	} else {
 		/* Otherwise, not registered at all */
 		return;
@@ -1203,8 +1206,9 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 	cur_cnt = (pbm_stats->total_count += 1);
 	pbm_stats->counts[blk % PBM_INDEX_SCAN_NUM_COUNTS] += 1;
 
-	/* Update speed estimate if appropriate */
-	if (cur_cnt % 100 == 0 || cur_cnt == 10) {
+	/* Update speed estimate if appropriate:
+	 * every ~500 blocks or specific milestones at the start of the scan */
+	if (cur_cnt % 512 == 0 || cur_cnt == 100 || cur_cnt == 10) {
 		unsigned long t, t_elapsed;
 		uint64 tuples_elapsed;
 		SpinLockAcquire(&pbm_stats->stats_lock);
@@ -1222,7 +1226,9 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 	}
 }
 
-// TODO remove this? debugging only...
+/*
+ * Report when an index scan "rescans" which is important to know in some cases.
+ */
 void PBM_ReportIndexScanRescan(struct IndexScanState * scan) {
 	IndexScanStatsEntry * pbm_stats;
 	IndexScanDescData * scandesc = scan->iss_ScanDesc;
@@ -1657,7 +1663,7 @@ static inline void update_scan_speed_estimate(unsigned long elapsed, uint32 bloc
 }
 
 /* Current time in nanoseconds */
-unsigned long get_time_ns(void) {
+uint64 get_time_ns(void) {
 	struct timespec now;
 	clock_gettime(PBM_CLOCK, &now);
 
@@ -2338,6 +2344,116 @@ unsigned long BlockGroupTimeToNextConsumption(BlockGroupData *const bgdata, bool
 	return min_next_access;
 }
 
+/*
+ * Estimate the average time to next access of the index scans on the buffer.
+ */
+unsigned long BlockPageTimeToNextIndexAccess(BufferDesc * buf, bool * requested) {
+	IndexScanHashEntry *const stats = get_buffer_stats(buf)->pbm_iscan_stats;
+	const BlockNumber blk = buf->tag.blockNum;
+	const uint64 b_idx = blk % PBM_INDEX_SCAN_NUM_COUNTS;
+	double lambda = 0.;
+
+	*requested = false;
+
+	/* Check all index scans interested in this buffer */
+	LOCK_GUARD_V2(&stats->lock, LW_SHARED) {
+		dlist_iter it;
+
+		/* Compute the distribution for each scan and combine the results */
+		dlist_foreach(it, &stats->dlist) {
+			IndexScanStatsEntry * entry = dlist_container(IndexScanStatsEntry, dlist, it.cur);
+			bool sane = true;
+			double est_lambda;
+
+			/* Extract stats from the entry */
+			const uint64 nblocks = entry->nblocks;
+			const uint64 cur_bucket_accesses = entry->counts[b_idx];
+			const uint64 cur_total_accesses = entry->total_count;
+			const double est_speed = entry->est_speed;  /* tuples / nanosecond */
+
+			const uint64 blocks_in_bucket = nblocks / PBM_INDEX_SCAN_NUM_COUNTS
+					+ (b_idx < (nblocks % PBM_INDEX_SCAN_NUM_COUNTS) ? 1 : 0);
+
+#ifdef TRACE_PBM_IDX_EVICT_CALC
+			if (0 == buf->buf_id) {
+				elog(WARNING, "BlockPageTimeToNextIndexAccess(0): scan=%lu, blk=%u, nblocks=%lu, per_block=%f, "
+							  "cur_accesses=%lu, total=%lu, speed=%f, in_bucket=%lu"
+					, entry->id, blk, nblocks, entry->accesses_per_block
+					, cur_bucket_accesses, cur_total_accesses, est_speed, blocks_in_bucket
+				);
+			}
+#endif
+
+			/* This could happen for an initially small table which doesn't use
+			 * all buckets and is inserted into during the scan. Ignore this? */
+			if (0 == blocks_in_bucket) {
+				continue;
+			}
+
+			/* Estimate remaining # of block accesses */
+			const double est_cur_block_accesses
+					= (double)cur_bucket_accesses / (double)blocks_in_bucket;
+			const double est_remaining_block_accesses
+					= entry->accesses_per_block - (double)est_cur_block_accesses;
+
+			/* Estimate total accesses remaining */
+			const double est_final_total_accesses = entry->plan_rows * entry->plan_loops;
+			const double est_remaining_total_accesses
+					= est_final_total_accesses - (double)cur_total_accesses;
+
+			/* Sanity checks... */
+			sane = (est_remaining_total_accesses > 0) && (est_remaining_block_accesses > 0);
+
+			if (sane) {
+				/* Estimate # of accesses before this block is accessed again (units = tuples) */
+				const double est_remaining_tuples_to_next_block_access
+						= est_remaining_total_accesses / est_remaining_block_accesses;
+
+				/* Estimate the "rate" for this block (=1/time_to_next_access) */
+				est_lambda = est_speed / est_remaining_tuples_to_next_block_access;
+			} else {
+				/* If sanity checks fail, ignore counts and just use over-all average inter-access */
+				est_lambda = est_speed / (double)nblocks;
+			}
+
+			/* We are assuming geometric distribution, so with multiple scans
+			 * the rate of the minimum is the sum of the individual rates
+			 * https://en.wikipedia.org/wiki/Exponential_distribution
+			 */
+
+			lambda += est_lambda;
+			*requested = true;
+
+#ifdef TRACE_PBM_IDX_EVICT_CALC
+			if (0 == buf->buf_id) {
+				elog(WARNING, "BlockPageTimeToNextIndexAccess(0): scan=%lu, "
+							  "remaining_block=%f, remaining_total=%f, est_final_total=%f, "
+							  "lambda=%e, avg_inter_access=%e"
+					, entry->id
+					, est_remaining_block_accesses, est_remaining_total_accesses, est_final_total_accesses
+					, est_lambda, est_speed / (double)nblocks
+				);
+			}
+#endif
+		}
+	}
+#ifdef TRACE_PBM_IDX_EVICT_CALC
+	if (0 == buf->buf_id) {
+		elog(WARNING, "BlockPageTimeToNextIndexAccess(0) final: "
+					  "lambda=%e, NAT=%lu"
+	        , lambda, *requested ? (uint64)(1. / lambda) : AccessTimeNotRequested
+		);
+	}
+#endif
+
+	/* For geometric distribution: expected value is 1/lambda */
+	if (*requested) {
+		return (uint64)(1. / lambda);
+	} else {
+		return AccessTimeNotRequested;
+	}
+}
+
 /* Delete a specific scan from the list of the given block group */
 bool block_group_delete_scan(ScanId id, BlockGroupData *groupData) {
 	slist_mutable_iter iter;
@@ -2828,8 +2944,8 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 	uint32 local_buf_state;
 	BlockGroupData * bgdata;
 	bool requested, last_eviction;
-	unsigned long next_access = 0;
-	unsigned long now;
+	uint64 next_access = 0;
+	uint64 now;
 
 	int n_selected = 0;
 	int n_evicted = 0;
@@ -2872,29 +2988,34 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 		/* Compute time to next access */
 		/* NOTE: here "next_access" is "time to next access" NOT "next access time". */
 		now = get_time_ns();
-#if PBM_TRACK_STATS
 		{ /* Scope to silence -Wdeclaration-after-statement... */
 			int naccesses;
-			uint64 bg_next_consumption = BlockGroupTimeToNextConsumption(bgdata, &requested, now);
+			bool requested_idx = false, requested_seq = false;
+			uint64 bg_next_consumption = BlockGroupTimeToNextConsumption(bgdata, &requested_seq, now);
+			uint64 idx_next_consumption = BlockPageTimeToNextIndexAccess(buf, &requested_idx);
+#if PBM_TRACK_STATS
 			uint64 buffer_est_inter_access = est_inter_access_time(get_buffer_stats(buf), now, &naccesses);
-			if (requested && naccesses > 1) {
-				/* Consider both registered estimate and inter-access estimate
-				 * if it is requested and more than one recent access */
-				next_access = Min(bg_next_consumption, buffer_est_inter_access);
-			} else if (requested) {
-				/* Ignore inter-access time if we only have one access so far */
+#endif
+			requested = (requested_idx || requested_seq);
+
+			/* Combine estimates as appropriate */
+			next_access = INT64_MAX;
+			if (requested_seq) {
 				next_access = bg_next_consumption;
-			} else if (naccesses > 1 && pbm_evict_use_freq) {
-				/* If not requested, use the inter-access time.
-				 * Also lie about being requested to prevent it getting used
-				 * immediately in the next block.*/
-				next_access = buffer_est_inter_access;
+			}
+			if (requested_idx) {
+				next_access = Min(next_access, idx_next_consumption);
+			}
+#if PBM_TRACK_STATS
+			if (pbm_evict_use_freq && naccesses > 1) {
+				/* Only consider inter-access time if there is at least once access */
+				next_access = Min(next_access, buffer_est_inter_access);
+				/* Set requested so we don't re-use it immediately in next block */
 				requested = true;
 			}
-		}
-#else
-		next_access = BlockGroupTimeToNextConsumption(bgdata, &requested, now);
 #endif
+		}
+
 		samples[n_selected].next_access_time = next_access;
 
 		/* If it is "not requested", try to use it immediately.

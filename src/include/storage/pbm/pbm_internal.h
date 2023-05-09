@@ -99,17 +99,18 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 /* Debugging flags */
 //#define TRACE_PBM
 //#define TRACE_PBM_REGISTER
-#define TRACE_PBM_REGISTER_INDEX
+//#define TRACE_PBM_REGISTER_INDEX
 //#define TRACE_PBM_REPORT_PROGRESS
 //#define TRACE_PBM_REPORT_PROGRESS_VERBOSE
 //#define TRACE_PBM_BITMAP_PROGRESS
-#define TRACE_PBM_INDEX_PROGRESS
+//#define TRACE_PBM_INDEX_PROGRESS
 //#define TRACE_PBM_PRINT_SCANMAP
 //#define TRACE_PBM_PRINT_BLOCKGROUPMAP
 //#define TRACE_PBM_PRINT_IDXSCANMAP
 //#define TRACE_PBM_BUFFERS
 //#define TRACE_PBM_BUFFERS_NEW
 //#define TRACE_PBM_BUFFERS_EVICT
+//#define TRACE_PBM_IDX_EVICT_CALC
 //#define TRACE_PBM_PQ_REFRESH
 //#define TRACE_PBM_ON_BUFFER_ACCESS
 
@@ -298,7 +299,7 @@ typedef struct IndexScanStatsEntry {
 
 	/* These stats updated atomically */
 	slock_t stats_lock;
-	double est_speed;
+	_Atomic(double) est_speed;
 	unsigned long last_stats_update_t;
 	uint64 last_stats_update_count;
 
