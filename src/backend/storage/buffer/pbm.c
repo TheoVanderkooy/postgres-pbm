@@ -2981,11 +2981,8 @@ void index_scan_buf_marker(const struct IndexScanDescData *scandesc, IndexScanSt
 
 		/* ### technically a race condition: updating trailing_idx_next_access
 		 * is not atomic but this is just an estimate so we don't care. */
-		if (cur_next_trailing_access <= now || AccessTimeNotRequested == cur_next_trailing_access) {
+		if (cur_next_trailing_access <= now || est_trailing_t < cur_next_trailing_access) {
 			buf_stats->trailing_idx_next_access = est_trailing_t;
-		} else {
-			buf_stats->trailing_idx_next_access =
-					Min(est_trailing_t, cur_next_trailing_access);
 		}
 	}
 }
@@ -3238,11 +3235,14 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 		now = get_time_ns();
 		{ /* Scope to silence -Wdeclaration-after-statement... */
 			int naccesses;
-			bool requested_idx = false, requested_seq = false;
+			bool requested_idx = false, requested_seq = false, has_trailing = false;
 			uint64 bg_next_consumption = BlockGroupTimeToNextConsumption(bgdata, &requested_seq, now);
 			uint64 idx_next_consumption = BlockPageTimeToNextIndexAccess(buf, &requested_idx);
 #if PBM_TRACK_STATS
-			uint64 buffer_est_inter_access = est_inter_access_time(get_buffer_stats(buf), now, &naccesses);
+			uint64 buffer_est_inter_access = est_inter_access_time(buf_stats, now, &naccesses);
+			uint64 trailing_idx_next_consumption = buf_stats->trailing_idx_next_access;
+			has_trailing = (trailing_idx_next_consumption > now)
+					&& (trailing_idx_next_consumption != AccessTimeNotRequested);
 #endif
 			requested = (requested_idx || requested_seq);
 
@@ -3259,6 +3259,10 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 				/* Only consider inter-access time if there is at least once access */
 				next_access = Min(next_access, buffer_est_inter_access);
 				/* Set requested so we don't re-use it immediately in next block */
+				requested = true;
+			}
+			if (has_trailing) {
+				next_access = Min(next_access, trailing_idx_next_consumption);
 				requested = true;
 			}
 #endif
