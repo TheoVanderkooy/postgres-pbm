@@ -145,6 +145,11 @@ static inline uint64 est_inter_access_time(PbmBufferDescStats *stats, uint64 now
 #endif /* PBM_TRACK_STATS */
 
 
+// Index scan helpers
+static inline void index_scan_buf_marker(const struct IndexScanDescData *scandesc, IndexScanStatsEntry *pbm_stats);
+static inline void check_trailing_scan(const struct PbmBufferIdxScanMarker *old_mark, const struct PbmBufferIdxScanMarker *new_mark, unsigned int buf_id);
+
+
 // debugging
 #if defined(TRACE_PBM)
 static void debug_buffer_access(BufferDesc* buf, char* msg);
@@ -1108,6 +1113,8 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	stats->last_stats_update_count = 0;
 	stats->est_speed = pbm->initial_est_idx_speed;
 	stats->last_stats_update_t = get_time_ns();
+	/* Trailing scan stats */
+	stats->trailing_delay = AccessTimeNotRequested;
 
 	/* Attach to the scan */
 	scan->iss_ScanDesc->pbm_stats = stats;
@@ -1227,6 +1234,12 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 		}
 		SpinLockRelease(&pbm_stats->stats_lock);
 	}
+
+	/* Trailing index scans:
+	 * Write and check index scan markers on the buffer if appropriate. */
+	if (pbm_stats->plan_rows >= PBM_TRAILING_IDX_MIN_ROWS) {
+		index_scan_buf_marker(scandesc, pbm_stats);
+	}
 }
 
 /*
@@ -1258,6 +1271,9 @@ void PBM_ReportIndexScanRescan(struct IndexScanState * scan) {
 		);
 	}
 #endif /* TRACE_PBM_INDEX_PROGRESS */
+
+	pbm_stats->loop_count += 1;
+	pbm_stats->trailing_delay = AccessTimeNotRequested;
 }
 
 
@@ -1272,6 +1288,9 @@ void PBM_ReportIndexScanRescan(struct IndexScanState * scan) {
  */
 void PbmNewBuffer(BufferDesc * const buf) {
 	BlockGroupData * group;
+#if (PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING)
+	PbmBufferDescStats * stats = get_buffer_stats(buf);
+#endif
 
 #if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS) && defined(TRACE_PBM_BUFFERS_NEW)
 	elog(WARNING, "PbmNewBuffer added new buffer:" //"\n"
@@ -1290,7 +1309,13 @@ void PbmNewBuffer(BufferDesc * const buf) {
 	/* Associate with the block group and index scan stats */
 	group = AddBufToBlockGroup(buf);
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
-	get_buffer_stats(buf)->pbm_iscan_stats = search_or_create_idxscan_entry(&buf->tag.rnode);
+	stats->pbm_iscan_stats = search_or_create_idxscan_entry(&buf->tag.rnode);
+	for (int i = 0; i < PBM_IDX_NUM_MARKERS; ++i) {
+		stats->idx_markers[i] = (struct PbmBufferIdxScanMarker){
+			.entry = NULL,
+			.scan_id = 0,
+		};
+	}
 #endif
 
 	// There must be a group -- either it already existed or we created it.
@@ -1376,6 +1401,7 @@ void PbmOnEvictBuffer(BufferDesc *const buf) {
 	/* If we had cached the block group for this buffer, clear it */
 	get_buffer_stats(buf)->pbm_bg = NULL;
 	get_buffer_stats(buf)->pbm_iscan_stats = NULL;
+	get_buffer_stats(buf)->trailing_idx_next_access = AccessTimeNotRequested;
 #endif
 }
 
@@ -1653,7 +1679,7 @@ BlockNumber num_block_group_segments(BlockNumber nblocks) {
 	return nblock_segs;
 }
 
-static inline void update_scan_speed_estimate(unsigned long elapsed, uint32 blocks, ScanHashEntry * entry) {
+void update_scan_speed_estimate(unsigned long elapsed, uint32 blocks, ScanHashEntry * entry) {
 	float speed = (float)(blocks) / (float)(elapsed);
 	SharedScanStats stats = entry->data.stats;
 
@@ -1893,6 +1919,7 @@ static inline IndexScanStatsEntry * alloc_idxscan_stats(void) {
 	/* Zero stats */
 	memset(&stats->counts, 0, sizeof(stats->counts));
 	stats->total_count = 0;
+	stats->loop_count = 0;
 #if defined(TRACE_PBM_INDEX_PROGRESS)
 	stats->dbg_times_reported = 0;
 #endif /* TRACE_PBM_INDEX_PROGRESS */
@@ -1902,6 +1929,7 @@ static inline IndexScanStatsEntry * alloc_idxscan_stats(void) {
 
 /* Free an index scan stats struct */
 static inline void free_idxscan_stats(IndexScanStatsEntry * stats) {
+	stats->id = 0; /* Signal not in use anymore. */
 	SpinLockAcquire(&pbm->free_idxscan_stats_lock);
 	dlist_push_head(&pbm->free_idxscan_stats, &stats->dlist);
 	SpinLockRelease(&pbm->free_idxscan_stats_lock);
@@ -2174,6 +2202,7 @@ void RemoveBufFromBlockGroup(BufferDesc *const buf) {
 		group = stats->pbm_bg;
 		// Remove the block group pointer
 		stats->pbm_bg = NULL;
+		stats->trailing_idx_next_access = AccessTimeNotRequested;
 		Assert(group != NULL);
 	}
 #else
@@ -2691,12 +2720,23 @@ void clear_buffer_stats(PbmBufferDescStats * stats) {
 	stats->avg_recent_inter_access = 0.;
 	stats->last_access = AccessTimeNotRequested;
 #endif /* PBM_BUFFER_STATS_MODE */
+
+#if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+	stats->trailing_idx_next_access = AccessTimeNotRequested;
+	for (int i = 0; i < PBM_IDX_NUM_MARKERS; ++i) {
+		stats->idx_markers[i] = (struct PbmBufferIdxScanMarker) {
+			.entry = NULL,
+			.scan_id = 0,
+		};
+	}
+#endif /* PBM_EVICT_MODE_SAMPLING */
 }
 
 void init_buffer_stats(PbmBufferDescStatsPadded * stats) {
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
 	stats->stats.pbm_bg = NULL;
 	stats->stats.pbm_iscan_stats = NULL;
+	SpinLockInit(&stats->stats.idx_slock);
 #endif /* PBM_EVICT_MODE_SAMPLING */
 #if PBM_TRACK_STATS
 	SpinLockInit(&stats->stats.slock);
@@ -2816,6 +2856,172 @@ uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_acc
 	}
 }
 #endif /* PBM_TRACK_STATS */
+
+
+/* Handle buffer index scan markers: check for a trailing scan and write the new marker */
+void index_scan_buf_marker(const struct IndexScanDescData *scandesc, IndexScanStatsEntry *pbm_stats) {
+	/* Index scan markers: check for markers to detect trailing scans */
+	Buffer cur_buffer = ((IndexFetchHeapData *)scandesc->xs_heapfetch)->xs_cbuf;
+	BufferDesc * buf;
+	PbmBufferDescStats * buf_stats;
+	bool has_empty_slot = false, has_same_idx = false;
+	int oldest_slot = 0;
+	struct PbmBufferIdxScanMarker new_mark, old_mark;
+	struct PbmBufferIdxScanMarker * m;
+	uint64 now = get_time_ns();
+
+	Assert(cur_buffer > 0); /* Always expect a valid buffer */
+
+	buf = GetBufferDescriptor(cur_buffer - 1);
+	buf_stats = get_buffer_stats(buf);
+
+	/* Marker to write for this scan */
+	new_mark = (struct PbmBufferIdxScanMarker){
+		.scan_id = pbm_stats->id,
+		.scan_loop_num = pbm_stats->loop_count,
+		.entry = pbm_stats,
+		.access_time = now,
+		.idx_rel_id = scandesc->indexRelation->rd_node.relNode,
+		.tuple = ItemPointerGetOffsetNumber(&scandesc->xs_heaptid),
+	};
+
+	SpinLockAcquire(&buf_stats->idx_slock);
+
+	/* DEBUGGING: print marker slots for buffer 0 */
+#if defined(TRACE_PBM_INDEX_PROGRESS)
+	if (0 == buf->buf_id) {
+		for (int i = 0; i < PBM_IDX_NUM_MARKERS; ++i) {
+			m = &buf_stats->idx_markers[i];
+			if (m->entry == NULL) continue;
+			elog(WARNING, "PBM_ReportIndexScanPosition--marker[%d]: "
+						  "scan=%u, idx=%u, loop=%d, tup=%u, t=%lu"
+				, i, m->scan_id, m->idx_rel_id, m->scan_loop_num, m->tuple, m->access_time
+			);
+		}
+		elog(WARNING, "PBM_ReportIndexScanPosition--new marker: "
+					  "scan=%u, idx=%u, loop=%d, tup=%u, t=%lu, buf_rel=%u, buf_blk=%u"
+			, new_mark.scan_id, new_mark.idx_rel_id, new_mark.scan_loop_num, new_mark.tuple, new_mark.access_time
+			, buf->tag.rnode.relNode, buf->tag.blockNum
+		);
+	}
+#endif /* TRACE_PBM_INDEX_PROGRESS */
+
+
+	/* Check for existing markers: are we following anything and which slot
+	 * should we write our marker to?
+	 *
+	 * We allow only one marker per index, so if we see the same index relation
+	 * we check/overwrite only that one.
+	 *
+	 * Otherwise, overwrite the oldest_slot marker if there isn't an empty slot
+	*/
+	for (int i = 0; i < PBM_IDX_NUM_MARKERS; ++i) {
+		m = &buf_stats->idx_markers[i];
+
+		/* Check for an empty slot (always at the end) */
+		if (NULL == m->entry) {
+			has_empty_slot = true;
+			old_mark = *m;
+			break;
+		}
+
+		/* Check for markers from the same index scan */
+		if (m->idx_rel_id == new_mark.idx_rel_id) {
+			has_same_idx = true;
+			old_mark = *m;
+			break;
+		}
+
+		/* Replace the oldest_slot marker if no other condition matches */
+		if (m->access_time < buf_stats->idx_markers[oldest_slot].access_time) {
+			oldest_slot = i;
+		}
+	}
+
+#if defined(TRACE_PBM_INDEX_PROGRESS)
+	if (0 == buf->buf_id) {
+		elog(WARNING, "PBM_ReportIndexScanPosition--has_empty=%s, same_idx=%s"
+			, has_empty_slot?"y":"n", has_same_idx?"y":"n"
+
+		);
+	}
+#endif /* TRACE_PBM_INDEX_PROGRESS */
+
+	/*
+	 * Overwrite whichever slot it was we found, either an empty one or the same slot
+	 * unless we didn't find either of those, in which case use the oldest slot
+	 */
+	if (has_empty_slot || has_same_idx ) {
+		*m = new_mark;
+	} else {
+		buf_stats->idx_markers[oldest_slot] = new_mark;
+	}
+
+	SpinLockRelease(&buf_stats->idx_slock);
+
+	/* If we had the same index, check whether this scan is trailing something */
+	if (has_same_idx) {
+		check_trailing_scan(&old_mark, &new_mark, buf->buf_id);
+	}
+
+	/* If *this* scan is leading another, mark the buffer as appropriate */
+	if (pbm_stats->trailing_delay != AccessTimeNotRequested) {
+		uint64 est_trailing_t = now + pbm_stats->trailing_delay;
+		uint64 cur_next_trailing_access = buf_stats->trailing_idx_next_access;
+
+		/* ### technically a race condition: updating trailing_idx_next_access
+		 * is not atomic but this is just an estimate so we don't care. */
+		if (cur_next_trailing_access <= now || AccessTimeNotRequested == cur_next_trailing_access) {
+			buf_stats->trailing_idx_next_access = est_trailing_t;
+		} else {
+			buf_stats->trailing_idx_next_access =
+					Min(est_trailing_t, cur_next_trailing_access);
+		}
+	}
+}
+
+/* Check buffer index scan markers for a trailing scan */
+void check_trailing_scan(const struct PbmBufferIdxScanMarker *old_mark, const struct PbmBufferIdxScanMarker *new_mark,
+						 const unsigned int buf_id) {
+	uint64 delta;
+	bool is_trailing, is_leading_still_active;
+
+#ifdef TRACE_PBM_INDEX_PROGRESS
+	if (0 == buf_id) {
+		elog(WARNING, "check_trailing_scan maybe-trailing scan...");
+	}
+#endif /* TRACE_PBM_INDEX_PROGRESS */
+
+	/* Can only be trailing if it was the same specific tuple accessed! */
+	is_trailing = (old_mark->tuple == new_mark->tuple);
+	if (!is_trailing) return;
+
+	/* Verify the leading scan hasn't ended or restarted (rescan),
+	 * otherwise there is no point in trailing it.
+	 */
+	is_leading_still_active = ((unsigned int)old_mark->entry->id == old_mark->scan_id)
+								   && (old_mark->entry->loop_count == old_mark->scan_loop_num);
+	if (!is_leading_still_active) return;
+
+	/* ### technically a race condition here: leader could rescan (or end) after
+	 * we check for that. Very rare and only causes bad estimates, not breaking
+	 * anything, so we don't care. */
+
+	/* Detected a trailing scan, notify the leading scan about the time delta */
+	delta = new_mark->access_time - old_mark->access_time;
+	old_mark->entry->trailing_delay = delta;
+
+	// TODO PBM: also record the leader, so we can "unregister" if we stop trailing!
+
+	/* Debug printing */
+#ifdef TRACE_PBM_INDEX_PROGRESS
+	if (0 == buf_id % 100) {
+		elog(WARNING, "check_trailing_scan(%d) detected trailing scan! delta = %lu"
+			, buf_id, delta
+		);
+	}
+#endif /* TRACE_PBM_INDEX_PROGRESS */
+}
 
 
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_PQ_SINGLE

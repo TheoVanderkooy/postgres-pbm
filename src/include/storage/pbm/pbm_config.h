@@ -67,6 +67,16 @@
 /* Minimum number of average accesses per block to track an index scan */
 #define PBM_IDX_MIN_BLOCK_ACCESSES 1.0f
 
+/* Minimum estimated # of rows (per loop) for an index scan to leave markers on
+ * visited buffers and potentially detect trailing scans */
+#define PBM_TRAILING_IDX_MIN_ROWS 128
+
+/* Number of index scan markers to allow on a single buffer
+ * We don't need this to be high: there are many chances for the marker to be
+ * seen (every tuple!) and if they are consistently overwritten, then the
+ * trailing scans are not defining the lowest time-to-next-access so that info
+ * is not all that important. */
+#define PBM_IDX_NUM_MARKERS 3
 
 /* Track average eviction time and periodically log it. */
 //#define PBM_TRACK_EVICTION_TIME

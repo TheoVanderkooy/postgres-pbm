@@ -11,6 +11,7 @@
 #include "storage/relfilenode.h"
 #include "storage/spin.h"
 #include "storage/lwlock.h"
+#include "storage/off.h"
 
 
 /*-------------------------------------------------------------------------
@@ -297,12 +298,16 @@ typedef struct IndexScanStatsEntry {
 	_Atomic(int) dbg_times_reported;
 #endif /* TRACE_PBM_INDEX_PROGRESS */
 	_Atomic(uint64) total_count;
+	_Atomic(unsigned int) loop_count;
 
 	/* These stats updated atomically */
 	slock_t stats_lock;
 	_Atomic(double) est_speed;
 	unsigned long last_stats_update_t;
 	uint64 last_stats_update_count;
+
+	/* Delay of trailing scan if applicable */
+	_Atomic(uint64) trailing_delay;
 
 	_Atomic(uint16) counts[PBM_INDEX_SCAN_NUM_COUNTS];
 } IndexScanStatsEntry;
@@ -368,15 +373,32 @@ typedef struct PbmPQ {
 } PbmPQ;
 #endif
 
+struct PbmBufferIdxScanMarker {
+	uint64 access_time;
+	struct IndexScanStatsEntry * entry;
+	unsigned int scan_id;  /* to make sure we know the scan finishes and the struct is re-allocated to a new scan */
+	unsigned int scan_loop_num;  /* to detect "rescan" */
+
+	/* index relation */
+	Oid idx_rel_id;
+	/* tuple ID in the block */
+	OffsetNumber tuple;
+};
+
 /*
  * Separate descriptor for PBM-related buffer fields.
  * (mainly here because I don't want to make the actual buffer descriptor >64B)
  */
 typedef struct PbmBufferDescStats {
-	/* Block group in the PBM if applicable (protected by buffer header lock) */
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
+	/* Block group in the PBM if applicable (protected by buffer header lock) */
 	struct BlockGroupData * pbm_bg;
+	/* Index scan stats for the buffer */
 	struct IndexScanHashEntry * pbm_iscan_stats;
+	/* List of index markers */
+	slock_t idx_slock;
+	struct PbmBufferIdxScanMarker idx_markers[PBM_IDX_NUM_MARKERS];
+	_Atomic(uint64) trailing_idx_next_access;
 #endif
 #if PBM_TRACK_STATS
 	slock_t slock;		/* lock for these fields */
@@ -393,7 +415,7 @@ typedef struct PbmBufferDescStats {
 
 typedef union PbmBufferDescStatsPadded {
 	PbmBufferDescStats stats;
-	char padding[64];
+	char padding[192]; /* 64*4 */
 } PbmBufferDescStatsPadded;
 
 /*
