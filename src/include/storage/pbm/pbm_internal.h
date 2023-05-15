@@ -309,6 +309,13 @@ typedef struct IndexScanStatsEntry {
 	/* Delay of trailing scan if applicable */
 	_Atomic(uint64) trailing_delay;
 
+	/* If *this scan* is trailing something else: record info to "unregister" later */
+	slock_t leading_scan_lock; // ### is this useful? (maybe for multiple workers in the same scan entry?
+	struct IndexScanStatsEntry * leading_scan;
+	ScanId leading_scan_id;
+	uint64 leading_scan_delay;
+
+	/* The array of access counts per block */
 	_Atomic(uint16) counts[PBM_INDEX_SCAN_NUM_COUNTS];
 } IndexScanStatsEntry;
 

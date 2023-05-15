@@ -148,6 +148,7 @@ static inline uint64 est_inter_access_time(PbmBufferDescStats *stats, uint64 now
 // Index scan helpers
 static inline void index_scan_buf_marker(const struct IndexScanDescData *scandesc, IndexScanStatsEntry *pbm_stats);
 static inline void check_trailing_scan(const struct PbmBufferIdxScanMarker *old_mark, const struct PbmBufferIdxScanMarker *new_mark, unsigned int buf_id);
+static inline void index_scan_unregister_leading_scan(IndexScanStatsEntry * pbm_stats);
 
 
 // debugging
@@ -1110,11 +1111,15 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	stats->accesses_per_block = accesses_per_block;
 	/* Initial stat estimates */
 	SpinLockInit(&stats->stats_lock);
+	SpinLockInit(&stats->leading_scan_lock);
 	stats->last_stats_update_count = 0;
 	stats->est_speed = pbm->initial_est_idx_speed;
 	stats->last_stats_update_t = get_time_ns();
 	/* Trailing scan stats */
 	stats->trailing_delay = AccessTimeNotRequested;
+	/* Leading scan pointer */
+	stats->leading_scan = NULL;
+	stats->leading_scan_delay = AccessTimeNotRequested;
 
 	/* Attach to the scan */
 	scan->iss_ScanDesc->pbm_stats = stats;
@@ -1158,6 +1163,9 @@ void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
 		);
 	}
 #endif /* TRACE_PBM_REGISTER_INDEX */
+
+	/* Inform leading scan if applicable */
+	index_scan_unregister_leading_scan(pbm_stats);
 
 	/* Update global speed estimate */
 /* ### technically is a race condition and could loose updates if two scans end
@@ -1272,8 +1280,10 @@ void PBM_ReportIndexScanRescan(struct IndexScanState * scan) {
 	}
 #endif /* TRACE_PBM_INDEX_PROGRESS */
 
+	/* Update relevant stats; mainly related to tracking trailing scans */
 	pbm_stats->loop_count += 1;
 	pbm_stats->trailing_delay = AccessTimeNotRequested;
+	index_scan_unregister_leading_scan(pbm_stats);
 }
 
 
@@ -3011,7 +3021,12 @@ void check_trailing_scan(const struct PbmBufferIdxScanMarker *old_mark, const st
 	delta = new_mark->access_time - old_mark->access_time;
 	old_mark->entry->trailing_delay = delta;
 
-	// TODO PBM: also record the leader, so we can "unregister" if we stop trailing!
+	/* Record the leading scan so we can unregister later */
+	SpinLockAcquire(&new_mark->entry->leading_scan_lock);
+	new_mark->entry->leading_scan = old_mark->entry;
+	new_mark->entry->leading_scan_id = old_mark->scan_id;
+	new_mark->entry->leading_scan_delay = delta;
+	SpinLockRelease(&new_mark->entry->leading_scan_lock);
 
 	/* Debug printing */
 #ifdef TRACE_PBM_INDEX_PROGRESS
@@ -3021,6 +3036,20 @@ void check_trailing_scan(const struct PbmBufferIdxScanMarker *old_mark, const st
 		);
 	}
 #endif /* TRACE_PBM_INDEX_PROGRESS */
+}
+
+/* Inform leader that we've stopped "trailing" if applicable */
+void index_scan_unregister_leading_scan(IndexScanStatsEntry *pbm_stats) {/* "unregister" from leading scan */
+	SpinLockAcquire(&pbm_stats->leading_scan_lock);
+	if ((NULL != pbm_stats->leading_scan)
+		&& (pbm_stats->leading_scan_id == pbm_stats->leading_scan->id)
+		&& (pbm_stats->leading_scan_delay == pbm_stats->leading_scan->trailing_delay))
+	{
+		pbm_stats->leading_scan->trailing_delay = AccessTimeNotRequested;
+		pbm_stats->leading_scan = NULL;
+		pbm_stats->leading_scan_delay = AccessTimeNotRequested;
+	}
+	SpinLockRelease(&pbm_stats->leading_scan_lock);
 }
 
 
