@@ -91,10 +91,11 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 #define PBM_BG_LOCK_MODE PBM_BG_LOCK_MODE_DOUBLE_SPIN
 
 
-/*
- * Number of buckets for index scan stats.
- */
+/* Number of buckets for index scan stats. */
 #define PBM_INDEX_SCAN_NUM_COUNTS (1 << 14)
+
+/* Whether to use the inverse frequency counts. */
+#define PBM_INDEX_SCAN_USE_COUNTS
 
 
 /* Debugging flags */
@@ -315,8 +316,10 @@ typedef struct IndexScanStatsEntry {
 	ScanId leading_scan_id;
 	uint64 leading_scan_delay;
 
+#ifdef PBM_INDEX_SCAN_USE_COUNTS
 	/* The array of access counts per block */
 	_Atomic(uint16) counts[PBM_INDEX_SCAN_NUM_COUNTS];
+#endif
 } IndexScanStatsEntry;
 
 /* Entry in Index scan map */

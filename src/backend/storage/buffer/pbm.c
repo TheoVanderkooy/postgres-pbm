@@ -117,7 +117,7 @@ static inline unsigned long ScanTimeToNextConsumption(const BlockGroupScanListEl
 
 static unsigned long BlockGroupTimeToNextConsumption(BlockGroupData * bgdata, bool * requestedPtr, unsigned long now);
 static inline double idx_scan_est_lambda(uint64 blk_idx, const IndexScanStatsEntry * stats_entry);
-static unsigned long BlockPageTimeToNextIndexAccess(BufferDesc * buf, bool * requested);
+static unsigned long BlockPageTimeToNextIndexAccess(IndexScanHashEntry * stats, bool *requested, BlockNumber blk);
 
 // removing scans from block groups
 static inline bool block_group_delete_scan(ScanId id, BlockGroupData * groupData);
@@ -1046,7 +1046,7 @@ extern void internal_PBM_ReportBitmapScanPosition(struct BitmapHeapScanState *co
  */
 void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScanDescData *pscan) {
 	ScanId id;
-	RelFileNode * rel_key = &scan->ss.ss_currentRelation->rd_node;
+	RelFileNode * rel_key;
 	IndexScanHashEntry * entry;
 	IndexScanStatsEntry * stats;
 	const double rows = scan->ss.ps.plan->plan_rows;
@@ -1054,6 +1054,12 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	const double exp_accesses = rows * loops;
 	double accesses_per_block;
 	BlockNumber nblocks;
+
+	Assert(scan != NULL);
+	Assert(scan->ss.ss_currentRelation != NULL);
+	Assert(scan->ss.ps.plan != NULL);
+
+	rel_key = &scan->ss.ss_currentRelation->rd_node;
 
 	/* Don't register an index scan with very few accesses - not worth the extra cost
 	 * Also don't register if disabled */
@@ -1076,6 +1082,9 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	accesses_per_block = exp_accesses / nblocks;
 
 	if (accesses_per_block < PBM_IDX_MIN_BLOCK_ACCESSES) {
+/* ### for now: actually register anyways for the trailing-scan detection.
+ * Maybe we would want to ignore the inverse-frequency stuff but right now
+ * there's no easy way to disable that without disabling trailing-scans too. */
 #if defined(TRACE_PBM_REGISTER_INDEX)
 		if (pbm->next_id < 100) {
 			elog(WARNING, "PBM_RegisterIndexScan(--) not registering: rel=%u   "
@@ -1085,6 +1094,7 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 			);
 		}
 #endif /* TRACE_PBM_REGISTER_INDEX */
+		// return;
 	}
 
 	/* Allocate scan ID */
@@ -1129,6 +1139,7 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 
 	/* Store the stats in the map */
 	entry = search_or_create_idxscan_entry(rel_key);
+	Assert(entry != NULL);
 	stats->hash_entry = entry;
 	LOCK_GUARD_V2(&entry->lock, LW_EXCLUSIVE) {
 		dlist_push_head(&entry->dlist, &stats->dlist);
@@ -1193,7 +1204,6 @@ void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
  */
 void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 	IndexScanStatsEntry * pbm_stats;
-	BlockNumber blk;
 	BlockNumber cur_cnt;
 
 	if (NULL != scandesc->parallel_scan && NULL != scandesc->parallel_scan->pbm_stats) {
@@ -1209,12 +1219,10 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 
 	Assert(NULL != pbm_stats);
 
-	blk = ItemPointerGetBlockNumber(&scandesc->xs_heaptid);
-
 #if defined(TRACE_PBM_INDEX_PROGRESS)
 	if (pbm_stats->dbg_times_reported < 40 || pbm_stats->dbg_times_reported % 10000 == 0) {
 		elog(WARNING, "PBM_ReportIndexScanPosition(%lu) report time %d @ blk %u, speed=%f",
-			 pbm_stats->id, pbm_stats->dbg_times_reported, blk, pbm_stats->est_speed
+			 pbm_stats->id, pbm_stats->dbg_times_reported, ItemPointerGetBlockNumber(&scandesc->xs_heaptid), pbm_stats->est_speed
 		);
 	}
 	pbm_stats->dbg_times_reported += 1;
@@ -1222,7 +1230,12 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 
 	/* Update scan stats */
 	cur_cnt = (pbm_stats->total_count += 1);
-	pbm_stats->counts[blk % PBM_INDEX_SCAN_NUM_COUNTS] += 1;
+#ifdef PBM_INDEX_SCAN_USE_COUNTS
+	{ /* silence -Wdeclaration-after-statement */
+		BlockNumber blk = ItemPointerGetBlockNumber(&scandesc->xs_heaptid);
+		pbm_stats->counts[blk % PBM_INDEX_SCAN_NUM_COUNTS] += 1;
+	}
+#endif
 
 	/* Update speed estimate if appropriate:
 	 * every ~500 blocks or specific milestones at the start of the scan */
@@ -1321,7 +1334,7 @@ void PbmNewBuffer(BufferDesc * const buf) {
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
 	stats->pbm_iscan_stats = search_or_create_idxscan_entry(&buf->tag.rnode);
 	for (int i = 0; i < PBM_IDX_NUM_MARKERS; ++i) {
-		stats->idx_markers[i] = (struct PbmBufferIdxScanMarker){
+		stats->idx_markers[i] = (struct PbmBufferIdxScanMarker) {
 			.entry = NULL,
 			.scan_id = 0,
 		};
@@ -1375,6 +1388,9 @@ void PbmNewBuffer(BufferDesc * const buf) {
  * Notify the PBM when we *remove* a buffer to keep data structure up to date.
  */
 void PbmOnEvictBuffer(BufferDesc *const buf) {
+#if PBM_TRACK_STATS
+	PbmBufferDescStats * stats;
+#endif
 #if defined(TRACE_PBM) && defined(TRACE_PBM_BUFFERS) && defined(TRACE_PBM_BUFFERS_EVICT)
 	static int num_evicted = 0;
 	elog(WARNING, "evicting buffer %d tbl={spc=%u, db=%u, rel=%u, fork=%d} block#=%u, #evictions=%d",
@@ -1404,14 +1420,15 @@ void PbmOnEvictBuffer(BufferDesc *const buf) {
 #endif /* PBM_TRACK_BLOCKGROUP_BUFFERS */
 
 #if PBM_TRACK_STATS
-	clear_buffer_stats(get_buffer_stats(buf));
+	stats = get_buffer_stats(buf);
+	clear_buffer_stats(stats);
 #endif /* PBM_TRACK_STATS */
 
 #if PBM_EVICT_MODE == PBM_EVICT_MODE_SAMPLING
 	/* If we had cached the block group for this buffer, clear it */
-	get_buffer_stats(buf)->pbm_bg = NULL;
-	get_buffer_stats(buf)->pbm_iscan_stats = NULL;
-	get_buffer_stats(buf)->trailing_idx_next_access = AccessTimeNotRequested;
+	stats->pbm_bg = NULL;
+	stats->pbm_iscan_stats = NULL;
+	stats->trailing_idx_next_access = AccessTimeNotRequested;
 #endif
 }
 
@@ -1927,7 +1944,9 @@ static inline IndexScanStatsEntry * alloc_idxscan_stats(void) {
 	}
 
 	/* Zero stats */
+#ifdef PBM_INDEX_SCAN_USE_COUNTS
 	memset(&stats->counts, 0, sizeof(stats->counts));
+#endif
 	stats->total_count = 0;
 	stats->loop_count = 0;
 #if defined(TRACE_PBM_INDEX_PROGRESS)
@@ -2391,9 +2410,10 @@ unsigned long BlockGroupTimeToNextConsumption(BlockGroupData *const bgdata, bool
 
 /* Calculate `lambda`/"rate" parameter for access distribution of an index scan. */
 double idx_scan_est_lambda(const uint64 blk_idx, const IndexScanStatsEntry * stats_entry) {
-	bool sane = true;
 	double est_lambda;
 
+#ifdef PBM_INDEX_SCAN_USE_COUNTS
+	bool sane = true;
 	/* Extract stats from the entry */
 	const uint64 nblocks = stats_entry->nblocks;
 	const uint64 cur_bucket_accesses = stats_entry->counts[blk_idx];
@@ -2439,15 +2459,17 @@ double idx_scan_est_lambda(const uint64 blk_idx, const IndexScanStatsEntry * sta
 		/* If sanity checks fail, ignore counts and just use over-all average inter-access */
 		est_lambda = est_speed / (double)nblocks;
 	}
+#else /* ~not~ PBM_INDEX_SCAN_USE_COUNTS */
+	/* If not using the inverse frequency counts, just use the average inter-access time. */
+	est_lambda = stats_entry->est_speed / stats_entry->nblocks;
+#endif /* PBM_INDEX_SCAN_USE_COUNTS */
 	return est_lambda;
 }
 
 /*
  * Estimate the average time to next access of the index scans on the buffer.
  */
-unsigned long BlockPageTimeToNextIndexAccess(BufferDesc * buf, bool * requested) {
-	IndexScanHashEntry *const stats = get_buffer_stats(buf)->pbm_iscan_stats;
-	const BlockNumber blk = buf->tag.blockNum;
+unsigned long BlockPageTimeToNextIndexAccess(IndexScanHashEntry *const stats, bool * requested, const BlockNumber blk) {
 	const uint64 b_idx = blk % PBM_INDEX_SCAN_NUM_COUNTS;
 	double lambda = 0.;
 
@@ -2755,6 +2777,8 @@ void init_buffer_stats(PbmBufferDescStatsPadded * stats) {
 }
 
 PbmBufferDescStats * get_buffer_stats(const BufferDesc *const buf) {
+	Assert(NULL != buf);
+	Assert(0 <= buf->buf_id && buf->buf_id < NBuffers);
 	return &pbm->buffer_stats[buf->buf_id].stats;
 }
 
@@ -2871,7 +2895,7 @@ uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_acc
 /* Handle buffer index scan markers: check for a trailing scan and write the new marker */
 void index_scan_buf_marker(const struct IndexScanDescData *scandesc, IndexScanStatsEntry *pbm_stats) {
 	/* Index scan markers: check for markers to detect trailing scans */
-	Buffer cur_buffer = ((IndexFetchHeapData *)scandesc->xs_heapfetch)->xs_cbuf;
+	Buffer cur_buffer;
 	BufferDesc * buf;
 	PbmBufferDescStats * buf_stats;
 	bool has_empty_slot = false, has_same_idx = false;
@@ -2880,7 +2904,11 @@ void index_scan_buf_marker(const struct IndexScanDescData *scandesc, IndexScanSt
 	struct PbmBufferIdxScanMarker * m;
 	uint64 now = get_time_ns();
 
+	Assert(pbm_stats != NULL);
+	Assert(scandesc != NULL && scandesc->xs_heapfetch != NULL);
+	cur_buffer = ((IndexFetchHeapData *)scandesc->xs_heapfetch)->xs_cbuf;
 	Assert(cur_buffer > 0); /* Always expect a valid buffer */
+	Assert(scandesc->indexRelation != NULL);
 
 	buf = GetBufferDescriptor(cur_buffer - 1);
 	buf_stats = get_buffer_stats(buf);
@@ -3186,6 +3214,7 @@ static void evict_rest_of_block_group(BlockGroupData *const bgdata, const Buffer
 BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 	BufferDesc * buf;
 	PbmBufferDescStats * buf_stats;
+	IndexScanHashEntry * buf_idx_stats;
 	uint32 local_buf_state;
 	BlockGroupData * bgdata;
 	bool requested, last_eviction;
@@ -3199,6 +3228,10 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 
 	// find the configured number of samples
 	while (n_selected < pbm_evict_num_samples) {
+		int naccesses;
+		bool requested_idx = false, requested_seq = false, has_trailing = false;
+		uint64 bg_next_consumption, idx_next_consumption, buffer_est_inter_access, trailing_idx_next_consumption;
+
 		/* Pick a random buffer */
 		buf = GetBufferDescriptor(random() % NBuffers);
 		buf_stats = get_buffer_stats(buf);
@@ -3224,6 +3257,10 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 		/* Copy the tag and cached block group atomically before unlocking */
 		samples[n_selected].tag = buf->tag;
 		bgdata = buf_stats->pbm_bg;
+		buf_idx_stats = buf_stats->pbm_iscan_stats;
+#if PBM_TRACK_STATS
+		trailing_idx_next_consumption = buf_stats->trailing_idx_next_access;
+#endif
 		UnlockBufHdr(buf, local_buf_state);
 
 		/* Sanity checks */
@@ -3233,40 +3270,37 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 		/* Compute time to next access */
 		/* NOTE: here "next_access" is "time to next access" NOT "next access time". */
 		now = get_time_ns();
-		{ /* Scope to silence -Wdeclaration-after-statement... */
-			int naccesses;
-			bool requested_idx = false, requested_seq = false, has_trailing = false;
-			uint64 bg_next_consumption = BlockGroupTimeToNextConsumption(bgdata, &requested_seq, now);
-			uint64 idx_next_consumption = BlockPageTimeToNextIndexAccess(buf, &requested_idx);
-#if PBM_TRACK_STATS
-			uint64 buffer_est_inter_access = est_inter_access_time(buf_stats, now, &naccesses);
-			uint64 trailing_idx_next_consumption = buf_stats->trailing_idx_next_access;
-			has_trailing = (trailing_idx_next_consumption > now)
-					&& (trailing_idx_next_consumption != AccessTimeNotRequested);
-#endif
-			requested = (requested_idx || requested_seq);
 
-			/* Combine estimates as appropriate */
-			next_access = INT64_MAX;
-			if (requested_seq) {
-				next_access = bg_next_consumption;
-			}
-			if (requested_idx) {
-				next_access = Min(next_access, idx_next_consumption);
-			}
+		bg_next_consumption = BlockGroupTimeToNextConsumption(bgdata, &requested_seq, now);
+		idx_next_consumption = BlockPageTimeToNextIndexAccess(buf_idx_stats, &requested_idx,
+															  samples[n_selected].tag.blockNum);
 #if PBM_TRACK_STATS
-			if (pbm_evict_use_freq && naccesses > 1) {
-				/* Only consider inter-access time if there is at least once access */
-				next_access = Min(next_access, buffer_est_inter_access);
-				/* Set requested so we don't re-use it immediately in next block */
-				requested = true;
-			}
-			if (has_trailing) {
-				next_access = Min(next_access, trailing_idx_next_consumption);
-				requested = true;
-			}
+		buffer_est_inter_access = est_inter_access_time(buf_stats, now, &naccesses);
+		has_trailing = (trailing_idx_next_consumption > now)
+				&& (trailing_idx_next_consumption != AccessTimeNotRequested);
 #endif
+		requested = (requested_idx || requested_seq);
+
+		/* Combine estimates as appropriate */
+		next_access = INT64_MAX;
+		if (requested_seq) {
+			next_access = bg_next_consumption;
 		}
+		if (requested_idx) {
+			next_access = Min(next_access, idx_next_consumption);
+		}
+#if PBM_TRACK_STATS
+		if (pbm_evict_use_freq && naccesses > 1) {
+			/* Only consider inter-access time if there is at least once access */
+			next_access = Min(next_access, buffer_est_inter_access);
+			/* Set requested so we don't re-use it immediately in next block */
+			requested = true;
+		}
+		if (has_trailing) {
+			next_access = Min(next_access, trailing_idx_next_consumption);
+			requested = true;
+		}
+#endif
 
 		samples[n_selected].next_access_time = next_access;
 
