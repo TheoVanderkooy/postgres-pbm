@@ -249,6 +249,9 @@ void InitPBM(void) {
 
 		dlist_init(&pbm->free_idxscan_stats);
 		SpinLockInit(&pbm->free_idxscan_stats_lock);
+#ifdef TRACE_PBM_REGISTER_INDEX
+		pbm->dbg_alloced_index_scans = 0;
+#endif
 	} else {
 		pbm->IndexScanMap = NULL;
 	}
@@ -1941,6 +1944,10 @@ static inline IndexScanStatsEntry * alloc_idxscan_stats(void) {
 	/* Allocate a new one if not found */
 	if (NULL == stats) {
 		stats = ShmemAlloc(sizeof(IndexScanStatsEntry));
+#ifdef TRACE_PBM_REGISTER_INDEX
+		pbm->dbg_alloced_index_scans += 1;
+		elog(WARNING, "alloced index scan: total=%d", pbm->dbg_alloced_index_scans);
+#endif
 	}
 
 	/* Zero stats */

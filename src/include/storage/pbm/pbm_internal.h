@@ -92,7 +92,7 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 
 
 /* Number of buckets for index scan stats. */
-#define PBM_INDEX_SCAN_NUM_COUNTS (1 << 14)
+#define PBM_INDEX_SCAN_NUM_COUNTS (1 << 12)
 
 /* Whether to use the inverse frequency counts. */
 #define PBM_INDEX_SCAN_USE_COUNTS
@@ -467,6 +467,9 @@ typedef struct PbmShared {
 	struct HTAB * IndexScanMap;
 	slock_t free_idxscan_stats_lock;
 	dlist_head free_idxscan_stats;
+#ifdef TRACE_PBM_REGISTER_INDEX
+	_Atomic(int) dbg_alloced_index_scans;
+#endif
 	/// Global estimate of speed for *new* index scans
 	_Atomic(float) initial_est_idx_speed;
 
