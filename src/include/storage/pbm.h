@@ -20,6 +20,7 @@ extern unsigned long pbm_bg_naest_max_age_ns;
 extern bool pbm_evict_whole_group;
 extern bool pbm_evict_use_freq;
 extern bool pbm_evict_use_idx_scan;
+extern int pbm_idx_scan_num_counts;
 
 
 /* ===== FORWARD DECLARATIONS (sorted) ===== */

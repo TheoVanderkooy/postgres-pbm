@@ -3592,6 +3592,17 @@ static struct config_int ConfigureNamesInt[] =
 		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
 	},
 
+	{
+		.gen = {
+			.name = "pbm_idx_scan_num_counts", .context = PGC_POSTMASTER, .group = RESOURCES_MEM,
+			.short_desc = gettext_noop("# of buckets for index scan frequency counts"),
+			.long_desc = gettext_noop("0 to disable"),
+		},
+		.variable = &pbm_idx_scan_num_counts,
+		.boot_val = 0, .min = 0, .max = (1 << 24),
+		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL
