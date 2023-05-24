@@ -416,7 +416,8 @@ typedef struct PbmBufferDescStats {
 
 typedef union PbmBufferDescStatsPadded {
 	PbmBufferDescStats stats;
-	char padding[192]; /* 64*4 */
+	char padding[128]; /* 64*2 */
+//	char padding[192]; /* 64*3 */
 } PbmBufferDescStatsPadded;
 
 /*

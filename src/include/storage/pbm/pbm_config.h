@@ -76,7 +76,7 @@
  * seen (every tuple!) and if they are consistently overwritten, then the
  * trailing scans are not defining the lowest time-to-next-access so that info
  * is not all that important. */
-#define PBM_IDX_NUM_MARKERS 3
+#define PBM_IDX_NUM_MARKERS 2
 
 /* Track average eviction time and periodically log it. */
 //#define PBM_TRACK_EVICTION_TIME
