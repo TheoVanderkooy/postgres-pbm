@@ -92,7 +92,7 @@ static const uint64_t PQ_TimeSlice = 100 * NS_PER_MS;
 
 
 /* Number of buckets for index scan stats. */
-#define PBM_INDEX_SCAN_NUM_COUNTS (1 << 12)
+#define PBM_INDEX_SCAN_NUM_COUNTS (1 << 14)
 
 /* Whether to use the inverse frequency counts. */
 #define PBM_INDEX_SCAN_USE_COUNTS
