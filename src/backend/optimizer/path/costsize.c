@@ -570,9 +570,10 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 	path->indextotalcost = indexTotalCost;
 	path->indexselectivity = indexSelectivity;
 
-	/* PBM: save loop count estimate to know whether to register the index scan
-	 * or not. For now this is only for index scans. */
+	/* PBM: save loop count estimate and index correlation to know whether to
+	 * register the index scan or not. For now this is only for index scans. */
 	path->path.loops = loop_count;
+	path->path.idx_correlation = indexCorrelation;
 
 	/* all costs for touching index itself included here */
 	startup_cost += indexStartupCost;
@@ -580,6 +581,9 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 
 	/* estimate number of main-table tuples fetched */
 	tuples_fetched = clamp_row_est(indexSelectivity * baserel->tuples);
+
+	/* PBM: also want to know # of tuples at runtime */
+	path->path.rel_tuples = baserel->tuples;
 
 	/* fetch estimated page costs for tablespace containing table */
 	get_tablespace_page_costs(baserel->reltablespace,

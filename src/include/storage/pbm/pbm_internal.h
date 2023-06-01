@@ -282,6 +282,9 @@ typedef struct IndexScanStatsEntry {
 	double plan_loops;
 	BlockNumber nblocks;
 	double accesses_per_block;
+	double correlation;
+	double rel_tuples;
+	double rel_tuples_per_block;
 
 	/* List entry + the hash entry it is in. Protected by the entry's lock */
 	dlist_node dlist;
@@ -292,6 +295,7 @@ typedef struct IndexScanStatsEntry {
 	_Atomic(int) dbg_times_reported;
 #endif /* TRACE_PBM_INDEX_PROGRESS */
 	_Atomic(uint64) total_count;
+	_Atomic(BlockNumber) cur_blk;
 	_Atomic(unsigned int) loop_count;
 
 	/* These stats updated atomically */

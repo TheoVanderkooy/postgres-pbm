@@ -1056,6 +1056,8 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	IndexScanStatsEntry * stats;
 	const double rows = scan->ss.ps.plan->plan_rows;
 	const double loops = scan->ss.ps.plan->plan_loops;
+	const double idx_corr = scan->ss.ps.plan->plan_idx_correlation;
+	const double rel_tuples = scan->ss.ps.plan->plan_rel_tuples;
 	const double exp_accesses = rows * loops;
 	double accesses_per_block;
 	BlockNumber nblocks;
@@ -1110,9 +1112,10 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	if (id < 200 || id % 5000 == 0)
 	{
 		elog(WARNING, "PBM_RegisterIndexScan(%lu) rel=%u   "
-					  "plan_rows=%f loops=%f blocks=%u"
+					  "plan_rows=%f loops=%f blocks=%u corr=%f tuples=%f"
 			 , id, scan->ss.ss_currentRelation->rd_node.relNode
 			 , scan->ss.ps.plan->plan_rows, scan->ss.ps.plan->plan_loops, nblocks
+			 , idx_corr, rel_tuples
 		);
 	}
 #endif /* TRACE_PBM_REGISTER_INDEX */
@@ -1124,6 +1127,9 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	stats->plan_loops = loops;
 	stats->nblocks = nblocks;
 	stats->accesses_per_block = accesses_per_block;
+	stats->correlation = idx_corr;
+	stats->rel_tuples = rel_tuples;
+	stats->rel_tuples_per_block = (rel_tuples <= 0. ? 1. : rel_tuples / nblocks);
 	/* Initial stat estimates */
 	SpinLockInit(&stats->stats_lock);
 	SpinLockInit(&stats->leading_scan_lock);
@@ -1210,6 +1216,7 @@ void PBM_UnregisterIndexScan(struct IndexScanState * scan) {
 void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 	IndexScanStatsEntry * pbm_stats;
 	BlockNumber cur_cnt;
+	BlockNumber blk = ItemPointerGetBlockNumber(&scandesc->xs_heaptid);
 
 	if (NULL != scandesc->parallel_scan && NULL != scandesc->parallel_scan->pbm_stats) {
 		/* Registered parallel scan */
@@ -1235,8 +1242,8 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 
 	/* Update scan stats */
 	cur_cnt = (pbm_stats->total_count += 1);
+	pbm_stats->cur_blk = blk;
 	if (pbm_idx_scan_num_counts > 0) {
-		BlockNumber blk = ItemPointerGetBlockNumber(&scandesc->xs_heaptid);
 		pbm_stats->counts[blk % pbm_idx_scan_num_counts] += 1;
 	}
 
@@ -2481,6 +2488,7 @@ double idx_scan_est_lambda(const uint64 blk_idx, const IndexScanStatsEntry * sta
 unsigned long BlockPageTimeToNextIndexAccess(IndexScanHashEntry *const stats, bool * requested, const BlockNumber blk) {
 	const uint64 b_idx = pbm_idx_scan_num_counts > 0 ? blk % pbm_idx_scan_num_counts : blk;
 	double lambda = 0.;
+	uint64 seq_idx_next = AccessTimeNotRequested;
 
 	*requested = false;
 
@@ -2497,15 +2505,32 @@ unsigned long BlockPageTimeToNextIndexAccess(IndexScanHashEntry *const stats, bo
 			 * all buckets and is inserted into during the scan. Ignore this? */
 			if (blk >= entry->nblocks) continue;
 
-			est_lambda = idx_scan_est_lambda(b_idx, entry);
 
 			/* We are assuming geometric distribution, so with multiple scans
 			 * the rate of the minimum is the sum of the individual rates
 			 * https://en.wikipedia.org/wiki/Exponential_distribution
 			 */
 
-			lambda += est_lambda;
-			*requested = true;
+
+			/* If index correlation is high, treat it as sequential. Otherwise,
+			 * assume a geometric distribution. */
+			if (entry->correlation > 0.9) {
+				const BlockNumber idx_cur_blk = entry->cur_blk;
+
+				/* if before cur position, then we've already gone past */
+				if (blk >= idx_cur_blk) {
+					const uint64 dist_tuples = (uint64)((blk - idx_cur_blk) * entry->rel_tuples_per_block);
+					const uint64 dist_t = (uint64)((double)dist_tuples / entry->est_speed);
+
+					seq_idx_next = Min(seq_idx_next, dist_t);
+
+					*requested = true;
+				}
+			} else {
+				est_lambda = idx_scan_est_lambda(b_idx, entry);
+				lambda += est_lambda;
+				*requested = true;
+			}
 
 #ifdef TRACE_PBM_IDX_EVICT_CALC
 			if (0 == buf->buf_id) {
@@ -2529,9 +2554,10 @@ unsigned long BlockPageTimeToNextIndexAccess(IndexScanHashEntry *const stats, bo
 	}
 #endif
 
-	/* For geometric distribution: expected value is 1/lambda */
+	/* For geometric distribution: expected value is 1/lambda.
+	 * Also consider estimate based on "sequential indexes" */
 	if (*requested) {
-		return (uint64)(1. / lambda);
+		return Min((uint64)(1. / lambda), seq_idx_next);
 	} else {
 		return AccessTimeNotRequested;
 	}

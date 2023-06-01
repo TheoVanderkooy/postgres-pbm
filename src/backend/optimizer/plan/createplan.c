@@ -5320,7 +5320,11 @@ copy_generic_path_info(Plan *dest, Path *src)
 	dest->startup_cost = src->startup_cost;
 	dest->total_cost = src->total_cost;
 	dest->plan_rows = src->rows;
+	/* PBM: copy some extra fields for index scans.
+	 * Probably these shouldn't be in "generic path info" but this is easier! */
 	dest->plan_loops = src->loops;
+	dest->plan_idx_correlation = src->idx_correlation;
+	dest->plan_rel_tuples = src->rel_tuples;
 	dest->plan_width = src->pathtarget->width;
 	dest->parallel_aware = src->parallel_aware;
 	dest->parallel_safe = src->parallel_safe;

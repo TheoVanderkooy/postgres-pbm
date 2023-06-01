@@ -123,6 +123,8 @@ typedef struct Plan
 	double		plan_rows;		/* number of rows plan is expected to emit */
 	double		plan_loops;		/* number of loops expected */ /* PBM for now: only valid for index scans */
 	int			plan_width;		/* average row width in bytes */
+	double		plan_idx_correlation; /* correlation of the index */ /* PBM: used for handling indexes -- probably should be index-specific */
+	double		plan_rel_tuples;/* total # of tuples in the table */ /* PBM: used for handling "sequential index scans" */
 
 	/*
 	 * information needed for parallel query

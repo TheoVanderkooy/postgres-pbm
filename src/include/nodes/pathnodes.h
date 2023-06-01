@@ -1188,6 +1188,8 @@ typedef struct Path
 	/* estimated size/costs for path (see costsize.c for more info) */
 	double		rows;			/* estimated number of result tuples */
 	double		loops;			/* estimated number of loops */ /* PBM: for now only used to know whether to register index scans or not. */
+	double		idx_correlation;/* correlation of the index */ /* PBM: use this to know how to handle the scan */
+	double		rel_tuples;		/* # of table tuples */ /* PBM: use this for "sequential index scans" */
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
 
