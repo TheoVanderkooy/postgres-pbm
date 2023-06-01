@@ -1261,6 +1261,7 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 
 	/* Trailing index scans:
 	 * Write and check index scan markers on the buffer if appropriate. */
+// TODO: should only consider this if the index orders the tuples (btrees)
 	if (pbm_stats->plan_rows >= PBM_TRAILING_IDX_MIN_ROWS) {
 		index_scan_buf_marker(scandesc, pbm_stats);
 	}

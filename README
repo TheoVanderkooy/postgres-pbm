@@ -4,12 +4,15 @@ PBM in postgres
 Potential implementation improvements
 -------------------------------------
 - Use dynamic shared memory (dsa.h) for the PBM data structures?
+- Ordered index scans (B-Trees): should have special handling for when the index order is correlated with physical order - can treat it similar to a sequential scan (but need to re-implement still...)
 - ...
 
 Known bugs
 ----------
 - For pbm_part1: it is technically possible for 2 workers to try to load the same buffer at the same time, both allocate *from the free list*, and one of them leaks the free list buffer when it sees someone else loaded the block it wanted. For clock or sampling, the invalid buffer will eventually get found again, but for PBM1 we won't have a reference to it and it is lost.
 - If a query is cancelled (fails, etc.) the PBM unregister functions may not be called because the End*Scan methods are not called...
+- Sequential scans currently don't handle backwards scans properly
+- Trailing index scans: should only be considered if the index sorts the output (e.g. btrees)
 - ...
 
 
