@@ -383,7 +383,7 @@ heap_setscanlimits(TableScanDesc sscan, BlockNumber startBlk, BlockNumber numBlk
 #ifdef USE_PBM
 	/* Want to know if this happens... is it just for TID scans and building indices? */
 	if (scan->pbmSharedScanData != NULL) {
-		elog(WARNING, "PBM setting scan limits for a registered scan! "
+		elog(DEBUG1, "PBM setting scan limits for a registered scan! "
 					  "id=%lu, start=%u, num=%d",
 			scan->scanId, startBlk, numBlks
 		);
