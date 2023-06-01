@@ -2117,7 +2117,7 @@ static struct config_bool ConfigureNamesBool[] =
 			.short_desc = gettext_noop("Whether to evict a whole block group at once."),
 		},
 		.variable = &pbm_evict_whole_group,
-		.boot_val = true,
+		.boot_val = false,
 		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
 	},
 
