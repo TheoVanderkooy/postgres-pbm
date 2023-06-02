@@ -2488,6 +2488,7 @@ double idx_scan_est_lambda(const uint64 blk_idx, const IndexScanStatsEntry * sta
 unsigned long BlockPageTimeToNextIndexAccess(IndexScanHashEntry *const stats, bool * requested, const BlockNumber blk) {
 	const uint64 b_idx = pbm_idx_scan_num_counts > 0 ? blk % pbm_idx_scan_num_counts : blk;
 	double lambda = 0.;
+	bool has_lambda = false;
 	uint64 seq_idx_next = AccessTimeNotRequested;
 
 	*requested = false;
@@ -2529,6 +2530,7 @@ unsigned long BlockPageTimeToNextIndexAccess(IndexScanHashEntry *const stats, bo
 			} else {
 				est_lambda = idx_scan_est_lambda(b_idx, entry);
 				lambda += est_lambda;
+				has_lambda = true;
 				*requested = true;
 			}
 
@@ -2556,10 +2558,12 @@ unsigned long BlockPageTimeToNextIndexAccess(IndexScanHashEntry *const stats, bo
 
 	/* For geometric distribution: expected value is 1/lambda.
 	 * Also consider estimate based on "sequential indexes" */
-	if (*requested) {
+	if (!*requested) {
+		return AccessTimeNotRequested;
+	} else if (has_lambda) {
 		return Min((uint64)(1. / lambda), seq_idx_next);
 	} else {
-		return AccessTimeNotRequested;
+		return seq_idx_next;
 	}
 }
 
