@@ -294,9 +294,10 @@ typedef struct IndexScanStatsEntry {
 #if defined(TRACE_PBM_INDEX_PROGRESS)
 	_Atomic(int) dbg_times_reported;
 #endif /* TRACE_PBM_INDEX_PROGRESS */
-	_Atomic(uint64) total_count;
+	_Atomic(uint64) total_count; /* count since scan started */
+	_Atomic(uint64) count_this_loop; /* only in this loop; reset on rescan */
 	_Atomic(BlockNumber) cur_blk;
-	_Atomic(unsigned int) loop_count;
+	_Atomic(unsigned int) loop_count; /* # of loops */
 
 	/* These stats updated atomically */
 	slock_t stats_lock;
