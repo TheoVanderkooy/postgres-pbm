@@ -25,6 +25,7 @@
 #include "lib/simplehash.h"
 
 #include <time.h>
+#include <stdatomic.h>
 
 // TODO! look for ### comments --- low-priority/later TODOs
 // TODO! look for DEBUGGING comments and disable/remove them once they definitely aren't needed
@@ -118,6 +119,7 @@ static inline unsigned long ScanTimeToNextConsumption(const BlockGroupScanListEl
 
 static unsigned long BlockGroupTimeToNextConsumption(BlockGroupData * bgdata, bool * requestedPtr, unsigned long now);
 static inline double idx_scan_est_lambda(uint64 blk_idx, const IndexScanStatsEntry * stats_entry);
+static inline uint64 idx_seq_next_access(BlockNumber blk, const IndexScanStatsEntry * entry);
 static unsigned long BlockTimeToNextIndexAccess(IndexScanHashEntry * stats, bool *requested, BlockNumber blk
 #ifdef TRACE_PBM_IDX_EVICT_CALC
 												, int buf_id, struct buftag* rel
@@ -1247,10 +1249,37 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 
 	/* Update scan stats */
 	cur_cnt = (pbm_stats->total_count += 1);
-	pbm_stats->count_this_loop += 1;
-	pbm_stats->cur_blk = blk;
 	if (pbm_idx_scan_num_counts > 0) {
 		pbm_stats->counts[blk % pbm_idx_scan_num_counts] += 1;
+	}
+
+	/* Update seq-idx-specific stats */
+	{
+		_Atomic(BlockNumber) prev = atomic_exchange(&pbm_stats->cur_blk, blk);
+		if (blk < prev) {
+			_Atomic(BlockNumber) prev_first;
+			_Atomic(uint64) prev_count;
+			uint64 prev_range;
+
+			/* New key, update tracking accordingly */
+			/* Track previous block range */
+			pbm_stats->max_blk_prev_key = prev;
+			prev_first = atomic_exchange(&pbm_stats->first_blk_cur_key, blk);
+			prev_range = (prev - prev_first) + 1;
+			prev_count = atomic_exchange(&pbm_stats->count_this_key, 0);
+
+			if (prev_count > 4) {
+				double prev_density = (double) prev_count / (double) prev_range;
+				if (pbm_stats->tuple_density == 0.) {
+					pbm_stats->tuple_density = prev_density;
+				} else {
+					pbm_stats->tuple_density = pbm_stats->tuple_density * 0.8 + prev_density * 0.2;
+				}
+			}
+		}
+
+		pbm_stats->count_this_loop += 1;
+		pbm_stats->count_this_key += 1;
 	}
 
 	/* Update speed estimate if appropriate:
@@ -1315,6 +1344,10 @@ void PBM_ReportIndexScanRescan(struct IndexScanState * scan) {
 	pbm_stats->count_this_loop = 0;
 	pbm_stats->trailing_delay = AccessTimeNotRequested;
 	index_scan_unregister_leading_scan(pbm_stats);
+	/* For sequential index scans: */
+	pbm_stats->cur_blk = InvalidBlockNumber;
+	pbm_stats->max_blk_prev_key = InvalidBlockNumber;
+	pbm_stats->first_blk_cur_key = InvalidBlockNumber;
 }
 
 
@@ -1972,6 +2005,11 @@ static inline IndexScanStatsEntry * alloc_idxscan_stats(void) {
 	stats->total_count = 0;
 	stats->loop_count = 0;
 	stats->count_this_loop = 0;
+	stats->count_this_key = 0;
+	stats->cur_blk = InvalidBlockNumber;
+	stats->max_blk_prev_key = InvalidBlockNumber;
+	stats->first_blk_cur_key = InvalidBlockNumber;
+	stats->tuple_density = 0.;
 #if defined(TRACE_PBM_INDEX_PROGRESS)
 	stats->dbg_times_reported = 0;
 #endif /* TRACE_PBM_INDEX_PROGRESS */
@@ -2492,6 +2530,139 @@ double idx_scan_est_lambda(const uint64 blk_idx, const IndexScanStatsEntry * sta
 }
 
 /*
+ * Estimate when a specific index will next reach this block for a "sequential index scan"
+ */
+uint64 idx_seq_next_access(const BlockNumber blk, const IndexScanStatsEntry *const entry) {
+	const BlockNumber idx_cur_blk = entry->cur_blk;
+	const BlockNumber max_blk_prev_key = entry->max_blk_prev_key;
+	const BlockNumber first_blk_cur_key = entry->first_blk_cur_key;
+	const uint64 idx_count_this_loop = entry->count_this_loop;
+	const uint64 idx_count_this_key = entry->count_this_key;
+	double tup_density = entry->tuple_density;
+	double rel_tuples_per_block = entry->rel_tuples_per_block;
+
+	/* Scan hasn't actually started yet, have no idea about what it's doing yet */
+	if (idx_cur_blk == InvalidBlockNumber) {
+		return AccessTimeNotRequested;
+	}
+
+#ifdef TRACE_PBM_IDX_EVICT_CALC
+	if (0 == blk % 10000) {
+		elog(WARNING, //"scan=%lu: "
+					  //"correlation=%f,  "
+					  "blk=%u, density=%f, "
+					  "\n\t\t\t\t\t\t[first_cur=%u, idx_cur=%u, max_pre=%u], "
+		, blk, tup_density
+		, first_blk_cur_key, idx_cur_blk, max_blk_prev_key
+		);
+	}
+#endif
+
+	/* Before anything related to the current key: not likely to be accessed again by this scan. */
+	if (blk < first_blk_cur_key) { /* includes first_blk_cir_key == InvalidBlockNumber */
+		return AccessTimeNotRequested;
+	}
+
+	/* Calculate average # of tuples per block accessed for one key if not already estimated. */
+	if (tup_density == 0.) {
+		if (idx_count_this_key > 4) {
+			tup_density = (double) idx_count_this_key / (idx_cur_blk - first_blk_cur_key);
+		} else {
+			/* Not enough information yet, make an arbitrary guess. */
+			tup_density = 5.;
+		}
+	}
+
+	if (first_blk_cur_key <= blk && blk < idx_cur_blk) {
+		/* Won't be accessed again by this key, but could be by the next one.*/
+
+		BlockNumber blk_dist;
+
+		/* Compare tuples/block for one key to the over-all tuples/block.
+		 * if high, assume we won't wrap back around to this block */
+		if (tup_density > 0.5 * rel_tuples_per_block) {
+			return AccessTimeNotRequested;
+		}
+		/* ### really should do something more sophisticated, maybe try to estimate
+		 * what portion of leading blocks will get re-scanned. */
+
+		/* Guess that we'll "wrap around" back to it with the next key. */
+		blk_dist = (blk - first_blk_cur_key) + (max_blk_prev_key - idx_cur_blk);
+
+		/* estimate # of blocks -> # of tuples, then divide by speed to get time */
+		return (uint64)((tup_density * (double)blk_dist) / entry->est_speed);
+
+	} else if (idx_cur_blk <= blk && max_blk_prev_key == InvalidBlockNumber) {
+		/* Block is in the future and we either haven't wrapped around yet, or
+		 * never will because this is "sequential". */
+
+		BlockNumber blk_dist = (blk - idx_cur_blk);
+
+		/* Guess distance somewhere between what it would be if we continued at current rate,
+		 * or fully scan every block in between first. */
+		double tups_direct = tup_density * (double)blk_dist;
+		double tups_slow = rel_tuples_per_block * (double)blk_dist;
+
+		//### very simplistic: just the average unless this seems like a true-sequential scan
+		double tups_guess = (tup_density * 0.5 > rel_tuples_per_block)
+				? tups_slow
+				: (tups_direct + tups_slow) / 2.;
+
+		return (uint64) (tups_guess / entry->est_speed);
+
+	} else if (idx_cur_blk <= blk && blk <= max_blk_prev_key) { /* also: max_blk_prev_key != InvalidBlockNumber */
+		/* Likely to be accessed again by this key */
+
+		BlockNumber blk_dist = (blk - idx_cur_blk);
+
+		/* estimate # of blocks -> # of tuples, then divide by speed to get time */
+		return (uint64)((tup_density * (double)blk_dist) / entry->est_speed);
+
+	} else { /* blk > max_blk_prev_key */
+		/* Blocks not likely to be accessed for this key, but maybe later keys */
+
+		/* Estimate # of tuples until we reach the block */
+		double dist_tups = 0.;
+
+		/* from current position to prev_max_blk at the current rate */
+		if (max_blk_prev_key > idx_cur_blk) {
+			dist_tups += tup_density * (double) (max_blk_prev_key - idx_cur_blk);
+		}
+
+		/*
+		 * Then estimate everything between:
+		 *
+		 * The scan will go forwards, then jump backwards when it gets to a new key in the range.
+		 * If we assume each segment is roughly the same length, we can estimate how many times
+		 * we'll see each block before the specified one.
+		 *
+		 * 1. For blocks between prev_first_blk and prev_max_blk: prev_first_blk probably will never
+		 *    be accessed again, and prev_max_blk will probably need to read every tuple before the
+		 *    new block is accessed. If the range of blocks shifts by roughly the same amount each
+		 *    time it jumps back, then between this range the blocks will *on average* need to access
+		 *    half their tuples.
+		 * 2. Then between prev_max_blk and `blk`, some of them will access every block and some of them
+		 *    not. We estimate that the range of blocks accessed less than their full count is the same
+		 *    as the current range between prev_first_blk and prev_max_blk, and with the same assumption
+		 *    about uniform shifts the number we would over-count is the same as what is calculated in
+		 *    step 1.
+		 * 3. Thus step 1 and the over-counting of step 2 cancel out, so we count the blocks between
+		 *    prev_max and `blk` and assume that every tuple will be accessed (on average).
+		 */
+		dist_tups += rel_tuples_per_block * (double)(blk - max_blk_prev_key);
+
+		/* Check for end of the scan: if the distance is too far we assume the scan won't get that far.
+		 * allow a slightly larger range in case of bad estimates. */
+		if ((double)idx_count_this_loop + dist_tups > entry->plan_rows * 1.1) {
+			return AccessTimeNotRequested;
+		}
+
+		/* Finally, divide tuples by speed to get estimated time. */
+		return (uint64)(dist_tups / entry->est_speed);
+	}
+}
+
+/*
  * Estimate the average time to next access of the index scans on the buffer.
  */
 unsigned long BlockTimeToNextIndexAccess(IndexScanHashEntry *const stats, bool * requested, const BlockNumber blk
@@ -2522,24 +2693,14 @@ unsigned long BlockTimeToNextIndexAccess(IndexScanHashEntry *const stats, bool *
 			/* If index correlation is high, treat it as sequential. Otherwise,
 			 * assume a geometric distribution. */
 			if (entry->correlation > 0.9) {
-				const BlockNumber idx_cur_blk = entry->cur_blk;
-				const uint64 idx_count = entry->total_count;
+				uint64 this_idx_next = idx_seq_next_access(blk, entry);
 
-				const uint64 dist_blks = (blk - idx_cur_blk);
-				const uint64 dist_tuples = (uint64)((double)dist_blks * entry->rel_tuples_per_block);
-
-				/* Only requested sequentially if we haven't passed the block yet
-				 * AND the block is within the range we expect to access.
-				 * `dist_blks < 10` is there for the case of a scan which is
-				 * longer than expected to always reserver the next few blocks ahead.*/
-				if (dist_blks >= 0 && (dist_blks < 10 || dist_tuples + idx_count <= (uint64)entry->plan_rows)) {
-					const uint64 dist_t = (uint64)((double)dist_tuples / entry->est_speed);
-
-					seq_idx_next = Min(seq_idx_next, dist_t);
-
+				if (this_idx_next != AccessTimeNotRequested) {
 					*requested = true;
+					seq_idx_next = Min(seq_idx_next, this_idx_next);
 				}
-			// TODO should consider negative correlation => backwards sequential...
+
+				// TODO should consider negative correlation => backwards sequential...
 			} else {
 				/* Uncorrelated index scan case: */
 				/* We are assuming geometric distribution, so with multiple scans
@@ -2552,24 +2713,27 @@ unsigned long BlockTimeToNextIndexAccess(IndexScanHashEntry *const stats, bool *
 				*requested = true;
 			}
 
-#ifdef TRACE_PBM_IDX_EVICT_CALC
-			if (0 == buf_id) {
-				elog(WARNING, "BlockTimeToNextIndexAccess(0): scan=%lu, "
-							  "correlation=%f, idx_cur_blk=%u, blk=%u"
-					, entry->id, entry->correlation, entry->cur_blk, blk
-				);
-			}
-#endif
+//#ifdef TRACE_PBM_IDX_EVICT_CALC
+//			if (0 == buf_id) {
+//				elog(WARNING, "BlockTimeToNextIndexAccess(0): scan=%lu, "
+//							  "correlation=%f, idx_cur_blk=%u, blk=%u, seq_next=%lu, est_lambda=%f, lambda=%f"
+//					, entry->id, entry->correlation, entry->cur_blk, blk, seq_idx_next, est_lambda, lambda
+//				);
+//			}
+//#endif
 		}
 	}
 #ifdef TRACE_PBM_IDX_EVICT_CALC
-	if (0 == buf_id) {
+//	if (0 == buf_id) {
+	if (0 == blk % 10000 && rel->rnode.relNode > 12345) {
 		elog(WARNING, "BlockTimeToNextIndexAccess(0) final: "
-					  "blk=%u," // " rel={fork=%u, spc=%u, db=%u, rel=%u}, "
-					  "requested?=%s, lambda=%e, NAT=%lu, seq_idx_next=%lu"
-		    , blk //, rel->forkNum, rel->rnode.spcNode, rel->rnode.dbNode, rel->rnode.relNode  //, rel->blockNum
+					  "blk=%u, " "rel=%u, "   // " rel={fork=%u, spc=%u, db=%u, rel=%u}, "
+					  "seq_next=%lu, "
+					  "requested?=%s, lambda=%e, NAT=%lu"
+		    , blk, rel->rnode.relNode   //, rel->forkNum, rel->rnode.spcNode, rel->rnode.dbNode, rel->rnode.relNode  //, rel->blockNum
+			, seq_idx_next
 			, (*requested ? "y" : "n")
-	        , lambda, has_lambda ? (uint64)(1. / lambda) : AccessTimeNotRequested, seq_idx_next
+	        , lambda, has_lambda ? (uint64)(1. / lambda) : AccessTimeNotRequested
 		);
 	}
 #endif

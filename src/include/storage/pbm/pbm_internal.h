@@ -291,13 +291,18 @@ typedef struct IndexScanStatsEntry {
 	struct IndexScanHashEntry * hash_entry;
 
 	/* Runtime stats */
+	_Atomic(uint64) total_count; /* tuple count since scan started */
+	_Atomic(unsigned int) loop_count; /* # of loops */
+	/* For "sequential" index scans */
+	_Atomic(uint64) count_this_loop; /* only in this loop; reset on rescan */
+	_Atomic(BlockNumber) cur_blk;
+	_Atomic(BlockNumber) max_blk_prev_key;
+	_Atomic(BlockNumber) first_blk_cur_key;
+	_Atomic(uint64) count_this_key; /* reset whenever cur_blk decreases */
+	_Atomic(double) tuple_density; /* average tuples per block accessed for the same key. */
 #if defined(TRACE_PBM_INDEX_PROGRESS)
 	_Atomic(int) dbg_times_reported;
 #endif /* TRACE_PBM_INDEX_PROGRESS */
-	_Atomic(uint64) total_count; /* count since scan started */
-	_Atomic(uint64) count_this_loop; /* only in this loop; reset on rescan */
-	_Atomic(BlockNumber) cur_blk;
-	_Atomic(unsigned int) loop_count; /* # of loops */
 
 	/* These stats updated atomically */
 	slock_t stats_lock;
