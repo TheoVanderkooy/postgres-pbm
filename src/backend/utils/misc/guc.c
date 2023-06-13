@@ -2147,7 +2147,7 @@ static struct config_bool ConfigureNamesBool[] =
 			.short_desc = gettext_noop("Whether to use index scan stats for PBM"),
 		},
 		.variable = &pbm_lru_if_not_requested,
-		.boot_val = false,  // TODO PBM: this should be true if it actually helps
+		.boot_val = true,
 		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
 	},
 
