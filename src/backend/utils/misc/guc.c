@@ -2141,6 +2141,16 @@ static struct config_bool ConfigureNamesBool[] =
 		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
 	},
 
+	{
+		.gen = {
+			.name = "pbm_lru_if_not_requested", .context = PGC_SUSET, .group = RESOURCES_MEM,
+			.short_desc = gettext_noop("Whether to use index scan stats for PBM"),
+		},
+		.variable = &pbm_lru_if_not_requested,
+		.boot_val = false,  // TODO PBM: this should be true if it actually helps
+		.check_hook = NULL, .assign_hook = NULL, .show_hook = NULL,
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL

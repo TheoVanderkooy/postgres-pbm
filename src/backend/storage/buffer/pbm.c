@@ -43,6 +43,7 @@ bool pbm_evict_whole_group;
 bool pbm_evict_use_freq;
 bool pbm_evict_use_idx_scan;
 int pbm_idx_scan_num_counts;
+bool pbm_lru_if_not_requested;
 
 
 /*-------------------------------------------------------------------------
@@ -148,7 +149,7 @@ static inline void init_buffer_stats(PbmBufferDescStatsPadded * stats);
 static inline PbmBufferDescStats * get_buffer_stats(const BufferDesc * buf);
 #if PBM_TRACK_STATS
 static inline void update_buffer_recent_access(PbmBufferDescStats * stats, uint64 now);
-static inline uint64 est_inter_access_time(PbmBufferDescStats *stats, uint64 now, int *n_accesses);
+static inline uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_accesses, uint64 * last_access);
 #endif /* PBM_TRACK_STATS */
 
 
@@ -1119,9 +1120,9 @@ void PBM_RegisterIndexScan(struct IndexScanState *scan, struct ParallelIndexScan
 	if (id < 200 || id % 5000 == 0)
 	{
 		elog(WARNING, "PBM_RegisterIndexScan(%lu) rel=%u   "
-					  "plan_rows=%f loops=%f blocks=%u corr=%f tuples=%f"
+					  "parallel?=%s plan_rows=%f loops=%f blocks=%u corr=%f tuples=%f parallel"
 			 , id, rel->rd_node.relNode
-			 , scan->ss.ps.plan->plan_rows, scan->ss.ps.plan->plan_loops, nblocks
+			 , (NULL != pscan ? "y" : "n"), scan->ss.ps.plan->plan_rows, scan->ss.ps.plan->plan_loops, nblocks
 			 , idx_corr, rel_tuples
 		);
 	}
@@ -1224,13 +1225,16 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 	IndexScanStatsEntry * pbm_stats;
 	BlockNumber cur_cnt;
 	BlockNumber blk = ItemPointerGetBlockNumber(&scandesc->xs_heaptid);
+	bool is_leader_or_not_parallel = false;
 
 	if (NULL != scandesc->parallel_scan && NULL != scandesc->parallel_scan->pbm_stats) {
 		/* Registered parallel scan */
 		pbm_stats = scandesc->parallel_scan->pbm_stats;
+		is_leader_or_not_parallel = (NULL != scandesc->pbm_stats);
 	} else if (NULL != scandesc->pbm_stats) {
 		/* Registered non-parallel scan */
 		pbm_stats = scandesc->pbm_stats;
+		is_leader_or_not_parallel = true;
 	} else {
 		/* Otherwise, not registered at all */
 		return;
@@ -1240,8 +1244,9 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 
 #if defined(TRACE_PBM_INDEX_PROGRESS)
 	if (pbm_stats->dbg_times_reported < 40 || pbm_stats->dbg_times_reported % 10000 == 0) {
-		elog(WARNING, "PBM_ReportIndexScanPosition(%lu) report time %d @ blk %u, speed=%f",
+		elog(WARNING, "PBM_ReportIndexScanPosition(%lu) report time %d @ blk %u, speed=%f, leader?=%s",
 			 pbm_stats->id, pbm_stats->dbg_times_reported, ItemPointerGetBlockNumber(&scandesc->xs_heaptid), pbm_stats->est_speed
+			 , (is_leader_or_not_parallel?"y":"n")
 		);
 	}
 	pbm_stats->dbg_times_reported += 1;
@@ -1254,7 +1259,7 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 	}
 
 	/* Update seq-idx-specific stats */
-	{
+	if (is_leader_or_not_parallel) {
 		_Atomic(BlockNumber) prev = atomic_exchange(&pbm_stats->cur_blk, blk);
 		if (blk < prev) {
 			_Atomic(BlockNumber) prev_first;
@@ -1277,10 +1282,9 @@ void PBM_ReportIndexScanPosition(struct IndexScanDescData * scandesc) {
 				}
 			}
 		}
-
-		pbm_stats->count_this_loop += 1;
-		pbm_stats->count_this_key += 1;
 	}
+	pbm_stats->count_this_loop += 1;
+	pbm_stats->count_this_key += 1;
 
 	/* Update speed estimate if appropriate:
 	 * every ~500 blocks or specific milestones at the start of the scan */
@@ -3053,8 +3057,7 @@ void update_buffer_recent_access(PbmBufferDescStats * stats, uint64 now) {
 #endif /* PBM_BUFFER_STATS_MODE */
 }
 
-uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_accesses) {
-	uint64 last_access = 0;
+uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_accesses, uint64 * last_access) {
 	uint64 est_inter_access, t_since_last;
 	int num_accesses;
 #if PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_NRECENT
@@ -3078,7 +3081,7 @@ uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_acc
 	SpinLockAcquire(&stats->slock);
 
 	num_accesses = stats->nrecent_accesses;
-	last_access = stats->last_access;
+	*last_access = stats->last_access;
 	est_inter_access = (uint64)stats->avg_recent_inter_access;
 
 	SpinLockRelease(&stats->slock);
@@ -3097,7 +3100,7 @@ uint64 est_inter_access_time(PbmBufferDescStats * stats, uint64 now, int * n_acc
 	}
 
 	/* Compute time since last access */
-	t_since_last = (now - last_access);
+	t_since_last = (now - *last_access);
 #if PBM_BUFFER_STATS_MODE == PBM_BUFFER_STATS_MODE_NRECENT
 	est_inter_access = (last_access - min_access) / (num_accesses - 1);
 #endif
@@ -3310,6 +3313,7 @@ typedef struct PBM_BufSample {
 	struct BufferDesc * buf; /* The chosen buffer */
 	BufferTag tag; /* The tag when we choose the sample */
 	unsigned long next_access_time;
+	unsigned long last_access;
 } PBM_BufSample;
 
 /*
@@ -3321,6 +3325,21 @@ static inline void swap_buf_s(PBM_BufSample * a, PBM_BufSample * b) {
 	PBM_BufSample temp = *a;
 	*a = *b;
 	*b = temp;
+}
+static inline bool bh_bufsamp_cmp(const PBM_BufSample * a, const PBM_BufSample * b) {
+	/* `a` accessed further in future or not accessed while `b` is:
+	 * `a` should be evicted first */
+	if (a->next_access_time > b->next_access_time) {
+		return true;
+	}
+
+	/* if equal next access (usually: both not requested), evict the one with *earlier* last_access (mimic LRU) */
+	if (a->next_access_time == b->next_access_time) {
+		return (a->last_access < b->last_access);
+	}
+
+	/* `b` further away, prefer evicting `b` */
+	return false;
 }
 static inline size_t bh_parent(size_t i) { return (i-1)/2; }
 static inline size_t bh_left(size_t i) { return 2*i + 1; }
@@ -3336,11 +3355,11 @@ static inline void bh_fix_down(size_t i, PBM_BufSample * h, size_t n) {
 
 		/* Find child with larger access time */
 		if (r >= n) m = l;
-		else if (h[l].next_access_time > h[r].next_access_time) m = l;
+		else if (bh_bufsamp_cmp(&h[l], &h[r])) m = l;
 		else m = r;
 
 		/* Stop if current is already bigger */
-		if (h[i].next_access_time >= h[m].next_access_time) return;
+		if (bh_bufsamp_cmp(&h[i], &h[m])) return;
 
 		/* Otherwise swap down and continue from there */
 		swap_buf_s(&h[i], &h[m]);
@@ -3500,7 +3519,7 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 #endif
 		);
 #if PBM_TRACK_STATS
-		buffer_est_inter_access = est_inter_access_time(buf_stats, now, &naccesses);
+		buffer_est_inter_access = est_inter_access_time(buf_stats, now, &naccesses, &samples[n_selected].last_access);
 		has_trailing = (trailing_idx_next_consumption > now)
 				&& (trailing_idx_next_consumption != AccessTimeNotRequested);
 #endif
@@ -3527,11 +3546,13 @@ BufferDesc * PBM_EvictPage(uint32 * buf_state) {
 		}
 #endif
 
+		if (!requested) next_access = AccessTimeNotRequested;
 		samples[n_selected].next_access_time = next_access;
 
-		/* If it is "not requested", try to use it immediately.
+		/* If it is "not requested", AND we're not using last-access-time as a
+		 * tie breaker, try to use it immediately.
 		 * Need to check it is still not pinned. */
-		if (!requested) {
+		if (!requested && !pbm_lru_if_not_requested) {
 			local_buf_state = LockBufHdr(buf);
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 					&& BUFFERTAGS_EQUAL(buf->tag, samples[n_selected].tag)) {

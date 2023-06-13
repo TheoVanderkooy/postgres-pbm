@@ -21,6 +21,7 @@ extern bool pbm_evict_whole_group;
 extern bool pbm_evict_use_freq;
 extern bool pbm_evict_use_idx_scan;
 extern int pbm_idx_scan_num_counts;
+extern bool pbm_lru_if_not_requested;
 
 
 /* ===== FORWARD DECLARATIONS (sorted) ===== */
