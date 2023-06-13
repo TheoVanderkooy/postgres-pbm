@@ -2681,6 +2681,11 @@ unsigned long BlockTimeToNextIndexAccess(IndexScanHashEntry *const stats, bool *
 
 	*requested = false;
 
+	/* Ignore if disabled. */
+	if (!pbm_evict_use_idx_scan) {
+		return AccessTimeNotRequested;
+	}
+
 	/* Check all index scans interested in this buffer */
 	LOCK_GUARD_V2(&stats->lock, LW_SHARED) {
 		dlist_iter it;
